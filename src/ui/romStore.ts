@@ -14,6 +14,9 @@ export interface RomMeta {
   code: string;           // 4-char game code from header 0xAC..0xB0
   size: number;
   addedAt: number;
+  // MD5 of the ROM bytes (32 hex chars). Optional because older library
+  // entries may have been added before we started hashing on import.
+  md5?: string;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -43,7 +46,7 @@ export async function listRoms(): Promise<RomMeta[]> {
     req.onsuccess = () => {
       // Return only the metadata fields (strip the bytes blob).
       const out: RomMeta[] = (req.result as any[])
-        .map(({ id, filename, title, code, size, addedAt }) => ({ id, filename, title, code, size, addedAt }))
+        .map(({ id, filename, title, code, size, addedAt, md5 }) => ({ id, filename, title, code, size, addedAt, md5 }))
         .sort((a, b) => b.addedAt - a.addedAt);
       resolve(out);
     };
@@ -65,7 +68,7 @@ export async function getRomBytes(id: string): Promise<Uint8Array | null> {
   });
 }
 
-export async function addRom(filename: string, bytes: Uint8Array): Promise<RomMeta> {
+export async function addRom(filename: string, bytes: Uint8Array, md5?: string): Promise<RomMeta> {
   const dec = new TextDecoder('ascii');
   const title = dec.decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '');
   const code = dec.decode(bytes.subarray(0xAC, 0xB0));
@@ -76,6 +79,7 @@ export async function addRom(filename: string, bytes: Uint8Array): Promise<RomMe
     code,
     size: bytes.length,
     addedAt: Date.now(),
+    md5,
     bytes,
   };
   const db = await openDb();
@@ -85,7 +89,7 @@ export async function addRom(filename: string, bytes: Uint8Array): Promise<RomMe
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-  return { id: row.id, filename, title: row.title, code, size: bytes.length, addedAt: row.addedAt };
+  return { id: row.id, filename, title: row.title, code, size: bytes.length, addedAt: row.addedAt, md5 };
 }
 
 export async function deleteRom(id: string): Promise<void> {

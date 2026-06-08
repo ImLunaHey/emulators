@@ -16,7 +16,7 @@
     // the headless harness in src/test/{boot,screenshot,batch}.ts gets
     // typechecked. The browser code in src/ doesn't use them, but
     // TypeScript happily mixes both ambient declaration sets.
-    "types": ["node"],
+    "types": ["node", "@cloudflare/workers-types"],
     "noEmit": true
   },
   "include": ["src"],

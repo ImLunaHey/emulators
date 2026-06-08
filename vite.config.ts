@@ -1,11 +1,15 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
-
 import { cloudflare } from "@cloudflare/vite-plugin";
 
+// The Cloudflare plugin spins up worker environments that aren't
+// compatible with vitest's Node externals, so we only enable it for
+// the actual dev/build pipeline. Vitest sets process.env.VITEST.
+const isTest = !!process.env.VITEST;
+
 export default defineConfig({
-  plugins: [react(), tailwindcss(), cloudflare()],
+  plugins: [react(), tailwindcss(), ...(isTest ? [] : [cloudflare()])],
   server: {
     fs: { allow: ['..'] },
     headers: {
