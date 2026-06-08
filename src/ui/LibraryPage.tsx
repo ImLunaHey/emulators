@@ -206,6 +206,12 @@ export function LibraryPage() {
           </div>
         </label>
 
+        {enriching > 0 && (
+          <div className="text-[10px] opacity-60 mb-2 flex items-center gap-2">
+            <span className="inline-block w-2 h-2 rounded-full bg-[var(--color-accent)] animate-pulse" />
+            Fetching metadata for {enriching} ROM{enriching === 1 ? '' : 's'}…
+          </div>
+        )}
         {roms.length === 0 ? (
           <div className="py-12 text-center opacity-50 text-xs">
             No ROMs imported yet.<br />
