@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { GBA_KEYS, labelFor, loadMap, resetMap, saveMap } from './controllerMap';
+import { ErrorBoundary } from './ErrorBoundary';
 
 interface PadSnapshot {
   id: string;
@@ -124,24 +125,26 @@ export function ControllerPanel({ open, onClose, onChange }: Props) {
           <button onClick={onClose} className="bg-transparent border-0 text-[#d8d8e0] text-xl cursor-pointer px-2 hover:text-white">×</button>
         </div>
 
-        {!snap ? (
-          <div className="py-12 text-center opacity-50 text-xs leading-relaxed">
-            Connect a gamepad and press any button to wake it.<br />
-            <span className="text-[10px] opacity-70">PS5 DualSense, Xbox controller, or any USB/Bluetooth pad will work.</span>
-          </div>
-        ) : (
-          <>
-            <PadDiagram snap={snap} />
-            <BindingTable
-              snap={snap}
-              bindings={bindings}
-              editingKey={editingKey}
-              onEdit={setEditingKey}
-              onReset={onReset}
-            />
-            <RawSignals snap={snap} />
-          </>
-        )}
+        <ErrorBoundary label="Controller" onClose={onClose} variant="inline">
+          {!snap ? (
+            <div className="py-12 text-center opacity-50 text-xs leading-relaxed">
+              Connect a gamepad and press any button to wake it.<br />
+              <span className="text-[10px] opacity-70">PS5 DualSense, Xbox controller, or any USB/Bluetooth pad will work.</span>
+            </div>
+          ) : (
+            <>
+              <PadDiagram snap={snap} />
+              <BindingTable
+                snap={snap}
+                bindings={bindings}
+                editingKey={editingKey}
+                onEdit={setEditingKey}
+                onReset={onReset}
+              />
+              <RawSignals snap={snap} />
+            </>
+          )}
+        </ErrorBoundary>
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Emulator } from '../emulator';
+import { ErrorBoundary } from './ErrorBoundary';
 
 interface Props {
   open: boolean;
@@ -37,13 +38,17 @@ export function DebugPanel({ open, emu, onClose }: Props) {
           ))}
         </div>
         <div className="flex-1 overflow-y-auto">
-          {tab === 'cpu'     && <CpuView emu={emu} />}
-          {tab === 'mem'     && <MemoryView emu={emu} />}
-          {tab === 'palette' && <PaletteView emu={emu} />}
-          {tab === 'tiles'   && <TilesView emu={emu} />}
-          {tab === 'sprites' && <SpritesView emu={emu} />}
-          {tab === 'io'      && <IoView emu={emu} />}
-          {tab === 'adv'     && <AdvancedView emu={emu} />}
+          {/* resetKey=tab so switching tabs after a crash clears the
+              fallback and gives the new view a clean try. */}
+          <ErrorBoundary label={`Debug · ${tab.toUpperCase()}`} resetKey={tab} onClose={onClose} variant="inline">
+            {tab === 'cpu'     && <CpuView emu={emu} />}
+            {tab === 'mem'     && <MemoryView emu={emu} />}
+            {tab === 'palette' && <PaletteView emu={emu} />}
+            {tab === 'tiles'   && <TilesView emu={emu} />}
+            {tab === 'sprites' && <SpritesView emu={emu} />}
+            {tab === 'io'      && <IoView emu={emu} />}
+            {tab === 'adv'     && <AdvancedView emu={emu} />}
+          </ErrorBoundary>
         </div>
       </div>
     </div>

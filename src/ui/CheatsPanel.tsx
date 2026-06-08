@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { Cheat } from '../io/cheats';
 import { parseCheat } from '../io/cheats';
+import { ErrorBoundary } from './ErrorBoundary';
 
 interface Props {
   open: boolean;
@@ -93,6 +94,7 @@ export function CheatsPanel({ open, gameCode, cheats, onChange, onClose }: Props
           <button onClick={onClose} className="bg-transparent border-0 text-[#d8d8e0] text-lg cursor-pointer px-2 hover:text-white">×</button>
         </div>
 
+        <ErrorBoundary label="Cheats" onClose={onClose} variant="inline">
         {!gameCode ? (
           <div className="py-8 text-center opacity-50 text-xs">
             Load a ROM to manage its cheats.
@@ -177,6 +179,7 @@ export function CheatsPanel({ open, gameCode, cheats, onChange, onClose }: Props
             </div>
           </>
         )}
+        </ErrorBoundary>
       </div>
     </div>
   );

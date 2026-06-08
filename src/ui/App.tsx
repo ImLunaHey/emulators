@@ -8,6 +8,7 @@ import { useGamepad } from './useGamepad';
 import { useKeypadHighlight } from './useKeypadHighlight';
 import { ControllerPanel } from './ControllerPanel';
 import { DebugPanel } from './DebugPanel';
+import { ErrorBoundary } from './ErrorBoundary';
 import { CheatsPanel, loadCheatsFor } from './CheatsPanel';
 import { RomLibrary } from './RomLibrary';
 import type { Cheat } from '../io/cheats';
@@ -198,14 +199,18 @@ export function App() {
         <h1 className="text-sm m-0 tracking-wide opacity-80">gba-recomp</h1>
         <div className="text-xs opacity-60 font-mono">{headerInfo || 'no ROM loaded'}</div>
       </header>
-      <Screen emu={emu} paused={paused} audio={audio} onStats={setStats} />
-      <div className="w-[720px] flex justify-between items-center px-2 text-[11px]">
-        <span className="text-[var(--color-accent)] opacity-85 font-mono">{stats}</span>
-        <span className="opacity-50">arrows · z/x · a/s · enter/shift</span>
-      </div>
-      <Gamepad keypad={emu.keypad} />
+      <ErrorBoundary label="Player" resetKey={currentRom?.id ?? null}>
+        <Screen emu={emu} paused={paused} audio={audio} onStats={setStats} />
+        <div className="w-[720px] flex justify-between items-center px-2 text-[11px]">
+          <span className="text-[var(--color-accent)] opacity-85 font-mono">{stats}</span>
+          <span className="opacity-50">arrows · z/x · a/s · enter/shift</span>
+        </div>
+      </ErrorBoundary>
 
-      <div className="flex gap-2 text-xs items-center w-[720px] flex-wrap">
+      <ErrorBoundary label="Controls">
+        <Gamepad keypad={emu.keypad} />
+
+        <div className="flex gap-2 text-xs items-center w-[720px] flex-wrap">
         <button onClick={() => setShowLib(true)} className="btn-default">📂 Library</button>
         <button onClick={() => setPaused((p) => !p)} className="btn-default" disabled={!currentRom}>{paused ? '▶ Resume' : '❚❚ Pause'}</button>
         <button onClick={onReset} className="btn-default" disabled={!currentRom}>↻ Reset</button>
@@ -246,7 +251,8 @@ export function App() {
         <button onClick={() => setShowCheats(true)} className="btn-default" disabled={!currentRom}>★ Cheats</button>
         <button onClick={() => setShowDebug(true)} className="btn-default" disabled={!currentRom}>🔍 Debug</button>
         <button onClick={() => setShowLog(!showLog)} className="btn-default">{showLog ? 'Hide Log' : 'Show Log'}</button>
-      </div>
+        </div>
+      </ErrorBoundary>
 
       {showLog && <LogPane lines={log} />}
 

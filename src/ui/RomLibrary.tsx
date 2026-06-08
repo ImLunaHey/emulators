@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { unzipSync } from 'fflate';
 import { addRom, deleteRom, listRoms, type RomMeta } from './romStore';
+import { ErrorBoundary } from './ErrorBoundary';
 
 // Pull every .gba member out of a ZIP archive.
 function extractGbaFromZip(zipBytes: Uint8Array): Array<{ filename: string; bytes: Uint8Array }> {
@@ -140,6 +141,7 @@ export function RomLibrary({ open, currentId, onClose, onSelect, onAppend }: Pro
           <button onClick={onClose} className="bg-transparent border-0 text-[#d8d8e0] text-lg cursor-pointer px-2 hover:text-white">×</button>
         </div>
 
+        <ErrorBoundary label="ROM Library" onClose={onClose} variant="inline">
         <label
           className={`block border-2 border-dashed rounded-md p-6 text-center cursor-pointer mb-3 transition-colors ${
             dragging ? 'border-[#5060a0] bg-[#1c1c2a]' : 'border-[#2a2a30] hover:border-[#404050]'
@@ -242,6 +244,7 @@ export function RomLibrary({ open, currentId, onClose, onSelect, onAppend }: Pro
             >Clear entire library</button>
           </div>
         )}
+        </ErrorBoundary>
       </div>
     </div>
   );
