@@ -138,7 +138,14 @@ export class Rtc {
   }
 
   private finishWrite() {
-    // We ignore date/time writes — the host wallclock is authoritative.
+    // Status writes: store the byte so subsequent reads match. Pokemon
+    // Ruby/Sapphire/Emerald write status then read it back; mismatch is
+    // reported as "battery has run dry".
+    const reg = (this.cmd >> 1) & 0x7;
+    if (reg === 1 && this.payload.length >= 1) {
+      this.status = this.payload[0];
+    }
+    // Date/time writes — host wallclock stays authoritative.
     this.state = 'idle';
   }
 

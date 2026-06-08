@@ -49,10 +49,14 @@ export class Recompiler {
     this.write8  = (a, v) => bus.write8(a >>> 0, v & 0xFF);
   }
 
-  // Try to dispatch through JIT for the next instruction.
-  // Returns true if the JIT handled it (CPU.step should skip interpretation
-  // for the executed window).
+  // Try to dispatch through JIT for the next instruction. The translator
+  // currently doesn't produce native instructions — it emits a real WASM
+  // module but the module just reports the count for the interpreter to
+  // replay. Running the cache lookup + profile-count map for every cycle
+  // costs more than it saves, so we early-out unless explicitly enabled.
+  enabled = false;
   tryDispatch(): boolean {
+    if (!this.enabled) return false;
     const cpu = this.cpu;
     const s = cpu.state;
     if (!(s.cpsr & 0x20)) return false; // ARM blocks not jitted in this build
