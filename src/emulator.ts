@@ -82,16 +82,12 @@ export class Emulator {
     // PPU no longer has HBlank IRQ enabled.
     if (!(this.ppu.dispstat & 0x10)) this.irq.iflag &= ~0x2;
     // BIOS-side IntrCheck flag: the BIOS sets bit 0 of *(u16*)0x03007FF8 on
-    // VBlank IRQ.
+    // VBlank IRQ. Our HLE doesn't drive this through a real BIOS handler,
+    // so we set it directly each frame. (FireRed/Emerald's own ROM IRQ
+    // handler ALSO sets bit 0 of gMain.intrCheck at 0x0300310C, but that
+    // depends on game-specific addresses — the canonical BIOS slot is
+    // what the AGB SDK polls.)
     this.bus.iwram[0x7FF8] |= 0x01;
-    // Pokemon games (FireRed/Emerald) poll gMain.intrCheck at IWRAM offset
-    // 0x310C (gMain base 0x30F0 + 0x1C). The AGB SDK's IntrMain sets bit 0
-    // of this field when it has serviced a VBlank IRQ. Our minimal BIOS
-    // stub routes IRQs through the user handler, but the user handler in
-    // pokefirered/emerald uses an indirection through an IntrFunc table
-    // that our HLE doesn't fully replicate. Force bit 0 each frame so the
-    // VBlankWait at 0x080008A4 completes.
-    this.bus.iwram[0x310C] |= 0x01;
     return {
       interp: this.recomp.intInsns - intStart,
       jit: this.recomp.jitInsns - jitStart,
