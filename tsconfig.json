@@ -14,5 +14,9 @@
     "jsx": "react-jsx",
     "types": []
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/test/boot.ts",
+    "src/test/**/*.test.ts"
+  ]
 }

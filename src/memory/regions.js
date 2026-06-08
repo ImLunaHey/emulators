@@ -1,0 +1,25 @@
+// GBA memory map sizes / masks.
+export const BIOS_SIZE = 0x4000; // 16 KB
+export const EWRAM_SIZE = 0x40000; // 256 KB
+export const IWRAM_SIZE = 0x8000; // 32 KB
+export const IO_SIZE = 0x400; // 1 KB
+export const PRAM_SIZE = 0x400; // 1 KB
+export const VRAM_SIZE = 0x18000; // 96 KB
+export const OAM_SIZE = 0x400; // 1 KB
+export const SRAM_SIZE = 0x10000; // 64 KB visible (Flash 128K banked)
+export const FLASH_SIZE = 0x20000; // 128 KB
+export const REGION_BIOS = 0x0;
+export const REGION_EWRAM = 0x2;
+export const REGION_IWRAM = 0x3;
+export const REGION_IO = 0x4;
+export const REGION_PRAM = 0x5;
+export const REGION_VRAM = 0x6;
+export const REGION_OAM = 0x7;
+export const REGION_ROM_0 = 0x8;
+export const REGION_ROM_1 = 0x9;
+export const REGION_ROM_2 = 0xA;
+export const REGION_ROM_3 = 0xB;
+export const REGION_ROM_4 = 0xC;
+export const REGION_ROM_5 = 0xD;
+export const REGION_SRAM = 0xE;
+export const REGION_SRAM2 = 0xF;
