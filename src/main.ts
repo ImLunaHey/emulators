@@ -103,23 +103,30 @@ async function main() {
       fpsAvg = fpsAvg ? fpsAvg * 0.9 + inst * 0.1 : inst;
       frameCounter++;
 
-      // Overlay live boot diagnostics on the canvas so it isn't silent
-      // while the game is still walking through its init state machines.
+      // Overlay live boot diagnostics on the canvas. When the game hasn't
+      // yet written content to VRAM/OAM, show a more visible splash panel.
       const s = emu.cpu.state;
       const pc = s.r[15].toString(16).padStart(8, '0');
       const mode = (s.cpsr & 0x20) ? 'THUMB' : 'ARM';
-      const dispcnt = emu.ppu.dispcnt.toString(16);
-      const dispstat = emu.ppu.dispstat.toString(16);
-      const ie = emu.irq.ie.toString(16);
-      const iflag = emu.irq.iflag.toString(16);
+      const dispcnt = emu.ppu.dispcnt.toString(16).padStart(4, '0');
+      const dispstat = emu.ppu.dispstat.toString(16).padStart(4, '0');
+      const ie = emu.irq.ie.toString(16).padStart(4, '0');
+      const iflag = emu.irq.iflag.toString(16).padStart(4, '0');
       const total = r.interp + r.jit || 1;
       const jitPct = ((r.jit / total) * 100) | 0;
+      const vramFill = nonZero(emu.bus.vram);
+      const showSplash = vramFill === 0;
       view.overlay([
-        `gba-recomp · ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz · ${fpsAvg.toFixed(1)} fps · frame ${frameCounter}`,
-        `pc ${pc}  ${mode}  jit ${jitPct}%  cycles/f ${(r.interp + r.jit).toString().padStart(6)}`,
-        `dispcnt ${dispcnt}  dispstat ${dispstat}  IE ${ie}  IF ${iflag}`,
-        `vram ${nonZero(emu.bus.vram)}/${emu.bus.vram.length}  oam ${nonZero(emu.bus.oam)}  pram ${nonZero(emu.bus.pram)}`,
-      ]);
+        `frame ${frameCounter.toString().padStart(5)}   ${fpsAvg.toFixed(1)} fps   ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz`,
+        `pc ${pc}  ${mode}  jit ${jitPct}%`,
+        `cycles/frame ${(r.interp + r.jit).toString().padStart(6)}   ${(r.jit).toString().padStart(5)} jit`,
+        `dispcnt ${dispcnt}  dispstat ${dispstat}`,
+        `ie ${ie}  if ${iflag}  ime ${emu.irq.ime}`,
+        `vram ${vramFill}  oam ${nonZero(emu.bus.oam)}  pram ${nonZero(emu.bus.pram)}`,
+        showSplash
+          ? `state: game in init wait loop`
+          : `state: game running`,
+      ], showSplash);
 
       if (frameCounter % 30 === 0) {
         stats.textContent = `${fpsAvg.toFixed(1)} fps · ${(280896 * fpsAvg / 1e6).toFixed(2)} Mhz · int ${((r.interp / total) * 100 | 0)}% · jit ${jitPct}%`;
