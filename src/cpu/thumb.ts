@@ -279,8 +279,15 @@ export function thumbExecute(cpu: Cpu, instr: number): void {
           if (R) {
             const v = cpu.bus.read32(sp & ~3) >>> 0;
             sp = (sp + 4) >>> 0;
-            if (v & 1) { s.cpsr |= FLAG_T; s.r[15] = v & ~1; }
-            else        { s.cpsr &= ~FLAG_T; s.r[15] = v & ~3; }
+            // ARMv4T (GBA): POP {PC} does NOT interwork. Bit 0 of the
+            // loaded value is masked out and the T flag stays THUMB —
+            // the only way to switch to ARM from THUMB is via BX.
+            // ARMv5T+ flips T from bit 0 here, but on the GBA's
+            // ARM7TDMI doing that lets compilers' THUMB-internal
+            // returns accidentally hop to ARM whenever a stored LR
+            // happens to have bit 0 clear, which is exactly Doom II's
+            // wild-ARM-jump symptom.
+            s.r[15] = v & ~1;
             cpu.flushPipeline();
           }
           s.r[13] = sp;
