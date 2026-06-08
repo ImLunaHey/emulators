@@ -130,13 +130,20 @@ export function ControllerPanel({ open, onClose, onChange }: Props) {
 // positions when pressed, instead of a flat grid of numbered cells.
 function PadDiagram({ snap }: { snap: PadSnapshot }) {
   const isStandard = snap.mapping === 'standard';
-  // For each visual button slot, give the gamepad-button index for that
-  // physical position in both mapping flavors. The first index in each
-  // pair is "standard", second is "sony non-standard".
   const map = (std: number, sony: number) => isStandard ? std : sony;
   const lit = (idx: number) => snap.buttons[idx];
 
-  // Left analog stick deflection direction (for visualization).
+  // D-pad direction is detected from EITHER discrete buttons OR the HID
+  // hat axes 6/7. Many controllers (PS5 on macOS Safari most notably)
+  // skip the discrete-button form entirely and only emit the hat axes.
+  const hx = snap.axes[6] ?? 0;
+  const hy = snap.axes[7] ?? 0;
+  const dUp    = lit(map(12, 14)) || hy < -0.5;
+  const dDown  = lit(map(13, 15)) || hy >  0.5;
+  const dLeft  = lit(map(14, 16)) || hx < -0.5;
+  const dRight = lit(map(15, 17)) || hx >  0.5;
+
+  // Stick deflection (for visualization).
   const ax = snap.axes[0] ?? 0;
   const ay = snap.axes[1] ?? 0;
   const rx = snap.axes[2] ?? 0;
@@ -156,10 +163,10 @@ function PadDiagram({ snap }: { snap: PadSnapshot }) {
             <PadBtn lit={lit(map(4, 4))} label="L1" small />
           </div>
           <div className="relative w-[80px] h-[80px]">
-            <div className="absolute left-1/2 top-0 -translate-x-1/2"><DpadBtn lit={lit(map(12, 14))} dir="up" /></div>
-            <div className="absolute left-0 top-1/2 -translate-y-1/2"><DpadBtn lit={lit(map(14, 16))} dir="left" /></div>
-            <div className="absolute right-0 top-1/2 -translate-y-1/2"><DpadBtn lit={lit(map(15, 17))} dir="right" /></div>
-            <div className="absolute left-1/2 bottom-0 -translate-x-1/2"><DpadBtn lit={lit(map(13, 15))} dir="down" /></div>
+            <div className="absolute left-1/2 top-0 -translate-x-1/2"><DpadBtn lit={dUp} dir="up" /></div>
+            <div className="absolute left-0 top-1/2 -translate-y-1/2"><DpadBtn lit={dLeft} dir="left" /></div>
+            <div className="absolute right-0 top-1/2 -translate-y-1/2"><DpadBtn lit={dRight} dir="right" /></div>
+            <div className="absolute left-1/2 bottom-0 -translate-x-1/2"><DpadBtn lit={dDown} dir="down" /></div>
           </div>
         </div>
 
@@ -277,7 +284,17 @@ function BindingTable({
         {GBA_KEYS.map(({ key, name }) => {
           const buttonIdx = bindings[key];
           const isEditing = editingKey === key;
-          const isLit = buttonIdx !== undefined && snap.buttons[buttonIdx];
+          // D-pad rows also light up from the hat-axis fallback so the
+          // user can see that direction is reaching the browser even
+          // when the controller doesn't expose discrete D-pad buttons.
+          const hx = snap.axes[6] ?? 0;
+          const hy = snap.axes[7] ?? 0;
+          const axisLit =
+            (name === 'D-pad Up'    && hy < -0.5) ||
+            (name === 'D-pad Down'  && hy >  0.5) ||
+            (name === 'D-pad Left'  && hx < -0.5) ||
+            (name === 'D-pad Right' && hx >  0.5);
+          const isLit = (buttonIdx !== undefined && snap.buttons[buttonIdx]) || axisLit;
           return (
             <button
               key={key}

@@ -62,6 +62,19 @@ export function useGamepad({
       for (const { idx, key } of lookup) {
         if (pad.buttons[idx] && pad.buttons[idx].pressed) want.add(key);
       }
+      // D-pad fallback: many controllers (PS5 on macOS Safari in
+      // particular) don't expose the D-pad as four discrete buttons —
+      // they expose it as the HID hat at axes 6/7 (X then Y). If those
+      // axes deflect past the threshold, synthesize D-pad presses so
+      // games actually receive direction input.
+      const hx = pad.axes[6] ?? 0;
+      const hy = pad.axes[7] ?? 0;
+      if (Math.abs(hx) > 0.5 || Math.abs(hy) > 0.5) {
+        if (hx < -0.5) want.add(Key.LEFT);
+        if (hx >  0.5) want.add(Key.RIGHT);
+        if (hy < -0.5) want.add(Key.UP);
+        if (hy >  0.5) want.add(Key.DOWN);
+      }
       if (stickAsDpad) {
         const ax = pad.axes[0] ?? 0;
         const ay = pad.axes[1] ?? 0;
