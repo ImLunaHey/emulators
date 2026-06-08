@@ -237,8 +237,25 @@ const handlerAddr = (emu.bus.iwram[0x7FFC] | (emu.bus.iwram[0x7FFD]<<8) | (emu.b
 console.log(`\nUser IRQ handler at 0x${handlerAddr.toString(16)}:`);
 if ((handlerAddr & 0xFF000000) === 0x03000000) {
   const base = handlerAddr & 0x7FFF;
-  for (let i = 0; i < 256; i += 4) {
+  for (let i = 0; i < 512; i += 4) {
     const v = (emu.bus.iwram[base+i] | (emu.bus.iwram[base+i+1]<<8) | (emu.bus.iwram[base+i+2]<<16) | (emu.bus.iwram[base+i+3]<<24)) >>> 0;
     console.log(`  ${(handlerAddr+i).toString(16)}: 0x${v.toString(16).padStart(8,'0')}`);
+  }
+}
+// Dump IntrFunc table at 0x03007438
+console.log(`\nIntrFunc table @ 0x03007438:`);
+for (let i = 0; i < 14; i++) {
+  const off = 0x7438 + i * 4;
+  const v = (emu.bus.iwram[off] | (emu.bus.iwram[off+1]<<8) | (emu.bus.iwram[off+2]<<16) | (emu.bus.iwram[off+3]<<24)) >>> 0;
+  console.log(`  [${i}] = 0x${v.toString(16).padStart(8,'0')}`);
+}
+// VBlank handler at IntrFunc[4] — dump its code in IWRAM
+const vblankAddr = (emu.bus.iwram[0x7438 + 4*4] | (emu.bus.iwram[0x7438 + 4*4 + 1]<<8) | (emu.bus.iwram[0x7438 + 4*4 + 2]<<16) | (emu.bus.iwram[0x7438 + 4*4 + 3]<<24)) >>> 0;
+console.log(`\nVBlank handler @ 0x${vblankAddr.toString(16)}:`);
+if ((vblankAddr & 0xFF000000) === 0x03000000) {
+  const base = vblankAddr & 0x7FFF;
+  for (let i = 0; i < 64; i += 4) {
+    const v = (emu.bus.iwram[base+i] | (emu.bus.iwram[base+i+1]<<8) | (emu.bus.iwram[base+i+2]<<16) | (emu.bus.iwram[base+i+3]<<24)) >>> 0;
+    console.log(`  ${(vblankAddr+i).toString(16)}: 0x${v.toString(16).padStart(8,'0')}`);
   }
 }
