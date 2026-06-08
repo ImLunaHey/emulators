@@ -1,6 +1,5 @@
 import type { Cpu } from '../cpu/cpu';
 import type { Bus } from '../memory/bus';
-import { FLAG_T, FLAG_I } from '../cpu/state';
 import { IRQ_VBLANK } from '../io/irq';
 
 // High-level emulation of GBA BIOS syscalls. Returning true tells the CPU

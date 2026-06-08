@@ -1,5 +1,4 @@
-import { Bus } from '../memory/bus';
-import { CpuState, FLAG_C, FLAG_N, FLAG_Z, FLAG_V, FLAG_T, FLAG_I, FLAG_F, Mode } from './state';
+import { CpuState, FLAG_T, Mode } from './state';
 import { immShift, regShift, rorImm32, applyCarry } from './shifter';
 import type { Cpu } from './cpu';
 

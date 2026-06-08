@@ -1,4 +1,4 @@
-import { CpuState, FLAG_C, FLAG_N, FLAG_Z, FLAG_V, FLAG_T } from './state';
+import { CpuState, FLAG_T } from './state';
 import { immShift, regShift, applyCarry } from './shifter';
 import type { Cpu } from './cpu';
 
