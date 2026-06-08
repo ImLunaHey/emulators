@@ -53,10 +53,11 @@ export class Cpu {
       bios[off + 2] = (v >> 16) & 0xFF;
       bios[off + 3] = (v >> 24) & 0xFF;
     };
-    // 0x00 reset:  B 0x08000000 (branch to ROM entry). We just keep PC
-    //              there directly via reset(), but make the vector valid
-    //              in case the game soft-resets.
-    wr32(0x00, 0xEA000000 | (((0x08000000 - 8) >>> 2) & 0x00FFFFFF));
+    // 0x00 reset: branch to ROM entry via LDR PC, [PC, #0x140] (load from
+    // literal in unused BIOS space). ARM B can't encode the ±32MB jump
+    // from 0x0 to 0x08000000 directly.
+    wr32(0x00, 0xE59FF140);  // LDR PC, [PC, #0x140] — addr = 0x00+8+0x140 = 0x148
+    wr32(0x148, 0x08000000); // ROM entry literal
     // 0x04 undef
     wr32(0x04, 0xEAFFFFFE);
     // 0x08 swi:   the CPU only lands here on SWI when HLE refuses. We
