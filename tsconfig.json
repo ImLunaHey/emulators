@@ -12,13 +12,15 @@
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
     "jsx": "react-jsx",
-    "types": [],
+    // Pull in Node's globals (process, Buffer, readFileSync, ...) so
+    // the headless harness in src/test/{boot,screenshot,batch}.ts gets
+    // typechecked. The browser code in src/ doesn't use them, but
+    // TypeScript happily mixes both ambient declaration sets.
+    "types": ["node"],
     "noEmit": true
   },
   "include": ["src"],
   "exclude": [
-    "src/test/boot.ts",
-    "src/test/screenshot.ts",
     "src/test/**/*.test.ts"
   ]
 }
