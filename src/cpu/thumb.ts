@@ -76,6 +76,57 @@ export function thumbExecute(cpu: Cpu, instr: number): void {
       return;
     }
     case 0b010: {
+      const high4 = instr >>> 12;
+      if (high4 === 0b0101) {
+        // Format 7 (LDR/STR reg offset) or Format 8 (load/store sign-extended).
+        const bit9 = (instr >>> 9) & 1;
+        const ro = (instr >>> 6) & 7;
+        const rb = (instr >>> 3) & 7;
+        const rd = instr & 7;
+        const addr = (s.r[rb] + s.r[ro]) >>> 0;
+        if (bit9 === 0) {
+          // Format 7: LDR/STR with byte/word toggle.
+          const L = (instr & 0x0800) !== 0;
+          const B = (instr & 0x0400) !== 0;
+          if (L) {
+            if (B) s.r[rd] = cpu.bus.read8(addr) >>> 0;
+            else {
+              const aligned = cpu.bus.read32(addr & ~3);
+              const rot = (addr & 3) << 3;
+              s.r[rd] = (rot ? ((aligned >>> rot) | (aligned << (32 - rot))) : aligned) >>> 0;
+            }
+          } else {
+            if (B) cpu.bus.write8(addr, s.r[rd] & 0xFF);
+            else   cpu.bus.write32(addr & ~3, s.r[rd] >>> 0);
+          }
+        } else {
+          // Format 8: H + S bits.
+          const H = (instr & 0x0800) !== 0;
+          const S = (instr & 0x0400) !== 0;
+          if (!H && !S) {
+            // STRH
+            cpu.bus.write16(addr & ~1, s.r[rd] & 0xFFFF);
+          } else if (!H && S) {
+            // LDSB
+            const b = cpu.bus.read8(addr);
+            s.r[rd] = (b & 0x80) ? (b | 0xFFFFFF00) >>> 0 : b;
+          } else if (H && !S) {
+            // LDRH (unaligned rotated)
+            const aligned = cpu.bus.read16(addr & ~1);
+            s.r[rd] = ((addr & 1) ? ((aligned >>> 8) | (aligned << 24)) : aligned) >>> 0;
+          } else {
+            // LDSH — unaligned: read byte sign-extended.
+            if (addr & 1) {
+              const b = cpu.bus.read8(addr);
+              s.r[rd] = (b & 0x80) ? (b | 0xFFFFFF00) >>> 0 : b;
+            } else {
+              const h = cpu.bus.read16(addr);
+              s.r[rd] = (h & 0x8000) ? (h | 0xFFFF0000) >>> 0 : h;
+            }
+          }
+        }
+        return;
+      }
       if (((instr >>> 10) & 7) === 0b000) {
         // Format 4: ALU ops.
         const op = (instr >>> 6) & 0xF;

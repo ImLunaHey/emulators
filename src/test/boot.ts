@@ -25,13 +25,21 @@ emu.io.write16 = (addr: number, v: number) => {
   }
   origIoWrite16(addr, v);
 };
-// Trace writes to wait flag 0x0300310C
-let waitFlagWrites = 0;
+// Trace writes near state byte 0x03003528
+let stateWrites = 0;
+const origBusWrite8 = emu.bus.write8.bind(emu.bus);
+emu.bus.write8 = (addr: number, v: number) => {
+  if ((addr >>> 0) === 0x03003528 && stateWrites < 30) {
+    console.log(`  STATE[0x03003528] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
+    stateWrites++;
+  }
+  origBusWrite8(addr, v);
+};
 const origBusWrite16 = emu.bus.write16.bind(emu.bus);
 emu.bus.write16 = (addr: number, v: number) => {
-  if ((addr >>> 0) === 0x0300310C && waitFlagWrites < 30) {
-    console.log(`  [0x0300310C] <- 0x${v.toString(16).padStart(4,'0')}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
-    waitFlagWrites++;
+  if ((addr >>> 0) === 0x03003528 && stateWrites < 30) {
+    console.log(`  STATE16[0x03003528] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
+    stateWrites++;
   }
   origBusWrite16(addr, v);
 };
@@ -143,6 +151,31 @@ console.log(`IRQ entry IF distribution:`, Array.from(irqIfHist.entries()).map(([
 
 // Sample frame buffer pixels.
 const f = emu.ppu.frame;
+// Dump state at 0x03003528 (callback state byte)
+console.log(`State byte @ 0x03003528 = 0x${emu.bus.iwram[0x3528].toString(16)}`);
+console.log(`Bytes 0x03003520..0x03003540: ${Array.from(emu.bus.iwram.slice(0x3520, 0x3540)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
+// Dump gMain struct at IWRAM 0x30F0..0x3120
+console.log(`gMain @ 0x030030F0..0x03003130:`);
+for (let i = 0; i < 8; i++) {
+  const off = 0x30F0 + i * 8;
+  const b = Array.from(emu.bus.iwram.slice(off, off + 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+  console.log(`  0x0300${off.toString(16).padStart(4,'0')}: ${b}`);
+}
+// Dump CPU registers + walk a likely return-address chain from SP.
+const sr = emu.cpu.state;
+console.log(`Regs: R0=${sr.r[0].toString(16)} R1=${sr.r[1].toString(16)} R2=${sr.r[2].toString(16)} R3=${sr.r[3].toString(16)}`);
+console.log(`      R4=${sr.r[4].toString(16)} R5=${sr.r[5].toString(16)} R6=${sr.r[6].toString(16)} R7=${sr.r[7].toString(16)}`);
+console.log(`      R8=${sr.r[8].toString(16)} R9=${sr.r[9].toString(16)} R10=${sr.r[10].toString(16)} R11=${sr.r[11].toString(16)}`);
+console.log(`      R12=${sr.r[12].toString(16)} SP=${sr.r[13].toString(16)} LR=${sr.r[14].toString(16)} PC=${sr.r[15].toString(16)}`);
+console.log(`Stack dump from SP:`);
+const sp = sr.r[13];
+for (let i = 0; i < 16; i++) {
+  const a = sp + i * 4;
+  const off = a & 0x7FFF;
+  const v = (emu.bus.iwram[off] | (emu.bus.iwram[off+1]<<8) | (emu.bus.iwram[off+2]<<16) | (emu.bus.iwram[off+3]<<24)) >>> 0;
+  const looksLikeCode = (v & 0xFF000000) === 0x08000000;
+  console.log(`  [SP+${(i*4).toString(16).padStart(3,'0')}] = 0x${v.toString(16).padStart(8,'0')}${looksLikeCode ? ' ← ROM' : ''}`);
+}
 console.log(`PRAM[0..7] bytes: ${Array.from(emu.bus.pram.slice(0, 8)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
 console.log(`Frame buffer first 8 px (RGBA):`);
 for (let i = 0; i < 8; i++) {
