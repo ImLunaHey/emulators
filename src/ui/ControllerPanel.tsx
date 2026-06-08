@@ -41,10 +41,16 @@ export function ControllerPanel({ open, onClose, onChange }: Props) {
         axes: Array.from(pad.axes),
       });
       // If we're in remap mode, look for any newly-pressed button to bind.
+      // If that button was already bound to a different GBA key, unbind it
+      // there first — the same physical button can't drive two actions.
       if (editingKey !== null) {
         for (let i = 0; i < pressed.length; i++) {
           if (pressed[i] && !lastPressedRef.current.has(i)) {
-            const newBindings = { ...bindings, [editingKey]: i };
+            const newBindings: Record<number, number> = {};
+            for (const [k, v] of Object.entries(bindings)) {
+              if (v !== i) newBindings[Number(k)] = v;
+            }
+            newBindings[editingKey] = i;
             setBindings(newBindings);
             saveMap(pad.mapping || 'sony', newBindings);
             setEditingKey(null);
@@ -69,13 +75,24 @@ export function ControllerPanel({ open, onClose, onChange }: Props) {
     }
   }, [snap?.mapping, mapping, snap]);
 
-  // Esc cancels remap mode.
+  // Esc while editing UNBINDS the key being edited (and exits edit mode).
   useEffect(() => {
     if (editingKey === null) return;
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setEditingKey(null); };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      const next: Record<number, number> = {};
+      for (const [k, v] of Object.entries(bindings)) {
+        if (Number(k) !== editingKey) next[Number(k)] = v;
+      }
+      setBindings(next);
+      saveMap(mapping, next);
+      setEditingKey(null);
+      onChange?.();
+    };
     window.addEventListener('keydown', onEsc);
     return () => window.removeEventListener('keydown', onEsc);
-  }, [editingKey]);
+  }, [editingKey, bindings, mapping, onChange]);
 
   if (!open) return null;
 
@@ -321,7 +338,8 @@ function BindingTable({
       </div>
       <div className="mt-4 text-[10px] opacity-50 leading-relaxed">
         Click a binding to rebind it, then press any button on the controller.
-        Press Esc to cancel.
+        Esc unbinds the key. If you bind a button that's already in use, it's
+        auto-removed from its previous binding.
       </div>
     </div>
   );
