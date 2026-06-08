@@ -182,6 +182,7 @@ for (let i = 0; i < emu.bus.ewram.length; i++) {
   }
 }
 console.log(`Non-zero EWRAM ranges (>=4 bytes):${ewramRanges || ' (none)'}`);
+console.log(`EWRAM[0..0x10]: ${Array.from(emu.bus.ewram.slice(0, 16)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
 
 // Sample frame buffer pixels.
 const f = emu.ppu.frame;
