@@ -29,10 +29,11 @@ export function detectSaveType(rom: Uint8Array): SaveType {
   for (const sig of SIGS) {
     const needle = sig.needle;
     const n = needle.length;
-    // Linear byte-by-byte search. AGB tools always put the signature
-    // somewhere in the cart header / library code in the first MB, so
-    // we cap the scan at 1 MB to stay cheap on 32 MB ROMs.
-    const limit = Math.min(rom.length - n, 1 << 20);
+    // Linear byte-by-byte search. The AGB SDK's save library can end
+    // up linked anywhere — Minish Cap (EEPROM_V) sits at ROM offset
+    // ~0xEF2F8C, well past the first MB — so we scan the whole ROM.
+    // A 32 MB worst-case scan completes in low single-digit ms.
+    const limit = rom.length - n;
     outer:
     for (let i = 0; i < limit; i++) {
       for (let k = 0; k < n; k++) {

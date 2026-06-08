@@ -40,6 +40,11 @@ export class Bus {
 
   io!: IoBridge;
   save!: SaveBridge;
+  // Set by Emulator when the cart's save chip is EEPROM. The 0x0D
+  // bus region then routes through `save` (the Eeprom instance) for
+  // the 1-bit-per-DMA-transfer command/response stream. When false
+  // 0x0D reads return ROM (or open bus for ROMs <= 16 MB).
+  eepromMode = false;
 
   // Last value the BIOS protection register exposes when read while PC ∉ BIOS.
   biosOpenBus = 0xE129F000;
@@ -105,7 +110,12 @@ export class Bus {
       case R.REGION_OAM:   return this.oam[addr & (R.OAM_SIZE - 1)];
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
-      case R.REGION_ROM_4: case R.REGION_ROM_5: {
+      case R.REGION_ROM_4: {
+        const off = addr & 0x01FFFFFF;
+        return off < this.rom.length ? this.rom[off] : (addr >>> 1) & 0xFF;
+      }
+      case R.REGION_ROM_5: {
+        if (this.eepromMode) return this.save.read(addr) & 0xFF;
         const off = addr & 0x01FFFFFF;
         return off < this.rom.length ? this.rom[off] : (addr >>> 1) & 0xFF;
       }
@@ -130,7 +140,13 @@ export class Bus {
       case R.REGION_OAM:   return this.oam16[(addr & (R.OAM_SIZE - 1)) >>> 1];
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
-      case R.REGION_ROM_4: case R.REGION_ROM_5: {
+      case R.REGION_ROM_4: {
+        const off = (addr & 0x01FFFFFF) >>> 1;
+        return off < this.rom16.length ? this.rom16[off] : (addr >>> 1) & 0xFFFF;
+      }
+      case R.REGION_ROM_5: {
+        // EEPROM bit-serial reads return one bit per DMA transfer.
+        if (this.eepromMode) return this.save.read(addr) & 1;
         const off = (addr & 0x01FFFFFF) >>> 1;
         return off < this.rom16.length ? this.rom16[off] : (addr >>> 1) & 0xFFFF;
       }
@@ -157,7 +173,16 @@ export class Bus {
       case R.REGION_OAM:   return this.oam32[(addr & (R.OAM_SIZE - 1)) >>> 2] >>> 0;
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
-      case R.REGION_ROM_4: case R.REGION_ROM_5: {
+      case R.REGION_ROM_4: {
+        const off = (addr & 0x01FFFFFF) >>> 2;
+        return off < this.rom32.length ? this.rom32[off] >>> 0 : (addr & 0xFFFFFFFF) >>> 0;
+      }
+      case R.REGION_ROM_5: {
+        if (this.eepromMode) {
+          const lo = this.save.read(addr) & 1;
+          const hi = this.save.read(addr + 2) & 1;
+          return (lo | (hi << 16)) >>> 0;
+        }
         const off = (addr & 0x01FFFFFF) >>> 2;
         return off < this.rom32.length ? this.rom32[off] >>> 0 : (addr & 0xFFFFFFFF) >>> 0;
       }
@@ -191,6 +216,8 @@ export class Bus {
         return;
       }
       case R.REGION_OAM: return; // OAM ignores byte writes
+      case R.REGION_ROM_5:
+        if (this.eepromMode) this.save.write(addr, v); return;
       case R.REGION_SRAM: case R.REGION_SRAM2:
         if (this.save) this.save.write(addr & 0xFFFF, v); return;
     }
@@ -206,6 +233,8 @@ export class Bus {
       case R.REGION_PRAM:  this.pram16[(addr & (R.PRAM_SIZE - 1)) >>> 1] = v; return;
       case R.REGION_VRAM:  this.vram16[this.vramOff(addr) >>> 1] = v; return;
       case R.REGION_OAM:   this.oam16[(addr & (R.OAM_SIZE - 1)) >>> 1] = v; return;
+      case R.REGION_ROM_5:
+        if (this.eepromMode) this.save.write(addr, v); return;
       case R.REGION_SRAM: case R.REGION_SRAM2: {
         const rot = (v >>> ((addr & 1) << 3)) & 0xFF;
         if (this.save) this.save.write(addr & 0xFFFF, rot); return;
@@ -223,6 +252,16 @@ export class Bus {
       case R.REGION_PRAM:  this.pram32[(addr & (R.PRAM_SIZE - 1)) >>> 2] = v; return;
       case R.REGION_VRAM:  this.vram32[this.vramOff(addr) >>> 2] = v; return;
       case R.REGION_OAM:   this.oam32[(addr & (R.OAM_SIZE - 1)) >>> 2] = v; return;
+      case R.REGION_ROM_5:
+        if (this.eepromMode) {
+          // EEPROM is bit-serial; each DMA write of a 32-bit word
+          // really carries two halfword writes. The bit per write
+          // lives in bit 0 — split a 32-bit write into its two
+          // 16-bit lanes.
+          this.save.write(addr, v & 0xFFFF);
+          this.save.write(addr + 2, (v >>> 16) & 0xFFFF);
+        }
+        return;
       case R.REGION_SRAM: case R.REGION_SRAM2: {
         const rot = (v >>> ((addr & 3) << 3)) & 0xFF;
         if (this.save) this.save.write(addr & 0xFFFF, rot); return;

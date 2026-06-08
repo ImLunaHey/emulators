@@ -1,6 +1,7 @@
 import { Bus, SaveBridge } from './memory/bus';
 import { Flash128K } from './memory/flash';
 import { Sram32K } from './memory/sram';
+import { Eeprom } from './memory/eeprom';
 import { detectSaveType, type SaveType } from './memory/saveDetect';
 import { Rtc } from './memory/rtc';
 import { Cpu } from './cpu/cpu';
@@ -21,6 +22,10 @@ export class Emulator {
   bus = new Bus();
   flash = new Flash128K();
   sram = new Sram32K();
+  // EEPROM chips are accessed via the 0x0D bus region rather than the
+  // SRAM region, so we keep the instance ready and Bus.eepromMode tells
+  // it when to route there.
+  eeprom = new Eeprom(8192);
   rtc = new Rtc();
   saveType: SaveType = 'flash128';
   cheats: Cheat[] = [];
@@ -93,16 +98,18 @@ export class Emulator {
     // "FLASH_V" / "FLASH1M_V" / "EEPROM_V" signature. Default is
     // 128 KB Flash so unknown ROMs still get something workable.
     this.saveType = detectSaveType(bytes);
+    this.bus.eepromMode = false;
     switch (this.saveType) {
       case 'sram':
         this.save = this.sram;
         break;
-      // EEPROM 512/8K not yet implemented; both fall back to Flash 128
-      // until the bit-serial protocol lands.
-      case 'flash64':
-      case 'flash128':
       case 'eeprom512':
       case 'eeprom8k':
+        this.save = this.eeprom;
+        this.bus.eepromMode = true;
+        break;
+      case 'flash64':
+      case 'flash128':
       case 'none':
       default:
         this.save = this.flash;
