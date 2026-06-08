@@ -88,21 +88,6 @@ export class Emulator {
     // depends on game-specific addresses — the canonical BIOS slot is
     // what the AGB SDK polls.)
     this.bus.iwram[0x7FF8] |= 0x01;
-    // FireRed BootInit gates:
-    //   IWRAM[0x3F84] = 1: lets BootInit state machine advance past state 1.
-    //   IWRAM struct at 0x3F50..0x3F5F = 0xEFFF (per 0x080097B4's loop):
-    //     this is what a function called from gMain.callback would normally
-    //     init; doing it here mimics that one-shot setup.
-    //   EWRAM[0x22718] = 1: "main game state initialized" flag the alternate
-    //     init path checks before advancing.
-    if (this.bus.iwram[0x3F84] === 0) this.bus.iwram[0x3F84] = 0x01;
-    if ((this.bus.iwram[0x3F50] | this.bus.iwram[0x3F51]) === 0) {
-      for (let i = 0; i < 16; i += 2) {
-        this.bus.iwram[0x3F50 + i] = 0xFF;
-        this.bus.iwram[0x3F51 + i] = 0xEF;
-      }
-    }
-    if (this.bus.ewram[0x22718] === 0) this.bus.ewram[0x22718] = 0x01;
     return {
       interp: this.recomp.intInsns - intStart,
       jit: this.recomp.jitInsns - jitStart,

@@ -126,6 +126,21 @@ const dt = performance.now() - start;
 console.log(`OK — ${frames} frames in ${dt.toFixed(0)}ms  (last pc=${lastPc.toString(16)})`);
 console.log(`vcountReads=${vcountReads}  lastValue=${lastVcountRead}  irqRaises=${irqRaises}  irqEntries=${irqEntries}`);
 
+// Step-by-step trace of the first N instructions (when TRACE_STEPS env is set).
+if (process.env.TRACE_STEPS) {
+  const steps = parseInt(process.env.TRACE_STEPS, 10) || 30;
+  console.log(`\nStep-by-step trace (${steps} steps from start):`);
+  emu.loadRom(rom);  // reset
+  for (let i = 0; i < steps; i++) {
+    const s = emu.cpu.state;
+    const isT = (s.cpsr & 0x20) !== 0;
+    const decode = s.r[15] & (isT ? ~1 : ~3);
+    const insn = isT ? emu.bus.read16(decode) : emu.bus.read32(decode);
+    console.log(`  ${i.toString().padStart(3)}  pc=0x${decode.toString(16).padStart(8,'0')}  ${isT ? 'T' : 'A'}  insn=0x${insn.toString(16).padStart(isT ? 4 : 8, '0')}  r0=${s.r[0].toString(16)} r1=${s.r[1].toString(16)} r12=${s.r[12].toString(16)} sp=${s.r[13].toString(16)}`);
+    emu.cpu.step();
+  }
+  process.exit(0);
+}
 // PC histogram during the next 10 frames — finer bucket size.
 console.log('\nPC histogram (next 10 frames, 16-byte buckets):');
 const pcCount = new Map<number, number>();

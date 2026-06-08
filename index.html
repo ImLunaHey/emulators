@@ -17,6 +17,22 @@
       .log { width: 720px; height: 120px; overflow: auto; background: #0e0e12; border: 1px solid #1c1c20; padding: 8px; font-size: 11px; color: #9a9aa6; white-space: pre-wrap; }
       button { background: #1c1c22; color: #d8d8e0; border: 1px solid #2a2a30; padding: 6px 12px; font-family: inherit; font-size: 11px; cursor: pointer; border-radius: 4px; }
       button:hover { background: #24242a; }
+      .gamepad { display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto; grid-template-areas: "dpad mid ab" "shoulder mid ab"; gap: 8px; width: 720px; align-items: center; padding: 8px 12px; }
+      .gamepad .dpad { grid-area: dpad; display: grid; grid-template-rows: auto auto auto; justify-items: center; gap: 2px; }
+      .gamepad .dpad-row { display: flex; gap: 2px; }
+      .gamepad .shoulder { grid-area: shoulder; display: flex; gap: 8px; }
+      .gamepad .middle { grid-area: mid; display: flex; gap: 8px; justify-content: center; }
+      .gamepad .ab { grid-area: ab; display: flex; gap: 12px; align-items: flex-end; }
+      .gp-btn { width: 36px; height: 36px; padding: 0; font-size: 13px; font-weight: bold; user-select: none; touch-action: manipulation; }
+      .gp-btn:active, .gp-btn.pressed { background: #3a3a5a; border-color: #5060a0; color: #fff; }
+      .gp-btn.dpad-mid { background: #14141a; border-color: #2a2a30; cursor: default; }
+      .gp-shoulder { width: 64px; }
+      .gp-pill { width: 64px; height: 22px; border-radius: 11px; font-size: 9px; letter-spacing: 0.1em; }
+      .gp-ab { width: 48px; height: 48px; border-radius: 24px; font-size: 18px; }
+      .gp-a { background: #5a3030; border-color: #804040; }
+      .gp-a:active, .gp-a.pressed { background: #aa4040; border-color: #d05050; }
+      .gp-b { background: #305a30; border-color: #408040; }
+      .gp-b:active, .gp-b.pressed { background: #40aa40; border-color: #50d050; }
     </style>
   </head>
   <body>
@@ -25,21 +41,40 @@
       <div class="stats" id="stats">— fps · — Mhz · int 0% · jit 0%</div>
     </header>
     <canvas id="screen" width="240" height="160"></canvas>
+    <div class="gamepad">
+      <div class="dpad">
+        <button class="gp-btn" data-key="UP">▲</button>
+        <div class="dpad-row">
+          <button class="gp-btn" data-key="LEFT">◀</button>
+          <button class="gp-btn dpad-mid" disabled></button>
+          <button class="gp-btn" data-key="RIGHT">▶</button>
+        </div>
+        <button class="gp-btn" data-key="DOWN">▼</button>
+      </div>
+      <div class="shoulder">
+        <button class="gp-btn gp-shoulder" data-key="L">L</button>
+        <button class="gp-btn gp-shoulder" data-key="R">R</button>
+      </div>
+      <div class="middle">
+        <button class="gp-btn gp-pill" data-key="SELECT">SELECT</button>
+        <button class="gp-btn gp-pill" data-key="START">START</button>
+      </div>
+      <div class="ab">
+        <button class="gp-btn gp-ab gp-b" data-key="B">B</button>
+        <button class="gp-btn gp-ab gp-a" data-key="A">A</button>
+      </div>
+    </div>
     <div class="row">
-      <span><b>D-Pad</b> Arrows</span>
-      <span><b>A</b> Z</span>
-      <span><b>B</b> X</span>
-      <span><b>L</b> A</span>
-      <span><b>R</b> S</span>
-      <span><b>Start</b> Enter</span>
-      <span><b>Select</b> Shift</span>
       <select id="rom" style="background:#1c1c22;color:#d8d8e0;border:1px solid #2a2a30;padding:6px;font-family:inherit;font-size:11px;border-radius:4px">
         <option value="/firered.gba">Pokemon FireRed</option>
         <option value="/emerald.gba">Pokemon Emerald</option>
         <option value="/ruby.gba">Pokemon Ruby</option>
+        <option value="/garfield.gba">Garfield: Search for Pooky</option>
+        <option value="/crash.gba">Crash Bandicoot</option>
       </select>
       <button id="pause">Pause</button>
       <button id="reset">Reset</button>
+      <span style="opacity:0.5">keys: arrows · z/x · a/s · enter/shift</span>
     </div>
     <div class="log" id="log"></div>
     <script type="module" src="/src/main.ts"></script>

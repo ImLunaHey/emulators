@@ -91,7 +91,14 @@ export class Cpu {
 
   flushPipeline(): void {
     this.prefetchedValid = false;
+    this.branched = true;
   }
+
+  // Set by flushPipeline() to tell step() that PC was redirected by the
+  // executed instruction (branch, BX, LDR PC, etc.). Replaces the buggy
+  // "compare r[15] to visible PC" heuristic: BX to addr (= decode + 8)
+  // was indistinguishable from no-branch under that check.
+  branched = false;
 
   // Single dispatch — fetch from r[15] (= next decode addr), temporarily
   // raise r[15] to the architectural visible PC for execute, then advance
@@ -112,14 +119,14 @@ export class Cpu {
     const prefetchOff = isThumb ? 4 : 8;
     const decode = s.r[15] & (isThumb ? ~1 : ~3);
     const instr = isThumb ? this.bus.read16(decode) : this.bus.read32(decode);
-    const visible = (decode + prefetchOff) >>> 0;
-    s.r[15] = visible;
+    s.r[15] = (decode + prefetchOff) >>> 0;
+    this.branched = false;
 
     if (isThumb) thumbExecute(this, instr);
     else         armExecute(this, instr);
 
-    // No branch happened → advance to next decode.
-    if (s.r[15] === visible) s.r[15] = (decode + insnSize) >>> 0;
+    // Auto-advance to the next decode if execute didn't flush the pipeline.
+    if (!this.branched) s.r[15] = (decode + insnSize) >>> 0;
     this.cycles += 1;
     return 1;
   }
