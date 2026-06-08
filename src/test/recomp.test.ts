@@ -41,8 +41,9 @@ describe('Recompiler (JIT)', () => {
     initThumb(emu, pc);
     // Force-compile by inserting a fake hit count past threshold.
     (emu.recomp as any).hits.set(pc, 1000);
+    // tryDispatch returns the number of insns it executed (3 here).
     const ran = emu.recomp.tryDispatch();
-    expect(ran).toBe(true);
+    expect(ran).toBe(3);
     expect(emu.cpu.state.r[0]).toBe(12);
     // After the block, r[15] should be advanced past the 3 insns.
     expect(emu.cpu.state.r[15] & ~1).toBe(pc + 6);
@@ -57,7 +58,7 @@ describe('Recompiler (JIT)', () => {
     placeInsns(emu, pc, [0x2005, 0x2805, 0xD000 /* BEQ #0 -> taken=pc+4+0=pc+4 */]);
     initThumb(emu, pc);
     (emu.recomp as any).hits.set(pc, 1000);
-    expect(emu.recomp.tryDispatch()).toBe(true);
+    expect(emu.recomp.tryDispatch()).toBeGreaterThan(0);
     // taken target is pc + 4 + (0 << 1) = pc + 4 (= the next-next insn)
     // But our BEQ encoding with off=0 actually means target = pc + 4 +
     // (0 << 1) = pc + 4 RELATIVE to the branch PC (which is pc + 4 in the
@@ -79,7 +80,7 @@ describe('Recompiler (JIT)', () => {
     emu.cpu.state.r[0] = 0xCAFEBABE;
     emu.cpu.state.r[1] = 0x03004000;
     (emu.recomp as any).hits.set(pc, 1000);
-    expect(emu.recomp.tryDispatch()).toBe(true);
+    expect(emu.recomp.tryDispatch()).toBeGreaterThan(0);
     expect(emu.cpu.state.r[2]).toBe(0xCAFEBABE);
   });
 
@@ -92,8 +93,8 @@ describe('Recompiler (JIT)', () => {
     placeInsns(emu, pc, [0xB501]);
     initThumb(emu, pc);
     (emu.recomp as any).hits.set(pc, 1000);
-    expect(emu.recomp.tryDispatch()).toBe(false);
+    expect(emu.recomp.tryDispatch()).toBe(0);
     // Now-cached as null so a second call doesn't bother re-trying.
-    expect(emu.recomp.tryDispatch()).toBe(false);
+    expect(emu.recomp.tryDispatch()).toBe(0);
   });
 });

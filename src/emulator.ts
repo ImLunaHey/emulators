@@ -140,7 +140,13 @@ export class Emulator {
       let i = 0;
       while (i < batch) {
         cpu.irqLine = irq.cachedPending;
-        if (this.recomp.tryDispatch()) i++;
+        // tryDispatch returns the number of THUMB insns the JIT block
+        // executed (0 when it didn't dispatch). We MUST advance `i` by
+        // that count, not by 1 — otherwise a JIT block of 20 insns
+        // counts as a single cycle, PPU/timers under-step by 20×, and
+        // the game's main loop ticks ~20× per real-time VBlank.
+        const jitN = this.recomp.tryDispatch();
+        if (jitN > 0) i += jitN;
         else { cpu.step(); i++; this.recomp.intInsns++; }
         if (cpu.state.halted) { i = batch; break; }
       }

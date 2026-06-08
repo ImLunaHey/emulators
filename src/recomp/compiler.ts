@@ -88,23 +88,31 @@ export class Recompiler {
     };
   }
 
-  tryDispatch(): boolean {
-    if (!this.enabled) return false;
+  // Returns the number of THUMB instructions executed by the JIT block
+  // it dispatched, or 0 if no dispatch happened (interpreter must
+  // handle this PC). Callers MUST advance their own cycle/instruction
+  // counter by the returned value, not by 1 — a compiled block is
+  // typically 5-32 instructions, and treating it as a single cycle
+  // makes runFrame consume the whole frame budget in far fewer
+  // iterations, effectively running ~N× more game code per real-time
+  // VBlank than the interpreter. That's the "JIT runs too fast" bug.
+  tryDispatch(): number {
+    if (!this.enabled) return 0;
     const s = this.cpu.state;
-    if (!(s.cpsr & 0x20)) return false;        // ARM blocks not jitted
+    if (!(s.cpsr & 0x20)) return 0;            // ARM blocks not jitted
     const pc = s.r[15] & ~1;
     const cached = this.cache.get(pc);
-    if (cached === null) return false;          // known-uncompilable
+    if (cached === null) return 0;              // known-uncompilable
     if (cached) {
       return this.runBlock(cached);
     }
     const c = (this.hits.get(pc) || 0) + 1;
     this.hits.set(pc, c);
-    if (c < HOT_THRESHOLD) return false;
+    if (c < HOT_THRESHOLD) return 0;
     this.hits.delete(pc);
     const block = this.compile(pc);
     this.cache.set(pc, block);
-    if (!block) return false;
+    if (!block) return 0;
     return this.runBlock(block);
   }
 
@@ -113,7 +121,7 @@ export class Recompiler {
   // Push JS-side CpuState into linear memory, run the block, pull state
   // back. The copy is 17 u32 writes either side (~50ns total) — small
   // enough that even short blocks come out ahead of the interpreter.
-  private runBlock(block: CompiledBlock): boolean {
+  private runBlock(block: CompiledBlock): number {
     const s = this.cpu.state;
     const mem = this.memU32;
     // In: r[0..15], cpsr.
@@ -124,7 +132,7 @@ export class Recompiler {
     for (let i = 0; i < 16; i++) s.r[i] = mem[i];
     s.cpsr = mem[CPSR_OFF >> 2] | 0;
     this.jitInsns += n;
-    return n > 0;
+    return n;
   }
 
   private compile(startPc: number): CompiledBlock | null {

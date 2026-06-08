@@ -64,9 +64,9 @@ describe('Recompiler micro-benchmark', () => {
       let executed = 0;
       const t0 = performance.now();
       while (executed < N) {
-        if (emu.recomp.tryDispatch()) {
-          // tryDispatch executed one block (insns.length insns)
-          executed += insns.length;
+        const n = emu.recomp.tryDispatch();
+        if (n > 0) {
+          executed += n;
         } else {
           emu.cpu.step();
           executed++;

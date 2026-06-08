@@ -182,7 +182,8 @@ for (let f = 0; f < 10; f++) {
   while (executed < 280896) {
     emu.cpu.irqLine = emu.irq.pending();
     let cycles: number;
-    if (emu.recomp.tryDispatch()) cycles = 1;
+    const jitN = emu.recomp.tryDispatch();
+    if (jitN > 0) cycles = jitN;
     else cycles = emu.cpu.step();
     emu.ppu.step(cycles);
     emu.timers.step(cycles);

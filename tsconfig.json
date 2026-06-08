@@ -18,6 +18,7 @@
   "include": ["src"],
   "exclude": [
     "src/test/boot.ts",
+    "src/test/screenshot.ts",
     "src/test/**/*.test.ts"
   ]
 }
