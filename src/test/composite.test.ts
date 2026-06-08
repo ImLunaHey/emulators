@@ -191,6 +191,68 @@ describe('Compositor: alpha blending', () => {
   });
 });
 
+describe('Compositor: windows', () => {
+  it('WIN0 enables BG0 inside its rect, disables outside', () => {
+    const ppu = makePpu();
+    // Put RED on BG0 across the whole scanline.
+    for (let x = 0; x < 240; x++) ppu.bgLine[0][x] = bgPixel(RED, 0);
+    // Enable WIN0, with BG0 enabled INSIDE, nothing enabled OUTSIDE.
+    ppu.dispcnt = 0x2000;  // WIN0 on
+    ppu.win0H = (50 << 8) | 100;   // x range [50, 100)
+    ppu.win0V = (0 << 8) | 160;    // y range full screen
+    ppu.winIn = 0x01;              // inside WIN0: BG0 allowed
+    ppu.winOut = 0x00;             // outside: nothing allowed (only backdrop)
+    ppu.bus.pram16[0] = WHITE;     // backdrop = white
+    compositeScanline(ppu, 10, WHITE);
+    // Inside: red.
+    const inside = pixelAt(ppu, 75, 10);
+    expect(inside.r).toBeGreaterThan(240);
+    expect(inside.g).toBeLessThan(20);
+    // Outside: backdrop (white).
+    const outside = pixelAt(ppu, 25, 10);
+    expect(outside.r).toBeGreaterThan(240);
+    expect(outside.g).toBeGreaterThan(240);
+    expect(outside.b).toBeGreaterThan(240);
+  });
+
+  it('WIN0 vertical bounds clip — outside Y range is "outside"', () => {
+    const ppu = makePpu();
+    for (let x = 0; x < 240; x++) ppu.bgLine[0][x] = bgPixel(RED, 0);
+    ppu.dispcnt = 0x2000;
+    ppu.win0H = (0 << 8) | 240;    // full X
+    ppu.win0V = (50 << 8) | 100;   // y [50, 100)
+    ppu.winIn = 0x01;
+    ppu.winOut = 0x00;
+    ppu.bus.pram16[0] = WHITE;
+    // Inside Y range.
+    compositeScanline(ppu, 75, WHITE);
+    expect(pixelAt(ppu, 100, 75).r).toBeGreaterThan(240);
+    // Outside Y range.
+    compositeScanline(ppu, 110, WHITE);
+    expect(pixelAt(ppu, 100, 110).r).toBeGreaterThan(240);
+    expect(pixelAt(ppu, 100, 110).g).toBeGreaterThan(240);  // white
+  });
+
+  it('WIN1 has lower priority than WIN0 (WIN0 wins at overlap)', () => {
+    const ppu = makePpu();
+    for (let x = 0; x < 240; x++) ppu.bgLine[0][x] = bgPixel(RED, 0);
+    ppu.dispcnt = 0x6000;  // WIN0 + WIN1 on
+    ppu.win0H = (10 << 8) | 50;
+    ppu.win0V = (0 << 8) | 160;
+    ppu.win1H = (40 << 8) | 100;
+    ppu.win1V = (0 << 8) | 160;
+    ppu.winIn = 0x01 | (0x00 << 8);  // WIN0 allows BG0, WIN1 allows nothing
+    ppu.winOut = 0x00;
+    ppu.bus.pram16[0] = WHITE;
+    compositeScanline(ppu, 10, WHITE);
+    // x=45 is in both windows — WIN0 wins, BG0 visible.
+    expect(pixelAt(ppu, 45, 10).r).toBeGreaterThan(240);
+    expect(pixelAt(ppu, 45, 10).g).toBeLessThan(20);
+    // x=75 is only in WIN1 — backdrop (because WIN1 disables BG0).
+    expect(pixelAt(ppu, 75, 10).g).toBeGreaterThan(240);
+  });
+});
+
 describe('Compositor: BGR555 → RGBA conversion accuracy', () => {
   it('pure red (0x001F) decodes to full red', () => {
     const ppu = makePpu();
