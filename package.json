@@ -6,13 +6,15 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview",
+    "preview": "npm run build && wrangler dev",
     "boot": "tsx src/test/boot.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "oxlint src"
+    "lint": "oxlint src",
+    "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.40.0",
     "@tailwindcss/vite": "^4.3.0",
     "@types/node": "^25.9.2",
     "@types/react": "^19.2.17",
@@ -23,7 +25,8 @@
     "tsx": "^4.22.4",
     "typescript": "^5.6.3",
     "vite": "^8.0.16",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "wrangler": "^4.98.0"
   },
   "dependencies": {
     "fflate": "^0.8.3",
