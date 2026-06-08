@@ -183,6 +183,12 @@ for (let i = 0; i < emu.bus.ewram.length; i++) {
 }
 console.log(`Non-zero EWRAM ranges (>=4 bytes):${ewramRanges || ' (none)'}`);
 console.log(`EWRAM[0..0x10]: ${Array.from(emu.bus.ewram.slice(0, 16)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
+// Check first init function output: should set IWRAM[0x60..0xBF] to 0xFF.
+const iwramAtRange = (s: number, e: number) =>
+  Array.from(emu.bus.iwram.slice(s, e)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+console.log(`IWRAM[0x60..0x70]: ${iwramAtRange(0x60, 0x70)}`);
+console.log(`IWRAM[0xB0..0xC0]: ${iwramAtRange(0xB0, 0xC0)}`);
+console.log(`IWRAM[0xC0..0xD0]: ${iwramAtRange(0xC0, 0xD0)}`);
 
 // Sample frame buffer pixels.
 const f = emu.ppu.frame;
