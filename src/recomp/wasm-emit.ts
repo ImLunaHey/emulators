@@ -80,6 +80,11 @@ export const OP_I32_SHR_S   = 0x75;
 export const OP_I32_SHR_U   = 0x76;
 export const OP_I32_ROTL    = 0x77;
 export const OP_I32_ROTR    = 0x78;
+export const OP_I32_LOAD    = 0x28;
+export const OP_I32_LOAD8_U = 0x2D;
+export const OP_I32_STORE   = 0x36;
+export const OP_I32_STORE8  = 0x3A;
+export const OP_I32_STORE16 = 0x3B;
 
 export class WasmFunction {
   locals: number[] = []; // count, type, count, type, ...
@@ -104,6 +109,20 @@ export class WasmFunction {
   op(opcode: number): this { this.body.push(opcode); return this; }
   end(): this { this.body.push(OP_END); return this; }
   ret(): this { this.body.push(OP_RETURN); return this; }
+
+  // memarg = align (uleb) + offset (uleb). align is log2 of natural size.
+  i32Load(offset: number, align = 2): this {
+    this.body.push(OP_I32_LOAD); uleb(align, this.body); uleb(offset, this.body); return this;
+  }
+  i32Store(offset: number, align = 2): this {
+    this.body.push(OP_I32_STORE); uleb(align, this.body); uleb(offset, this.body); return this;
+  }
+  i32Load8U(offset: number): this {
+    this.body.push(OP_I32_LOAD8_U); uleb(0, this.body); uleb(offset, this.body); return this;
+  }
+  i32Store8(offset: number): this {
+    this.body.push(OP_I32_STORE8); uleb(0, this.body); uleb(offset, this.body); return this;
+  }
 }
 
 // Builds a module:
@@ -116,6 +135,10 @@ export class WasmModuleBuilder {
   // Caller provides: read8, read16, read32, write8, write16, write32, getR, setR,
   //                  setNZ, exec_thumb, exec_arm
   imports: { module: string; field: string; params: number[]; results: number[] }[] = [];
+  // Optional memory import. When set, the module declares an imported
+  // memory (kind=0x02) instead of defining its own. Limits: min pages
+  // only (max omitted).
+  memImport: { module: string; field: string; minPages: number } | null = null;
   func: WasmFunction;
   exportName = 'run';
 
@@ -127,6 +150,10 @@ export class WasmModuleBuilder {
     const idx = this.imports.length;
     this.imports.push({ module, field, params, results });
     return idx;
+  }
+
+  importMemory(module: string, field: string, minPages: number): void {
+    this.memImport = { module, field, minPages };
   }
 
   encode(): Uint8Array {
@@ -163,7 +190,8 @@ export class WasmModuleBuilder {
     // Import section.
     {
       const body: number[] = [];
-      uleb(this.imports.length, body);
+      const totalImports = this.imports.length + (this.memImport ? 1 : 0);
+      uleb(totalImports, body);
       for (const imp of this.imports) {
         const mod = stringBytes(imp.module);
         const fld = stringBytes(imp.field);
@@ -171,6 +199,15 @@ export class WasmModuleBuilder {
         uleb(fld.length, body); body.push(...fld);
         body.push(0x00);                       // import kind: function
         uleb(sigIdx({ params: imp.params, results: imp.results }), body);
+      }
+      if (this.memImport) {
+        const mod = stringBytes(this.memImport.module);
+        const fld = stringBytes(this.memImport.field);
+        uleb(mod.length, body); body.push(...mod);
+        uleb(fld.length, body); body.push(...fld);
+        body.push(0x02);                       // import kind: memory
+        body.push(0x00);                       // limits: flags = 0 (no max)
+        uleb(this.memImport.minPages, body);
       }
       writeSection(out, SEC_IMPORT, body);
     }

@@ -65,10 +65,16 @@ export function Screen({ emu, paused, audio, onStats }: Props) {
         fpsAvg = fpsAvg ? fpsAvg * 0.6 + inst * 0.4 : inst;
         lastStatTs = ts;
         blitted = 0;
-        const total = lastR.interp + lastR.jit || 1;
-        const jitPct = ((lastR.jit / total) * 100) | 0;
+        // Only show JIT share when the recompiler is enabled — otherwise
+        // every frame would read "jit 0%" which is just noise.
+        let jitBit = '';
+        if (emu.recomp.enabled) {
+          const total = lastR.interp + lastR.jit || 1;
+          const jitPct = ((lastR.jit / total) * 100) | 0;
+          jitBit = ` · jit ${jitPct}%`;
+        }
         onStats(
-          `${fpsAvg.toFixed(1)} fps · ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz · jit ${jitPct}%`,
+          `${fpsAvg.toFixed(1)} fps · ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz${jitBit}`,
         );
       }
     };

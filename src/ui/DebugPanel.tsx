@@ -7,7 +7,7 @@ interface Props {
   onClose: () => void;
 }
 
-type Tab = 'cpu' | 'mem' | 'palette' | 'tiles' | 'sprites' | 'io';
+type Tab = 'cpu' | 'mem' | 'palette' | 'tiles' | 'sprites' | 'io' | 'adv';
 
 export function DebugPanel({ open, emu, onClose }: Props) {
   const [tab, setTab] = useState<Tab>('cpu');
@@ -24,7 +24,7 @@ export function DebugPanel({ open, emu, onClose }: Props) {
           <button onClick={onClose} className="bg-transparent border-0 text-[#d8d8e0] text-lg cursor-pointer px-2 hover:text-white">×</button>
         </div>
         <div className="flex gap-1 mb-3 text-[11px]">
-          {(['cpu', 'mem', 'palette', 'tiles', 'sprites', 'io'] as Tab[]).map((t) => (
+          {(['cpu', 'mem', 'palette', 'tiles', 'sprites', 'io', 'adv'] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -43,6 +43,7 @@ export function DebugPanel({ open, emu, onClose }: Props) {
           {tab === 'tiles'   && <TilesView emu={emu} />}
           {tab === 'sprites' && <SpritesView emu={emu} />}
           {tab === 'io'      && <IoView emu={emu} />}
+          {tab === 'adv'     && <AdvancedView emu={emu} />}
         </div>
       </div>
     </div>
@@ -456,6 +457,60 @@ function IoView({ emu }: { emu: Emulator }) {
           <div className="flex justify-between"><span className="opacity-50">FIFO B</span><span>{emu.sound.countB}/32</span></div>
           <div className="flex justify-between"><span className="opacity-50">Rate</span><span>{emu.sound.sampleRate.toFixed(0)} Hz</span></div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Experimental/advanced settings — currently just the THUMB recompiler
+// (JIT) toggle. The JIT translates hot THUMB basic blocks to WASM; it
+// can give a large speedup on register-heavy code but still falls back
+// to the interpreter for unsupported instructions and for ARM blocks.
+// Toggling reruns hot detection from scratch (the block cache is dropped).
+function AdvancedView({ emu }: { emu: Emulator }) {
+  useLiveTick(4);
+  const r = emu.recomp;
+  const total = r.intInsns + r.jitInsns;
+  const pct = total === 0 ? 0 : (r.jitInsns * 100) / total;
+  // useState mirrors enabled flag to drive re-renders on toggle.
+  const [, setBump] = useState(0);
+  const toggle = () => {
+    r.enabled = !r.enabled;
+    if (!r.enabled) r.invalidate();
+    setBump((b) => b + 1);
+  };
+  return (
+    <div className="text-[11px] space-y-4">
+      <div>
+        <div className="text-[10px] uppercase tracking-widest opacity-50 mb-2">Recompiler (THUMB JIT)</div>
+        <label className="flex items-center gap-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={r.enabled}
+            onChange={toggle}
+            className="w-4 h-4 accent-[#5060a0]"
+          />
+          <span>Enable JIT</span>
+          <span className="opacity-50 text-[10px]">experimental — may regress on some games</span>
+        </label>
+        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono">
+          <div className="flex justify-between"><span className="opacity-50">Interpreted insns</span><span>{r.intInsns.toLocaleString()}</span></div>
+          <div className="flex justify-between"><span className="opacity-50">JIT insns</span><span>{r.jitInsns.toLocaleString()}</span></div>
+          <div className="flex justify-between"><span className="opacity-50">JIT share</span><span>{pct.toFixed(1)}%</span></div>
+          <div className="flex justify-between"><span className="opacity-50">Cached blocks</span><span>{r.cache.size}</span></div>
+          <div className="flex justify-between"><span className="opacity-50">Profiling</span><span>{r.hits.size} hot PCs</span></div>
+        </div>
+        <button
+          onClick={() => { r.invalidate(); setBump((b) => b + 1); }}
+          className="btn-default mt-3 !text-[10px]"
+          disabled={r.cache.size === 0 && r.hits.size === 0}
+        >Clear JIT cache</button>
+      </div>
+      <div className="text-[10px] opacity-50 leading-relaxed">
+        The JIT compiles hot THUMB basic blocks to WebAssembly. Only Format
+        3/4/9 ALU + Format 16/18 branches are translated today; everything
+        else still goes through the interpreter, as do all ARM blocks. If a
+        game misbehaves, turn this off and reload the ROM.
       </div>
     </div>
   );

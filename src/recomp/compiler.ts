@@ -10,10 +10,21 @@ import * as W from './wasm-emit';
 //
 // The compiled function signature is `(unused: i32) -> i32` and it
 // returns the number of THUMB instructions it executed. The host uses
-// that to advance its own instruction-count statistics. r[15] is
-// updated via the setR import whenever a branch is taken inside the
-// block; otherwise the block emits a final setR at the end with the
-// next-PC value so the dispatcher knows where to go.
+// that to advance its own instruction-count statistics.
+//
+// REGISTER + CPSR STATE LIVES IN WASM LINEAR MEMORY.
+//
+// All compiled modules share one imported WebAssembly.Memory owned by
+// the Recompiler. The first 68 bytes lay out:
+//   offset 0x00..0x3F  -- r[0..15]   (16 × u32)
+//   offset 0x40        -- cpsr       (u32)
+// register access compiles to a single i32.load/i32.store against a
+// constant offset; the previous build went through getR/setR import
+// callbacks (50-150ns each, ~3× per simple ALU op) so this is where
+// the JIT actually starts winning against the interpreter. State syncs
+// in/out of the WASM memory at the dispatch boundary (tryDispatch).
+// Bus memory I/O (r32/w32/r16/w16/r8/w8) is still imported, since the
+// bus does region routing the JIT doesn't model yet.
 
 interface CompiledBlock {
   run: () => number;
@@ -24,69 +35,46 @@ interface CompiledBlock {
 const HOT_THRESHOLD = 50;
 const MAX_BLOCK_INSNS = 32;
 
+// Linear memory layout (offsets into the shared WebAssembly.Memory).
+const REG_BASE  = 0;
+const CPSR_OFF  = 64;
+
 export class Recompiler {
   cache = new Map<number, CompiledBlock | null>();   // null = compile failed
   hits = new Map<number, number>();
   jitInsns = 0;
   intInsns = 0;
-  // The JIT translator works correctly but is currently SLOWER than the
-  // interpreter because every translated instruction makes 1-3 imported
-  // JS function calls (getR/setR/setNZ/etc.), and each WASM↔JS boundary
-  // crossing is ~50-150ns. The interpreter spends ~50ns total on simple
-  // ALU ops, so the WASM dispatch loses on net. The proper fix is
-  // putting register + CPSR state inside the WASM module's linear
-  // memory so register access becomes a direct i32.load/store instead
-  // of an import — that's a 5-10× speedup and the next milestone.
-  // Until then the JIT is opt-in: the Recompiler infrastructure is
-  // ready and tests prove it executes correctly, but it's left disabled
-  // so the default config doesn't lose performance to it.
+  // Opt-in. The linear-memory refactor (see file header) makes the
+  // JIT ~5× faster than the interpreter on a pure ALU+branch micro-
+  // bench, but real-game performance hasn't been re-measured since;
+  // leave the flag off by default until that bake-in is done. Tests
+  // enable it explicitly.
   enabled = false;
 
-  // Host hooks bound at construction so each WASM Instance can use the
-  // same callbacks. CPU state goes through them; memory I/O goes
-  // through them.
+  // Shared linear memory for all compiled modules. 1 page = 64KB,
+  // dwarfs what we use today (68 bytes) but leaves room for future
+  // in-memory IWRAM/EWRAM mirroring.
+  private mem: WebAssembly.Memory;
+  // Uint32Array view onto the same buffer for fast JS-side state sync.
+  // Stable as long as we never grow the memory.
+  private memU32: Uint32Array;
+
+  // Host hooks bound at construction. Only bus I/O + SWI/exception
+  // helpers go through them now; register and CPSR access happens
+  // entirely in WASM.
   private hooks: {
-    getR:  (i: number) => number;
-    setR:  (i: number, v: number) => void;
-    setNZ: (v: number) => void;
-    setFlagsAdd: (a: number, b: number, r: number) => void;
-    setFlagsSub: (a: number, b: number, r: number) => void;
-    checkCond:   (cond: number) => number;
     r32: (a: number) => number;  w32: (a: number, v: number) => void;
     r16: (a: number) => number;  w16: (a: number, v: number) => void;
     r8:  (a: number) => number;  w8:  (a: number, v: number) => void;
   };
+  // Module-level imports object shape — populated lazily per compile.
+  private importsObj: { h: Record<string, Function>; m: { mem: WebAssembly.Memory } };
 
   constructor(public cpu: Cpu) {
-    // Resolve cpu.state lazily on every call — cpu.reset() replaces the
-    // state object entirely, so capturing it at construction would
-    // strand the hooks pointing at a dead object. Bus is stable for the
-    // emulator's lifetime so binding bus once is safe.
-    const c = cpu;
+    this.mem = new WebAssembly.Memory({ initial: 1 });
+    this.memU32 = new Uint32Array(this.mem.buffer);
     const bus = cpu.bus;
     this.hooks = {
-      getR:  (i) => c.state.r[i] >>> 0,
-      setR:  (i, v) => { c.state.r[i] = v >>> 0; },
-      setNZ: (v) => c.state.setNZ(v),
-      setFlagsAdd: (a, b, r) => {
-        const s = c.state;
-        s.setNZ(r);
-        // Carry on unsigned add: result < either operand (unsigned).
-        if ((r >>> 0) < (a >>> 0)) s.cpsr |= 0x20000000; else s.cpsr &= ~0x20000000;
-        // V on signed add: both inputs same sign, result opposite.
-        const v = (~(a ^ b) & (a ^ r)) >>> 31;
-        if (v) s.cpsr |= 0x10000000; else s.cpsr &= ~0x10000000;
-      },
-      setFlagsSub: (a, b, r) => {
-        const s = c.state;
-        s.setNZ(r);
-        // Carry on unsigned sub: no borrow when a >= b (unsigned).
-        if ((a >>> 0) >= (b >>> 0)) s.cpsr |= 0x20000000; else s.cpsr &= ~0x20000000;
-        // V: inputs different sign AND result sign differs from a.
-        const v = ((a ^ b) & (a ^ r)) >>> 31;
-        if (v) s.cpsr |= 0x10000000; else s.cpsr &= ~0x10000000;
-      },
-      checkCond: (cond) => c.state.checkCond(cond) ? 1 : 0,
       r32: (a) => bus.read32(a >>> 0),
       w32: (a, v) => bus.write32(a >>> 0, v >>> 0),
       r16: (a) => bus.read16(a >>> 0),
@@ -94,23 +82,21 @@ export class Recompiler {
       r8:  (a) => bus.read8(a >>> 0),
       w8:  (a, v) => bus.write8(a >>> 0, v & 0xFF),
     };
+    this.importsObj = {
+      h: this.hooks as unknown as Record<string, Function>,
+      m: { mem: this.mem },
+    };
   }
 
   tryDispatch(): boolean {
     if (!this.enabled) return false;
     const s = this.cpu.state;
     if (!(s.cpsr & 0x20)) return false;        // ARM blocks not jitted
-    // Between step() calls, r[15] holds the decode address of the next
-    // THUMB instruction (with bit 0 as the THUMB indicator). Strip that
-    // bit to get the actual pc; that's the key we cache compiled
-    // blocks under.
     const pc = s.r[15] & ~1;
     const cached = this.cache.get(pc);
     if (cached === null) return false;          // known-uncompilable
     if (cached) {
-      const n = cached.run();
-      this.jitInsns += n;
-      return n > 0;
+      return this.runBlock(cached);
     }
     const c = (this.hits.get(pc) || 0) + 1;
     this.hits.set(pc, c);
@@ -119,129 +105,270 @@ export class Recompiler {
     const block = this.compile(pc);
     this.cache.set(pc, block);
     if (!block) return false;
-    const n = block.run();
-    this.jitInsns += n;
-    return n > 0;
+    return this.runBlock(block);
   }
 
   invalidate(): void { this.cache.clear(); this.hits.clear(); }
+
+  // Push JS-side CpuState into linear memory, run the block, pull state
+  // back. The copy is 17 u32 writes either side (~50ns total) — small
+  // enough that even short blocks come out ahead of the interpreter.
+  private runBlock(block: CompiledBlock): boolean {
+    const s = this.cpu.state;
+    const mem = this.memU32;
+    // In: r[0..15], cpsr.
+    for (let i = 0; i < 16; i++) mem[i] = s.r[i];
+    mem[CPSR_OFF >> 2] = s.cpsr >>> 0;
+    const n = block.run();
+    // Out: same.
+    for (let i = 0; i < 16; i++) s.r[i] = mem[i];
+    s.cpsr = mem[CPSR_OFF >> 2] | 0;
+    this.jitInsns += n;
+    return n > 0;
+  }
 
   private compile(startPc: number): CompiledBlock | null {
     const bus = this.cpu.bus;
     const builder = new W.WasmModuleBuilder();
     const f = builder.func;
 
-    // Import indices — these match `this.hooks` shape.
-    const I_getR        = builder.addImport('h', 'getR',        [W.I32], [W.I32]);
-    const I_setR        = builder.addImport('h', 'setR',        [W.I32, W.I32], []);
-    const I_setNZ       = builder.addImport('h', 'setNZ',       [W.I32], []);
-    const I_setFlagsAdd = builder.addImport('h', 'setFlagsAdd', [W.I32, W.I32, W.I32], []);
-    const I_setFlagsSub = builder.addImport('h', 'setFlagsSub', [W.I32, W.I32, W.I32], []);
-    const I_checkCond   = builder.addImport('h', 'checkCond',   [W.I32], [W.I32]);
-    const I_r32         = builder.addImport('h', 'r32',         [W.I32], [W.I32]);
-    const I_w32         = builder.addImport('h', 'w32',         [W.I32, W.I32], []);
-    const I_r16         = builder.addImport('h', 'r16',         [W.I32], [W.I32]);
-    const I_w16         = builder.addImport('h', 'w16',         [W.I32, W.I32], []);
-    const I_r8          = builder.addImport('h', 'r8',          [W.I32], [W.I32]);
-    const I_w8          = builder.addImport('h', 'w8',          [W.I32, W.I32], []);
+    // Memory import — shared across every compiled module.
+    builder.importMemory('m', 'mem', 1);
+    // Bus I/O imports — the bus still does the region routing.
+    const I_r32 = builder.addImport('h', 'r32', [W.I32], [W.I32]);
+    const I_w32 = builder.addImport('h', 'w32', [W.I32, W.I32], []);
+    const I_r16 = builder.addImport('h', 'r16', [W.I32], [W.I32]);
+    const I_w16 = builder.addImport('h', 'w16', [W.I32, W.I32], []);
+    const I_r8  = builder.addImport('h', 'r8',  [W.I32], [W.I32]);
+    const I_w8  = builder.addImport('h', 'w8',  [W.I32, W.I32], []);
 
-    // Reserve a couple of locals for intermediate values. The function
-    // already has 1 i32 parameter (unused), so local indices 1..N are
-    // available after we addLocals().
-    f.addLocals(4, W.I32);
-    const L_A = 1, L_B = 2, L_R = 3, L_TMP = 4;
+    // Locals. f has 1 i32 param (unused), so locals start at index 1.
+    f.addLocals(5, W.I32);
+    const L_A = 1, L_B = 2, L_R = 3, L_TMP = 4, L_TMP2 = 5;
 
-    // Tiny emitter primitives that hide the import indices.
-    const pushGetR = (rd: number) => { f.i32Const(rd); f.call(I_getR); };
-    const callSetR = () => { f.call(I_setR); };
+    // ----- emitter primitives. All assume linear memory base is at 0.
+
+    // Push r[rd] onto the stack.
+    const pushReg = (rd: number) => {
+      f.i32Const(0);                          // base addr
+      f.i32Load(REG_BASE + rd * 4);
+    };
+
+    // Store value-in-local into r[rd]. Caller is responsible for
+    // putting the value into `localIdx` (typical pattern: compute,
+    // local.tee L; ...; storeRegFromLocal(rd, L)). We don't use the
+    // direct setReg(rd, expr) form because i32.store wants
+    // [addr, value] on the stack and reordering after computation
+    // is fiddly.
+    const storeRegFromLocal = (rd: number, localIdx: number) => {
+      f.i32Const(0);
+      f.localGet(localIdx);
+      f.i32Store(REG_BASE + rd * 4);
+    };
+
+    // Store the i32 constant `val` into r[rd].
+    const storeRegConst = (rd: number, val: number) => {
+      f.i32Const(0);
+      f.i32Const(val | 0);
+      f.i32Store(REG_BASE + rd * 4);
+    };
+
+    // setNZ(value-in-localIdx) — updates the CPSR's N+Z bits in place.
+    // Equivalent to CpuState.setNZ.
+    const emitSetNZ = (localIdx: number) => {
+      f.i32Const(0);                          // addr for the final store
+      // Load CPSR, mask out N+Z.
+      f.i32Const(0); f.i32Load(CPSR_OFF);
+      f.i32Const(0x3FFFFFFF); f.op(W.OP_I32_AND);
+      // OR in N: v & 0x80000000.
+      f.localGet(localIdx);
+      f.i32Const(0x80000000 | 0); f.op(W.OP_I32_AND);
+      f.op(W.OP_I32_OR);
+      // OR in Z: (v == 0) << 30.
+      f.localGet(localIdx);
+      f.op(W.OP_I32_EQZ);
+      f.i32Const(30); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);
+      // Store.
+      f.i32Store(CPSR_OFF);
+    };
+
+    // setFlagsAdd(a, b, r) — N from r, Z from r, C from r<a (unsigned),
+    // V from (~(a^b) & (a^r)) sign. Matches the JS reference exactly.
+    const emitSetFlagsAdd = (lA: number, lB: number, lR: number) => {
+      f.i32Const(0);                          // addr for store
+      // (masked old CPSR) | N | Z | C | V
+      f.i32Const(0); f.i32Load(CPSR_OFF);
+      f.i32Const(0x0FFFFFFF); f.op(W.OP_I32_AND);   // clear N+Z+C+V
+      // N: r & 0x80000000
+      f.localGet(lR);
+      f.i32Const(0x80000000 | 0); f.op(W.OP_I32_AND);
+      // Z: (r == 0) << 30
+      f.localGet(lR); f.op(W.OP_I32_EQZ);
+      f.i32Const(30); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);                            // N|Z
+      // C: (r < a) unsigned, << 29
+      f.localGet(lR); f.localGet(lA); f.op(W.OP_I32_LT_U);
+      f.i32Const(29); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);                            // N|Z|C
+      // V: (~(a^b) & (a^r)) sign bit moved to bit 28
+      f.localGet(lA); f.localGet(lB); f.op(W.OP_I32_XOR);
+      f.i32Const(-1); f.op(W.OP_I32_XOR);            // ~(a^b)
+      f.localGet(lA); f.localGet(lR); f.op(W.OP_I32_XOR); // (a^r)
+      f.op(W.OP_I32_AND);
+      f.i32Const(0x80000000 | 0); f.op(W.OP_I32_AND);
+      f.i32Const(3); f.op(W.OP_I32_SHR_U);           // → bit 28
+      f.op(W.OP_I32_OR);                            // N|Z|C|V
+      f.op(W.OP_I32_OR);                            // | masked CPSR
+      f.i32Store(CPSR_OFF);
+    };
+
+    const emitSetFlagsSub = (lA: number, lB: number, lR: number) => {
+      f.i32Const(0);
+      f.i32Const(0); f.i32Load(CPSR_OFF);
+      f.i32Const(0x0FFFFFFF); f.op(W.OP_I32_AND);
+      // N
+      f.localGet(lR);
+      f.i32Const(0x80000000 | 0); f.op(W.OP_I32_AND);
+      // Z
+      f.localGet(lR); f.op(W.OP_I32_EQZ);
+      f.i32Const(30); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);
+      // C: (a >= b) unsigned
+      f.localGet(lA); f.localGet(lB); f.op(W.OP_I32_GE_U);
+      f.i32Const(29); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);
+      // V: ((a^b) & (a^r)) sign → bit 28
+      f.localGet(lA); f.localGet(lB); f.op(W.OP_I32_XOR);
+      f.localGet(lA); f.localGet(lR); f.op(W.OP_I32_XOR);
+      f.op(W.OP_I32_AND);
+      f.i32Const(0x80000000 | 0); f.op(W.OP_I32_AND);
+      f.i32Const(3); f.op(W.OP_I32_SHR_U);
+      f.op(W.OP_I32_OR);
+      f.op(W.OP_I32_OR);
+      f.i32Store(CPSR_OFF);
+    };
+
+    // Push 0 or 1 (the condition result) onto the stack. `cond` is
+    // known at compile time so we hardcode the bit-test pattern.
+    const emitCheckCond = (cond: number) => {
+      if (cond === 0xE) { f.i32Const(1); return; }
+      if (cond === 0xF) { f.i32Const(0); return; }
+      // Push bit `bit` of CPSR onto the stack (as 0/1).
+      const pushBit = (bit: number) => {
+        f.i32Const(0); f.i32Load(CPSR_OFF);
+        f.i32Const(bit); f.op(W.OP_I32_SHR_U);
+        f.i32Const(1); f.op(W.OP_I32_AND);
+      };
+      switch (cond) {
+        case 0x0: pushBit(30); return;                                              // EQ: z
+        case 0x1: pushBit(30); f.op(W.OP_I32_EQZ); return;                          // NE: !z
+        case 0x2: pushBit(29); return;                                              // CS: c
+        case 0x3: pushBit(29); f.op(W.OP_I32_EQZ); return;                          // CC: !c
+        case 0x4: pushBit(31); return;                                              // MI: n
+        case 0x5: pushBit(31); f.op(W.OP_I32_EQZ); return;                          // PL: !n
+        case 0x6: pushBit(28); return;                                              // VS: v
+        case 0x7: pushBit(28); f.op(W.OP_I32_EQZ); return;                          // VC: !v
+        case 0x8: pushBit(29); pushBit(30); f.op(W.OP_I32_EQZ); f.op(W.OP_I32_AND); return; // HI: c && !z
+        case 0x9: pushBit(29); f.op(W.OP_I32_EQZ); pushBit(30); f.op(W.OP_I32_OR); return;  // LS: !c || z
+        case 0xA: pushBit(31); pushBit(28); f.op(W.OP_I32_EQ); return;              // GE: n==v
+        case 0xB: pushBit(31); pushBit(28); f.op(W.OP_I32_NE); return;              // LT: n!=v
+        case 0xC: pushBit(30); f.op(W.OP_I32_EQZ);                                  // GT: !z && n==v
+                  pushBit(31); pushBit(28); f.op(W.OP_I32_EQ);
+                  f.op(W.OP_I32_AND); return;
+        case 0xD: pushBit(30);                                                       // LE: z || n!=v
+                  pushBit(31); pushBit(28); f.op(W.OP_I32_NE);
+                  f.op(W.OP_I32_OR); return;
+      }
+      // Unhandled — emit 0 (will never branch).
+      f.i32Const(0);
+    };
 
     let pc = startPc;
     let count = 0;
-    let needsExitPc = true;  // we'll emit setR(15, ...) at end unless a branch already did
+    let needsExitPc = true;
 
-    // Translate one THUMB instruction. Returns true if successfully
-    // translated, false to bail out (the caller will discard this
-    // attempt entirely or end the block depending on whether we've
-    // already emitted anything).
     const translate = (insn: number): { ok: true; endsBlock: boolean } | { ok: false } => {
       const top3 = insn >>> 13;
 
-      // -------- Format 3: MOV/CMP/ADD/SUB Rd, #imm8 (8-bit imm)
+      // -------- Format 3: MOV/CMP/ADD/SUB Rd, #imm8
       if (top3 === 0b001) {
         const op = (insn >>> 11) & 3;
         const rd = (insn >>> 8) & 7;
         const imm = insn & 0xFF;
         if (op === 0) {
           // MOV Rd, #imm: setR(rd, imm); setNZ(imm)
-          f.i32Const(rd); f.i32Const(imm); callSetR();
-          f.i32Const(imm); f.call(I_setNZ);
+          storeRegConst(rd, imm);
+          f.i32Const(imm); f.localSet(L_R);
+          emitSetNZ(L_R);
         } else if (op === 1) {
-          // CMP Rd, #imm: a = getR(rd); r = a - imm; flagsSub(a, imm, r)
-          pushGetR(rd); f.localSet(L_A);
-          f.localGet(L_A); f.i32Const(imm); f.op(W.OP_I32_SUB); f.localSet(L_R);
-          f.localGet(L_A); f.i32Const(imm); f.localGet(L_R); f.call(I_setFlagsSub);
+          // CMP Rd, #imm: a = r[rd]; r = a - imm; flagsSub(a, imm, r)
+          pushReg(rd); f.localSet(L_A);
+          f.i32Const(imm); f.localSet(L_B);
+          f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_SUB); f.localSet(L_R);
+          emitSetFlagsSub(L_A, L_B, L_R);
         } else if (op === 2) {
-          // ADD Rd, #imm: r = getR(rd) + imm; setR(rd, r); flagsAdd(a, imm, r)
-          pushGetR(rd); f.localSet(L_A);
-          f.localGet(L_A); f.i32Const(imm); f.op(W.OP_I32_ADD); f.localSet(L_R);
-          f.i32Const(rd); f.localGet(L_R); callSetR();
-          f.localGet(L_A); f.i32Const(imm); f.localGet(L_R); f.call(I_setFlagsAdd);
+          // ADD Rd, #imm: r = a + imm; setR(rd, r); flagsAdd(a, imm, r)
+          pushReg(rd); f.localSet(L_A);
+          f.i32Const(imm); f.localSet(L_B);
+          f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_ADD); f.localSet(L_R);
+          storeRegFromLocal(rd, L_R);
+          emitSetFlagsAdd(L_A, L_B, L_R);
         } else {
-          // SUB Rd, #imm: r = getR(rd) - imm; setR(rd, r); flagsSub(a, imm, r)
-          pushGetR(rd); f.localSet(L_A);
-          f.localGet(L_A); f.i32Const(imm); f.op(W.OP_I32_SUB); f.localSet(L_R);
-          f.i32Const(rd); f.localGet(L_R); callSetR();
-          f.localGet(L_A); f.i32Const(imm); f.localGet(L_R); f.call(I_setFlagsSub);
+          // SUB Rd, #imm
+          pushReg(rd); f.localSet(L_A);
+          f.i32Const(imm); f.localSet(L_B);
+          f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_SUB); f.localSet(L_R);
+          storeRegFromLocal(rd, L_R);
+          emitSetFlagsSub(L_A, L_B, L_R);
         }
         return { ok: true, endsBlock: false };
       }
 
-      // -------- Format 4: ALU register ops (4-bit op selector)
+      // -------- Format 4: ALU register ops
       if ((insn & 0xFC00) === 0x4000) {
         const aluOp = (insn >>> 6) & 0xF;
         const rs = (insn >>> 3) & 7;
         const rd = insn & 7;
-        // a = getR(rd), b = getR(rs)
-        pushGetR(rd); f.localSet(L_A);
-        pushGetR(rs); f.localSet(L_B);
+        pushReg(rd); f.localSet(L_A);
+        pushReg(rs); f.localSet(L_B);
         switch (aluOp) {
           case 0x0: // AND
             f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_AND); f.localSet(L_R);
-            f.i32Const(rd); f.localGet(L_R); callSetR();
-            f.localGet(L_R); f.call(I_setNZ);
+            storeRegFromLocal(rd, L_R);
+            emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
           case 0x1: // EOR
             f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_XOR); f.localSet(L_R);
-            f.i32Const(rd); f.localGet(L_R); callSetR();
-            f.localGet(L_R); f.call(I_setNZ);
+            storeRegFromLocal(rd, L_R);
+            emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
-          case 0xA: // CMP Rd, Rs
+          case 0xA: // CMP
             f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_SUB); f.localSet(L_R);
-            f.localGet(L_A); f.localGet(L_B); f.localGet(L_R); f.call(I_setFlagsSub);
+            emitSetFlagsSub(L_A, L_B, L_R);
             return { ok: true, endsBlock: false };
           case 0xC: // ORR
             f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_OR); f.localSet(L_R);
-            f.i32Const(rd); f.localGet(L_R); callSetR();
-            f.localGet(L_R); f.call(I_setNZ);
+            storeRegFromLocal(rd, L_R);
+            emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
-          case 0xE: // BIC
-            f.localGet(L_A); f.localGet(L_B); f.i32Const(-1); f.op(W.OP_I32_XOR); f.op(W.OP_I32_AND); f.localSet(L_R);
-            f.i32Const(rd); f.localGet(L_R); callSetR();
-            f.localGet(L_R); f.call(I_setNZ);
+          case 0xE: // BIC: a & ~b
+            f.localGet(L_A);
+            f.localGet(L_B); f.i32Const(-1); f.op(W.OP_I32_XOR);
+            f.op(W.OP_I32_AND); f.localSet(L_R);
+            storeRegFromLocal(rd, L_R);
+            emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
-          case 0xF: // MVN
+          case 0xF: // MVN: ~b
             f.localGet(L_B); f.i32Const(-1); f.op(W.OP_I32_XOR); f.localSet(L_R);
-            f.i32Const(rd); f.localGet(L_R); callSetR();
-            f.localGet(L_R); f.call(I_setNZ);
+            storeRegFromLocal(rd, L_R);
+            emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
-          // Other Format 4 ops (LSL/LSR/ASR by reg, ADC/SBC/NEG/MUL/etc.)
-          // fall through to interpreter for now.
         }
         return { ok: false };
       }
 
-      // -------- Format 9 (8-bit): LDR/STR Rd, [Rb, #imm5*4 / *1]
-      // 011_BL_offset5_Rb_Rd
+      // -------- Format 9: LDR/STR Rd, [Rb, #imm5*4 / *1] (word or byte)
       if ((insn & 0xE000) === 0x6000) {
         const isByte = (insn & 0x1000) !== 0;
         const isLoad = (insn & 0x0800) !== 0;
@@ -249,66 +376,49 @@ export class Recompiler {
         const rb     = (insn >>> 3) & 7;
         const rd     = insn & 7;
         const offset = isByte ? off5 : off5 << 2;
-        // addr = getR(rb) + offset
-        pushGetR(rb); f.i32Const(offset); f.op(W.OP_I32_ADD); f.localSet(L_TMP);
+        // addr = r[rb] + offset
+        pushReg(rb); f.i32Const(offset); f.op(W.OP_I32_ADD); f.localSet(L_TMP);
         if (isLoad) {
-          if (isByte) { f.localGet(L_TMP); f.call(I_r8); }
-          else        { f.localGet(L_TMP); f.call(I_r32); }
+          f.localGet(L_TMP);
+          if (isByte) f.call(I_r8); else f.call(I_r32);
           f.localSet(L_R);
-          f.i32Const(rd); f.localGet(L_R); callSetR();
+          storeRegFromLocal(rd, L_R);
         } else {
-          pushGetR(rd); f.localSet(L_R);
+          pushReg(rd); f.localSet(L_R);
           f.localGet(L_TMP); f.localGet(L_R);
           if (isByte) f.call(I_w8); else f.call(I_w32);
         }
         return { ok: true, endsBlock: false };
       }
 
-      // -------- Format 16: B<cond> label (8-bit signed offset)
+      // -------- Format 16: B<cond> label
       if ((insn & 0xF000) === 0xD000) {
         const cond = (insn >>> 8) & 0xF;
-        if (cond === 0xE || cond === 0xF) return { ok: false }; // SWI / undefined
+        if (cond === 0xE || cond === 0xF) return { ok: false };
         let off = insn & 0xFF;
         if (off & 0x80) off -= 0x100;
         const taken    = (pc + 4 + (off << 1)) >>> 0;
         const fallthru = (pc + 2) >>> 0;
-        // if (checkCond(cond)) setR(15, taken+4); else setR(15, fallthru+4);
-        // r[15] stores the *next decode address + insnSize*; the dispatcher
-        // re-reads r[15] - 4 as the decode pc each step. THUMB insnSize=2,
-        // prefetchOff=4, so r[15] = decode + 4 means "decode at pc".
-        // The dispatcher loop does `r[15] = decode + prefetchOff` before
-        // executing, and after execute pulls r[15] - prefetchOff back as
-        // the new decode. So a branch sets r[15] = (target & ~1) + 0
-        // and the next dispatch will use r[15] - 4 = target - 4... hmm.
-        // The interpreter's branch path calls flushPipeline() and writes
-        // r[15] = target & ~1. Then `branched` is true so step()'s
-        // auto-advance skips. On the next step(), decode = r[15] & ~1.
-        // We're not inside step(), we're being called from inside it (the
-        // recompiler tryDispatch happens BEFORE the dispatcher's prefetch
-        // setup). So for branch handling we want r[15] = target & ~1 just
-        // like the interpreter would. The host dispatcher will then
-        // continue at the new pc.
-        f.i32Const(cond); f.call(I_checkCond);
-        f.op(W.OP_IF); f.body.push(0x40); // void block type
-        f.i32Const(15); f.i32Const((taken & ~1) >>> 0); callSetR();
+        emitCheckCond(cond);
+        f.op(W.OP_IF); f.body.push(0x40);
+        storeRegConst(15, (taken & ~1) >>> 0);
         f.op(W.OP_ELSE);
-        f.i32Const(15); f.i32Const((fallthru & ~1) >>> 0); callSetR();
+        storeRegConst(15, (fallthru & ~1) >>> 0);
         f.op(W.OP_END);
         needsExitPc = false;
         return { ok: true, endsBlock: true };
       }
 
-      // -------- Format 18: B label (11-bit signed offset)
+      // -------- Format 18: B label
       if ((insn & 0xF800) === 0xE000) {
         let off = insn & 0x7FF;
         if (off & 0x400) off -= 0x800;
         const target = (pc + 4 + (off << 1)) >>> 0;
-        f.i32Const(15); f.i32Const((target & ~1) >>> 0); callSetR();
+        storeRegConst(15, (target & ~1) >>> 0);
         needsExitPc = false;
         return { ok: true, endsBlock: true };
       }
 
-      // Unsupported — let interpreter take over.
       return { ok: false };
     };
 
@@ -323,13 +433,9 @@ export class Recompiler {
 
     if (count === 0) return null;
 
-    // Emit any post-block bookkeeping: if no branch already wrote PC,
-    // do it now so the dispatcher knows to resume at `pc`.
     if (needsExitPc) {
-      f.i32Const(15); f.i32Const(pc >>> 0); callSetR();
+      storeRegConst(15, pc >>> 0);
     }
-    // Return count. The WasmModuleBuilder.encode() appends the
-    // function-body terminator OP_END for us; don't double-emit it.
     f.i32Const(count);
 
     let module: WebAssembly.Module;
@@ -339,12 +445,11 @@ export class Recompiler {
       arr.set(bytes);
       module = new WebAssembly.Module(arr);
     } catch (e) {
-      // Failed validation — pretend we never tried.
       return null;
     }
     let instance: WebAssembly.Instance;
     try {
-      instance = new WebAssembly.Instance(module, { h: this.hooks });
+      instance = new WebAssembly.Instance(module, this.importsObj);
     } catch {
       return null;
     }
