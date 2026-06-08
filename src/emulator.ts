@@ -43,6 +43,29 @@ export class Emulator {
       read:  (a) => this.flash.read(a),
       write: (a, v) => this.flash.write(a, v),
     });
+    this.installRtcInterposer();
+  }
+
+  // Route reads/writes at the cart-GPIO range (0x080000C4/C6/C8) to the
+  // on-board RTC instead of letting them hit raw ROM. Pokemon
+  // Ruby/Sapphire/Emerald and FireRed/LeafGreen use this for berry
+  // growth, dewford trends, etc. The interposer used to live in App.tsx
+  // so headless boot wasn't routing GPIO at all (= zero RTC activity in
+  // CLI tests).
+  private installRtcInterposer(): void {
+    const bus = this.bus;
+    const rtc = this.rtc;
+    const inRange = (a: number) => (a & 0xFFFFFFFE) === 0x080000C4 ||
+                                    (a & 0xFFFFFFFE) === 0x080000C6 ||
+                                    (a & 0xFFFFFFFE) === 0x080000C8;
+    const oR16 = bus.read16.bind(bus);
+    const oW16 = bus.write16.bind(bus);
+    const oR8 = bus.read8.bind(bus);
+    const oW8 = bus.write8.bind(bus);
+    bus.read16 = (a) => inRange(a) ? rtc.read(a & 0xFF) : oR16(a);
+    bus.write16 = (a, v) => { if (inRange(a)) rtc.write(a & 0xFF, v); else oW16(a, v); };
+    bus.read8 = (a) => inRange(a) ? rtc.read(a & 0xFF) : oR8(a);
+    bus.write8 = (a, v) => { if (inRange(a)) rtc.write(a & 0xFF, v); else oW8(a, v); };
   }
 
   loadRom(bytes: Uint8Array): void {

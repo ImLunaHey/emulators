@@ -71,7 +71,7 @@ describe('RTC: enable + direction', () => {
 });
 
 describe('RTC: status register round-trip', () => {
-  it('status read returns the default value (24h mode bit)', () => {
+  it('status read returns 0x80 (POW bit set) on fresh chip', () => {
     const rtc = new Rtc();
     enableAndStart(rtc);
     // Command byte: 0110_RRRX = 0x60 | (reg << 1) | R/W. reg=1, R/W=1 (read).
@@ -79,7 +79,10 @@ describe('RTC: status register round-trip', () => {
     sendCmdByte(rtc, 0x63);
     const b = readByte(rtc);
     endTransaction(rtc);
-    expect(b).toBe(0x40);
+    // Fresh chip indicates power-on / battery-just-inserted via POW bit.
+    // Games (Pokemon Ruby/Sapphire/Emerald in particular) check this to
+    // decide whether they need to prompt for date setup.
+    expect(b).toBe(0x80);
   });
   it('status write then read back returns the written value', () => {
     const rtc = new Rtc();
@@ -123,12 +126,14 @@ describe('RTC: date/time read', () => {
 });
 
 describe('RTC: reset command resets status', () => {
-  it('cmd 0x60 (reg=0, write) restores 24h mode', () => {
+  it('cmd 0x60 (reg=0, write) restores 24h mode + clears POW', () => {
     const rtc = new Rtc();
     rtc.status = 0xFF;  // pollute
     enableAndStart(rtc);
     sendCmdByte(rtc, 0x60);
     endTransaction(rtc);
+    // After reset command the chip is back to the standard initialized
+    // state (24h mode set, POW cleared).
     expect(rtc.status).toBe(0x40);
   });
 });

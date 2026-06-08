@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Emulator } from '../emulator';
 import { Key } from '../io/keypad';
 import { Screen } from './Screen';
@@ -57,42 +57,9 @@ export function App() {
     onDisconnected: (name) => append(`controller disconnected: ${name}`),
   });
 
-  // RTC GPIO interposer at ROM 0x080000C4/C6/C8. Set up once.
-  useMemo(() => {
-    const origRead16 = emu.bus.read16.bind(emu.bus);
-    const origWrite16 = emu.bus.write16.bind(emu.bus);
-    const origRead8 = emu.bus.read8.bind(emu.bus);
-    const origWrite8 = emu.bus.write8.bind(emu.bus);
-    emu.bus.read16 = (addr) => {
-      if ((addr & 0xFFFFFFF8) === 0x080000C0) {
-        const off = addr & 0xFE;
-        if (off === 0xC4 || off === 0xC6 || off === 0xC8) return emu.rtc.read(off);
-      }
-      return origRead16(addr);
-    };
-    emu.bus.write16 = (addr, v) => {
-      if ((addr & 0xFFFFFFF8) === 0x080000C0) {
-        const off = addr & 0xFE;
-        if (off === 0xC4 || off === 0xC6 || off === 0xC8) { emu.rtc.write(off, v); return; }
-      }
-      origWrite16(addr, v);
-    };
-    emu.bus.read8 = (addr) => {
-      if ((addr & 0xFFFFFFF8) === 0x080000C0) {
-        const off = addr & 0xFF;
-        if (off === 0xC4 || off === 0xC6 || off === 0xC8) return emu.rtc.read(off);
-      }
-      return origRead8(addr);
-    };
-    emu.bus.write8 = (addr, v) => {
-      if ((addr & 0xFFFFFFF8) === 0x080000C0) {
-        const off = addr & 0xFF;
-        if (off === 0xC4 || off === 0xC6 || off === 0xC8) { emu.rtc.write(off, v); return; }
-      }
-      origWrite8(addr, v);
-    };
-  }, [emu]);
-
+  // RTC GPIO interposer is now installed inside Emulator.constructor()
+  // so it's always active (was previously here in useMemo, which meant
+  // headless boot bypassed the RTC entirely).
   const saveKeyRef = useRef<string>('');
 
   // ROM load + per-ROM Flash persistence wiring.

@@ -20,8 +20,16 @@ export class Rtc {
   cmd = 0;
   payload: number[] = [];
   cursor = 0;
-  // Status byte: bit 6 = 24h mode (matches stock setup).
-  status = 0x40;
+  // Status byte: initial value when chip first powers up. Real S-3511A
+  // hardware returns 0x82 here when the battery has just been installed
+  // (POW = 1, BUSY = 0, 24H not yet set, ALARM disabled). Pokemon
+  // Ruby/Sapphire/Emerald check this on boot: if POW = 1 they prompt
+  // to set the date and clear POW; if POW = 0 they assume the chip is
+  // already running. Without POW=1 on the very first read after boot,
+  // the game treats the response as "RTC says it's running but I never
+  // told it to" and prints "the internal battery has run dry".
+  status = 0x80;
+  hasBeenInitialized = false;
 
   read(off: number): number {
     // 0xC4 = data, 0xC6 = dir, 0xC8 = enable.
@@ -80,7 +88,9 @@ export class Rtc {
               this.beginCommand(this.buffer);
             }
           } else if (this.state === 'reply' && sckRising) {
-            // Device returns the current byte LSB-first across 8 clocks.
+            // S-3511A device replies LSB-first, so the host's bit 0 (the
+            // very first one clocked out) is the data byte's bit 0. That
+            // matches our `(byte >> this.bits) & 1` indexing.
             const byte = this.payload[this.cursor] ?? 0;
             this.data = (byte >> this.bits) & 1;
             this.bits++;
@@ -117,7 +127,7 @@ export class Rtc {
 
   payloadLen = 0;
 
-  private beginCommand(cmd: number) {
+  beginCommand(cmd: number) {
     this.cmd = cmd;
     this.cursor = 0;
     this.bits = 0;
@@ -157,7 +167,7 @@ export class Rtc {
     }
   }
 
-  private finishWrite() {
+  finishWrite() {
     // Status writes: store the byte so subsequent reads match. Pokemon
     // Ruby/Sapphire/Emerald write status then read it back; mismatch is
     // reported as "battery has run dry".
