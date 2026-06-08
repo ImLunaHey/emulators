@@ -37,6 +37,13 @@ export class Bus {
   oam32:   Uint32Array;
   rom16:   Uint16Array = new Uint16Array(0);
   rom32:   Uint32Array = new Uint32Array(0);
+  // Real carts mirror the on-cart ROM throughout the 0x08-0x0D bus
+  // region (the upper address bits land on disconnected/ignored pins
+  // for any cart smaller than 32 MB). `romMask` is set at loadRom to
+  // (size - 1) for power-of-2 sizes, or 0 otherwise — the read paths
+  // fall back to `% length` when the mask is 0. Power-of-2 covers
+  // every commercial release; the modulo path is for homebrew.
+  romMask = 0;
 
   io!: IoBridge;
   save!: SaveBridge;
@@ -81,6 +88,10 @@ export class Bus {
     this.rom = copy;
     this.rom16 = new Uint16Array(ab);
     this.rom32 = new Uint32Array(ab);
+    // Power-of-2 fast path. (copy.length is always one of 0x80000,
+    // 0x100000, 0x200000, ..., 0x2000000 for commercial carts.)
+    const n = copy.length;
+    this.romMask = (n > 0 && (n & (n - 1)) === 0) ? n - 1 : 0;
   }
 
   attachIo(io: IoBridge) { this.io = io; }
@@ -93,6 +104,18 @@ export class Bus {
     let off = addr & 0x1FFFF;
     if (off >= 0x18000) off -= 0x8000;
     return off;
+  }
+
+  // ROM offset, mirrored to the cart's actual size. Harvest Moon FoMT
+  // (8 MB) jumps to PCs in the 0x09... range (the upper-half mirror of
+  // its own ROM); without mirroring those reads return open bus and
+  // the CPU runs garbage. Most carts are power-of-2 sized so we mask;
+  // for the odd homebrew that isn't, fall back to modulo.
+  private romOff(addr: number): number {
+    const off = addr & 0x01FFFFFF;
+    if (this.romMask !== 0) return off & this.romMask;
+    if (this.rom.length === 0) return off;
+    return off % this.rom.length;
   }
 
   // ---------------------------------------------------------------- reads
@@ -111,12 +134,12 @@ export class Bus {
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
       case R.REGION_ROM_4: {
-        const off = addr & 0x01FFFFFF;
+        const off = this.romOff(addr);
         return off < this.rom.length ? this.rom[off] : (addr >>> 1) & 0xFF;
       }
       case R.REGION_ROM_5: {
         if (this.eepromMode) return this.save.read(addr) & 0xFF;
-        const off = addr & 0x01FFFFFF;
+        const off = this.romOff(addr);
         return off < this.rom.length ? this.rom[off] : (addr >>> 1) & 0xFF;
       }
       case R.REGION_SRAM: case R.REGION_SRAM2:
@@ -141,13 +164,13 @@ export class Bus {
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
       case R.REGION_ROM_4: {
-        const off = (addr & 0x01FFFFFF) >>> 1;
+        const off = this.romOff(addr) >>> 1;
         return off < this.rom16.length ? this.rom16[off] : (addr >>> 1) & 0xFFFF;
       }
       case R.REGION_ROM_5: {
         // EEPROM bit-serial reads return one bit per DMA transfer.
         if (this.eepromMode) return this.save.read(addr) & 1;
-        const off = (addr & 0x01FFFFFF) >>> 1;
+        const off = this.romOff(addr) >>> 1;
         return off < this.rom16.length ? this.rom16[off] : (addr >>> 1) & 0xFFFF;
       }
       case R.REGION_SRAM: case R.REGION_SRAM2: {
@@ -174,7 +197,7 @@ export class Bus {
       case R.REGION_ROM_0: case R.REGION_ROM_1:
       case R.REGION_ROM_2: case R.REGION_ROM_3:
       case R.REGION_ROM_4: {
-        const off = (addr & 0x01FFFFFF) >>> 2;
+        const off = this.romOff(addr) >>> 2;
         return off < this.rom32.length ? this.rom32[off] >>> 0 : (addr & 0xFFFFFFFF) >>> 0;
       }
       case R.REGION_ROM_5: {
@@ -183,7 +206,7 @@ export class Bus {
           const hi = this.save.read(addr + 2) & 1;
           return (lo | (hi << 16)) >>> 0;
         }
-        const off = (addr & 0x01FFFFFF) >>> 2;
+        const off = this.romOff(addr) >>> 2;
         return off < this.rom32.length ? this.rom32[off] >>> 0 : (addr & 0xFFFFFFFF) >>> 0;
       }
       case R.REGION_SRAM: case R.REGION_SRAM2: {
