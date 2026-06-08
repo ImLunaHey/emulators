@@ -6,6 +6,18 @@ import { Emulator } from '../emulator';
 const path = process.argv[2] ?? 'public/firered.gba';
 const rom = new Uint8Array(readFileSync(path));
 if (process.env.TRACE_CPUSET) (globalThis as any).__traceCpuSet = true;
+if (process.env.TRACE_BL) {
+  let count = 0;
+  const seen = new Map<string, number>();
+  (globalThis as any).__traceBL = (from: number, to: number) => {
+    const key = `${from.toString(16)}→${to.toString(16)}`;
+    seen.set(key, (seen.get(key) || 0) + 1);
+  };
+  process.on('exit', () => {
+    const sorted = Array.from(seen.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 30);
+    for (const [key, n] of sorted) console.log(`  BL ${key}  ×${n}`);
+  });
+}
 const emu = new Emulator();
 emu.loadRom(rom);
 
@@ -152,6 +164,7 @@ console.log(`IRQ entry IF distribution:`, Array.from(irqIfHist.entries()).map(([
 const f = emu.ppu.frame;
 // Dump state at 0x03003528 (callback state byte)
 console.log(`State byte @ 0x03003528 = 0x${emu.bus.iwram[0x3528].toString(16)}`);
+console.log(`Init byte @ 0x03003F3C = 0x${emu.bus.iwram[0x3F3C].toString(16)}`);
 console.log(`Bytes 0x03003520..0x03003540: ${Array.from(emu.bus.iwram.slice(0x3520, 0x3540)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
 // Dump gMain struct at IWRAM 0x30F0..0x3120
 console.log(`gMain @ 0x030030F0..0x03003130:`);
