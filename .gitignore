@@ -7,3 +7,4 @@ public/*.gba
 public/*.sav
 *.gba
 *.sav
+_*.png
