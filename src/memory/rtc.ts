@@ -64,7 +64,15 @@ export class Rtc {
         this.clk = newSck;
 
         if (this.selected) {
-          if (this.state === 'cmd' && sckFalling) {
+          // S-3511A clocks both directions on the RISING edge of SCK:
+          // the host sets SIO while SCK is low, then raises SCK; the chip
+          // samples the host's SIO on that rising edge, and emits its
+          // outgoing bit so the host can read it after the same rising
+          // edge. Previously we were sampling on the falling edge, which
+          // gave us the bit from the *previous* SIO setup — the AGB SDK's
+          // status-register probe never read its own write back, and
+          // Pokemon Ruby/Sapphire/Emerald flag that as "battery dry".
+          if (this.state === 'cmd' && sckRising) {
             // Host writes command MSB-first.
             this.buffer = ((this.buffer << 1) | newSio) & 0xFF;
             this.bits++;
@@ -81,7 +89,7 @@ export class Rtc {
               this.cursor++;
               if (this.cursor >= this.payload.length) this.state = 'idle';
             }
-          } else if (this.state === 'recv' && sckFalling) {
+          } else if (this.state === 'recv' && sckRising) {
             // Host writes one byte LSB-first.
             this.buffer = (this.buffer | (newSio << this.bits)) & 0xFF;
             this.bits++;

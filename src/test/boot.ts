@@ -6,6 +6,7 @@ import { Emulator } from '../emulator';
 const path = process.argv[2] ?? 'public/firered.gba';
 const rom = new Uint8Array(readFileSync(path));
 if (process.env.TRACE_CPUSET) (globalThis as any).__traceCpuSet = true;
+if (process.env.DUMP_OAM) (globalThis as any).__dumpOam = true;
 if (process.env.TRACE_BL) {
   const seen = new Map<string, number>();
   (globalThis as any).__traceBL = (from: number, to: number) => {

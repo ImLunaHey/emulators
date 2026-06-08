@@ -27,7 +27,10 @@ export class Flash128K implements SaveBridge {
   state: FlashCmd = FlashCmd.Normal;
   idMode = false;
   bank = 0;
-  // Manufacturer/device pair for Macronix MX29L1000.
+  // Manufacturer/device pair for Macronix MX29L010 — the only 128 KB
+  // Flash variant whose command set our chip implementation matches.
+  // (Lying about being Sanyo would route the game's save driver through
+  // Sanyo-specific commands we don't handle.)
   static readonly ID_MAKER = 0xC2;
   static readonly ID_DEVICE = 0x09;
 

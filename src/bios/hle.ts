@@ -261,8 +261,18 @@ export class BiosHle {
           const len = ((a >> 4) & 0xF) + 3;
           const disp = (((a & 0xF) << 8) | b) + 1;
           for (let k = 0; k < len && length > 0; k++) {
-            const back = (dst + (halfBufHas ? 1 : 0)) - disp;
-            const byte = this.bus.read8(back);
+            const back = (dst + halfBufHas) - disp;
+            // In VRAM mode, the current byte may be sitting in the
+            // halfword buffer (not yet flushed). Reading via bus.read
+            // would return stale memory; sense that case and pull from
+            // the buffer instead. This fixes sprites that LZ77-self-
+            // reference with disp=1 (every-other-byte-corrupt symptom).
+            let byte: number;
+            if (vram && halfBufHas === 1 && back === dst) {
+              byte = halfBuf;
+            } else {
+              byte = this.bus.read8(back);
+            }
             writeByte(byte);
             length--;
           }
