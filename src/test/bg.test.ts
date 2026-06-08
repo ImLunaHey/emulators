@@ -137,9 +137,20 @@ describe('BG text mode rendering', () => {
   });
 });
 
+// Bitmap modes in production-loaded ROMs receive the identity affine
+// matrix from the BIOS's RegisterRamReset(bit 7) call. These tests
+// skip the BIOS init so we have to seed PA / PD = 0x100 manually,
+// otherwise the affine sampler stays parked at refX / refY forever.
+function setBitmapIdentity(ppu: Ppu) {
+  ppu.bgPA[0] = 0x100; ppu.bgPB[0] = 0;
+  ppu.bgPC[0] = 0;     ppu.bgPD[0] = 0x100;
+  ppu.bgX[0] = 0;      ppu.bgY[0] = 0;
+}
+
 describe('Bitmap mode 4 (paletted 240x160)', () => {
   it('renders palette-indexed pixels for one scanline', () => {
     const ppu = makePpu();
+    setBitmapIdentity(ppu);
     ppu.bus.pram16[5] = 0x03E0;  // green
     // Set frame 0 (DISPCNT bit 4 = 0).
     ppu.dispcnt = 0;
@@ -151,6 +162,7 @@ describe('Bitmap mode 4 (paletted 240x160)', () => {
 
   it('respects double-buffer page select (DISPCNT bit 4)', () => {
     const ppu = makePpu();
+    setBitmapIdentity(ppu);
     ppu.bus.pram16[7] = 0x7C00;  // blue
     ppu.dispcnt = 0x10;  // page 1 active
     // Page 1 starts at VRAM 0xA000.
@@ -158,11 +170,24 @@ describe('Bitmap mode 4 (paletted 240x160)', () => {
     renderModeBitmap4(ppu, 50);
     expect((ppu.bgLine[2][5] & 0x7FFF)).toBe(0x7C00);
   });
+
+  it('respects BG2 affine PA scaling (Quake-style stretch)', () => {
+    // PA=0x80 = half-step → samples bitmap_x = (screen_x / 2), so the
+    // bitmap pixel at x=5 lands at screen x=10.
+    const ppu = makePpu();
+    setBitmapIdentity(ppu);
+    ppu.bgPA[0] = 0x80;
+    ppu.bus.pram16[3] = 0x7C00;
+    ppu.bus.vram[30 * 240 + 5] = 3;
+    renderModeBitmap4(ppu, 30);
+    expect((ppu.bgLine[2][10] & 0x7FFF)).toBe(0x7C00);
+  });
 });
 
 describe('Bitmap mode 3 (BGR555 240x160)', () => {
   it('renders direct color', () => {
     const ppu = makePpu();
+    setBitmapIdentity(ppu);
     // Pixel at (10, 30) = green direct BGR555.
     ppu.bus.vram[(30 * 240 + 10) * 2 + 0] = 0xE0;
     ppu.bus.vram[(30 * 240 + 10) * 2 + 1] = 0x03;  // 0x03E0
