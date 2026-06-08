@@ -142,7 +142,8 @@ export class BiosHle {
   private cpuFastSet(): void {
     const s = this.cpu.state;
     let src = s.r[0] >>> 0, dst = s.r[1] >>> 0;
-    let words = (s.r[2] & 0x1FFFFF + 7) & ~7;
+    // Word count is in R2[20:0], rounded up to the next multiple of 8 words.
+    let words = ((s.r[2] & 0x1FFFFF) + 7) & ~7;
     if (words === 0) words = 8;
     const fixed = (s.r[2] & 0x01000000) !== 0;
     for (let i = 0; i < words; i++) {

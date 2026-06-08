@@ -48,6 +48,10 @@ export class Emulator {
   loadRom(bytes: Uint8Array): void {
     this.bus.loadRom(bytes);
     this.cpu.reset();
+    // Cartridge-bypass boot leaves DISPSTAT in a state the real BIOS would
+    // have already touched — enable VBlank/HBlank/VCount IRQ defaults so
+    // games that don't explicitly write DISPSTAT can still receive IRQs.
+    this.ppu.dispstat = 0x38;
   }
 
   // Run a full GBA frame worth of cycles (~280896). Returns insn counts

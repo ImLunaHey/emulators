@@ -15,6 +15,15 @@ ppu.writeReg = (a: number, v: number) => {
   if (a === 0x00 || a === 0x04) console.log(`  PPU[${a.toString(16).padStart(2,'0')}] <- 0x${v.toString(16).padStart(4,'0')}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
   origWriteReg(a, v);
 };
+// Trace IO writes to DISPCNT/DISPSTAT/IE/IME only.
+const origIoWrite16 = emu.io.write16.bind(emu.io);
+emu.io.write16 = (addr: number, v: number) => {
+  const off = addr & 0x3FF;
+  if (off === 0x000 || off === 0x004 || off === 0x200 || off === 0x208) {
+    console.log(`  IO[0x${off.toString(16).padStart(3,'0')}] <- 0x${v.toString(16).padStart(4,'0')}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
+  }
+  origIoWrite16(addr, v);
+};
 // Track vcount reads + IRQ raises.
 let vcountReads = 0;
 let lastVcountRead = -1;
@@ -89,3 +98,14 @@ console.log(`Non-zero bytes  VRAM=${vramNonZero}/${emu.bus.vram.length}  PRAM=${
 console.log(`DISPCNT=${emu.ppu.dispcnt.toString(16)}  DISPSTAT=${emu.ppu.dispstat.toString(16)}  VCOUNT=${emu.ppu.vcount}  IE=${emu.irq.ie.toString(16)}  IF=${emu.irq.iflag.toString(16)}  IME=${emu.irq.ime}`);
 console.log(`IWRAM[310C-310F] (wait flag) = ${[0x310C,0x310D,0x310E,0x310F].map(o=>emu.bus.iwram[o].toString(16)).join(' ')}`);
 console.log(`SWI counts:`, Array.from(swiCounts.entries()).map(([k,v]) => `0x${k.toString(16)}=${v}`).join(' '));
+
+// Dump first 32 bytes of the user IRQ handler in IWRAM.
+const handlerAddr = (emu.bus.iwram[0x7FFC] | (emu.bus.iwram[0x7FFD]<<8) | (emu.bus.iwram[0x7FFE]<<16) | (emu.bus.iwram[0x7FFF]<<24)) >>> 0;
+console.log(`\nUser IRQ handler at 0x${handlerAddr.toString(16)}:`);
+if ((handlerAddr & 0xFF000000) === 0x03000000) {
+  const base = handlerAddr & 0x7FFF;
+  for (let i = 0; i < 32; i += 4) {
+    const v = (emu.bus.iwram[base+i] | (emu.bus.iwram[base+i+1]<<8) | (emu.bus.iwram[base+i+2]<<16) | (emu.bus.iwram[base+i+3]<<24)) >>> 0;
+    console.log(`  ${(handlerAddr+i).toString(16)}: 0x${v.toString(16).padStart(8,'0')}`);
+  }
+}

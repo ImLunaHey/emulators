@@ -18,11 +18,21 @@ async function main() {
   const emu = new Emulator();
   bindKeys(emu.keypad);
 
-  log('Fetching firered.gba…');
-  const resp = await fetch('/firered.gba');
+  const romSelect = document.getElementById('rom') as HTMLSelectElement;
+  let romPath = romSelect.value;
+  log(`Fetching ${romPath}…`);
+  let resp = await fetch(romPath);
   if (!resp.ok) throw new Error(`Failed to fetch ROM: ${resp.status}`);
-  const buf = new Uint8Array(await resp.arrayBuffer());
+  let buf = new Uint8Array(await resp.arrayBuffer());
   log(`Loaded ROM, ${buf.length} bytes`);
+  romSelect.addEventListener('change', async () => {
+    romPath = romSelect.value;
+    log(`Switching to ${romPath}…`);
+    const r = await fetch(romPath);
+    buf = new Uint8Array(await r.arrayBuffer());
+    emu.loadRom(buf);
+    log(`Loaded ${buf.length} bytes; reset.`);
+  });
 
   // Sanity check: read header.
   const title = new TextDecoder('ascii').decode(buf.subarray(0xA0, 0xAC)).replace(/\0/g, '');
