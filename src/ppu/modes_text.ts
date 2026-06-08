@@ -49,15 +49,7 @@ export function renderModeText(ppu: Ppu, bg: number, y: number): void {
 
     let pix: number;
     if (colorMode8) {
-      // 8bpp BG: the map's tile-number references a 32-byte slot (the same
-      // unit used by 4bpp tiles), and each 8bpp tile consumes 2 adjacent
-      // slots = 64 bytes. So slotAddr = charBase + N*32, then the 8bpp
-      // pixel at (inTileX, inTileY) is at byte slotAddr + inTileY*8 + inTileX.
-      // (Previously had `tileIdx * 64` here, which scaled the index up 2x
-      // and consistently fetched empty VRAM for tiles in the upper half
-      // of any map — the Pokemon FireRed intro Oak character art was the
-      // visible symptom.)
-      const tileAddr = charBase + tileIdx * 32 + inTileY * 8 + inTileX;
+      const tileAddr = charBase + tileIdx * 64 + inTileY * 8 + inTileX;
       if (tileAddr >= 0x10000) { out[x] = 0x8000; continue; } // BG can't access OBJ tile area
       pix = vram[tileAddr];
       if (pix === 0) { out[x] = 0x8000; continue; }

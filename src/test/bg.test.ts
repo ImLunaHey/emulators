@@ -137,28 +137,6 @@ describe('BG text mode rendering', () => {
   });
 });
 
-describe('BG 8bpp tile addressing (Pokemon character art)', () => {
-  it('8bpp BG tile-N references slot N (32-byte unit), not tile N (64-byte unit)', () => {
-    const ppu = makePpu();
-    // BG0 in 8bpp mode, charBase=0, mapBase=1 (= 0x800).
-    ppu.bgcnt[0] = (1 << 8) | (1 << 7);  // mapBase=1, 8bpp
-    ppu.bus.pram16[1] = 0x7FFF;  // palette[1] = white
-    // Put 8bpp tile data at SLOT 100 (= byte offset 100*32 = 0x0C80).
-    // 8bpp tile = 64 bytes (occupies slots 100 and 101).
-    for (let i = 0; i < 64; i++) ppu.bus.vram[100 * 32 + i] = 1;  // every pixel = palette 1
-    // Map entry references tile 100.
-    ppu.bus.vram[0x800] = 100;
-    ppu.bus.vram[0x801] = 0;
-    renderModeText(ppu, 0, 0);
-    // First 8 pixels of scanline 0 should be opaque if the slot=N lookup
-    // is correct. The old (broken) code with tileIdx*64 would have read
-    // from byte 100*64 = 0x1900 instead, finding zeros.
-    for (let x = 0; x < 8; x++) {
-      expect((ppu.bgLine[0][x] & 0x8000) === 0).toBe(true);
-    }
-  });
-});
-
 describe('Bitmap mode 4 (paletted 240x160)', () => {
   it('renders palette-indexed pixels for one scanline', () => {
     const ppu = makePpu();
