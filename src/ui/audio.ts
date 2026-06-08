@@ -12,7 +12,6 @@
 // If a game uses a different rate it'll play slightly too fast or
 // slow until we add rate tracking — visible-feature wise it works.
 
-const SOURCE_RATE = 32768;
 const TARGET_AHEAD_S = 0.06;   // 60ms of buffered audio ahead of playback
 const MAX_AHEAD_S = 0.15;      // drop the queue if we get too far ahead
 
@@ -45,15 +44,16 @@ export class AudioSink {
     this.nextStart = Math.max(this.nextStart, ctx.currentTime + TARGET_AHEAD_S);
   }
 
-  push(samples: Float32Array): void {
+  push(samples: Float32Array, sourceRate: number): void {
     const ctx = this.ctx;
     if (!ctx || !this.gain || samples.length === 0 || ctx.state !== 'running') return;
+    if (sourceRate < 1024 || sourceRate > 96000) return;  // sanity guard
     // Drop if we've drifted too far ahead — happens when the browser
     // tab is foregrounded after being throttled.
     if (this.nextStart - ctx.currentTime > MAX_AHEAD_S) {
       this.nextStart = ctx.currentTime + TARGET_AHEAD_S;
     }
-    const buf = ctx.createBuffer(1, samples.length, SOURCE_RATE);
+    const buf = ctx.createBuffer(1, samples.length, sourceRate);
     // Float32Array → AudioBuffer channel. Have to re-copy through a
     // fresh ArrayBuffer-backed array because TS's narrow Float32Array
     // overload for copyToChannel doesn't accept ArrayBufferLike-backed
@@ -65,6 +65,6 @@ export class AudioSink {
     src.connect(this.gain);
     const start = Math.max(this.nextStart, ctx.currentTime);
     src.start(start);
-    this.nextStart = start + samples.length / SOURCE_RATE;
+    this.nextStart = start + samples.length / sourceRate;
   }
 }

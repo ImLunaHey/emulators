@@ -53,7 +53,7 @@ export function Screen({ emu, paused, audio, onStats }: Props) {
         blitted++;
         // Drain the sound output for this frame into the Web Audio sink.
         const samples = emu.sound.drainOutput();
-        if (samples.length > 0) audio.push(samples);
+        if (samples.length > 0) audio.push(samples, emu.sound.sampleRate);
       }
       if (didFrame) {
         imageData.data.set(emu.ppu.frame);

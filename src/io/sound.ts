@@ -1,4 +1,5 @@
 import type { Dma } from './dma';
+import type { Timers } from './timers';
 
 // GBA Direct Sound A + B emulation (the two FIFO-driven 8-bit PCM
 // channels the m4a sound engine and most modern AGB titles use). The
@@ -40,6 +41,18 @@ export class Sound {
   // a margin; if a game cranks the sample rate higher we'll truncate.
   output = new Float32Array(2048);
   outputLen = 0;
+
+  // Source sample rate the FIFOs are currently draining at. Recomputed
+  // whenever a driving timer overflows. The host audio sink reads this
+  // along with drainOutput() to set the AudioBuffer's sample rate so
+  // the browser resamples correctly. 32768 Hz is just the seed value;
+  // games typically pick anything from 5734 Hz up to ~42048 Hz via the
+  // m4a sound engine's frequency table.
+  sampleRate = 32768;
+
+  // Filled by Emulator after Timers exists. We need to peek at the
+  // driving timer's reload + prescale to recompute the sample rate.
+  timers: Timers | null = null;
 
   constructor(public dma: Dma) {}
 
@@ -90,6 +103,16 @@ export class Sound {
     if (!(this.soundcntX & 0x80)) return; // master disable → silence
     const timerA = (this.soundcntH >> 10) & 1;
     const timerB = (this.soundcntH >> 14) & 1;
+
+    // Recompute the source sample rate from the driving timer's
+    // reload + prescale. CPU runs at 16.78 MHz; an overflow happens
+    // every (0x10000 - reload) * prescale cycles, so the sample
+    // rate the emulator produces is CPU_CLOCK / cyclesPerOverflow.
+    if (this.timers && (timerA === timerIdx || timerB === timerIdx)) {
+      const t = this.timers.ch[timerIdx];
+      const cycles = (0x10000 - t.reload) * t.prescale;
+      if (cycles > 0) this.sampleRate = 16777216 / cycles;
+    }
 
     if (timerA === timerIdx) {
       if (this.countA > 0) {
