@@ -51,6 +51,7 @@ export const OP_BR          = 0x0C;
 export const OP_BR_IF       = 0x0D;
 export const OP_RETURN      = 0x0F;
 export const OP_CALL        = 0x10;
+export const OP_DROP        = 0x1A;
 export const OP_LOCAL_GET   = 0x20;
 export const OP_LOCAL_SET   = 0x21;
 export const OP_LOCAL_TEE   = 0x22;
@@ -62,6 +63,12 @@ export const OP_I32_EQ      = 0x46;
 export const OP_I32_NE      = 0x47;
 export const OP_I32_LT_S    = 0x48;
 export const OP_I32_LT_U    = 0x49;
+export const OP_I32_GT_S    = 0x4A;
+export const OP_I32_GT_U    = 0x4B;
+export const OP_I32_LE_S    = 0x4C;
+export const OP_I32_LE_U    = 0x4D;
+export const OP_I32_GE_S    = 0x4E;
+export const OP_I32_GE_U    = 0x4F;
 export const OP_I32_ADD     = 0x6A;
 export const OP_I32_SUB     = 0x6B;
 export const OP_I32_MUL     = 0x6C;
@@ -93,6 +100,7 @@ export class WasmFunction {
   globalGet(i: number): this { this.body.push(OP_GLOBAL_GET); uleb(i, this.body); return this; }
   globalSet(i: number): this { this.body.push(OP_GLOBAL_SET); uleb(i, this.body); return this; }
   call(fi: number): this { this.body.push(OP_CALL); uleb(fi, this.body); return this; }
+  drop(): this { this.body.push(OP_DROP); return this; }
   op(opcode: number): this { this.body.push(opcode); return this; }
   end(): this { this.body.push(OP_END); return this; }
   ret(): this { this.body.push(OP_RETURN); return this; }
