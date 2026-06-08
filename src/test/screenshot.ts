@@ -23,6 +23,128 @@ const emu = new Emulator();
 emu.loadRom(rom);
 if (process.env.JIT) emu.recomp.enabled = true;
 
+if (process.env.RRR_TRACE) {
+  const orig = emu.cpu.softwareInterrupt.bind(emu.cpu);
+  emu.cpu.softwareInterrupt = (n) => {
+    if (n === 0x01) console.log(`SWI 0x01 RegisterRamReset mask=0x${(emu.cpu.state.r[0] & 0xFF).toString(16)} pc=0x${emu.cpu.state.r[15].toString(16)}`);
+    orig(n);
+  };
+}
+
+// Catalog distinct IO read addresses + how many times each.
+// Catalog BLDY writes
+if (process.env.BLDY_TRACE) {
+  const orig = emu.io.write16.bind(emu.io);
+  emu.io.write16 = (a, v) => {
+    if ((a & 0x3FF) === 0x054) console.log(`BLDY <= 0x${v.toString(16)} @ pc=0x${emu.cpu.state.r[15].toString(16)}`);
+    orig(a, v);
+  };
+}
+// Catalog IRQ raises (which IRQs actually fire over the run).
+if (process.env.IRQ_TRACE) {
+  const orig = emu.irq.raise.bind(emu.irq);
+  const counts = new Map<number, number>();
+  emu.irq.raise = (bits: number) => {
+    counts.set(bits, (counts.get(bits) ?? 0) + 1);
+    orig(bits);
+  };
+  process.on('exit', () => {
+    console.log('IRQ raises:');
+    for (const [b, n] of Array.from(counts.entries()).sort((a,b)=>a[0]-b[0])) {
+      console.log(`  0x${b.toString(16)}: ${n}`);
+    }
+  });
+}
+
+if (process.env.IO_READS) {
+  const orig8 = emu.io.read8.bind(emu.io);
+  const orig16 = emu.io.read16.bind(emu.io);
+  const orig32 = emu.io.read32.bind(emu.io);
+  const counts = new Map<number, number>();
+  emu.io.read8 = (a) => { const off = a & 0x3FF; counts.set(off, (counts.get(off) ?? 0) + 1); return orig8(a); };
+  emu.io.read16 = (a) => { const off = a & 0x3FF; counts.set(off | 0x10000, (counts.get(off | 0x10000) ?? 0) + 1); return orig16(a); };
+  emu.io.read32 = (a) => { const off = a & 0x3FF; counts.set(off | 0x20000, (counts.get(off | 0x20000) ?? 0) + 1); return orig32(a); };
+  process.on('exit', () => {
+    const sorted = Array.from(counts.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 20);
+    console.log('Top 20 IO reads (addr | width-tag : count):');
+    for (const [k, n] of sorted) {
+      const off = k & 0xFFFF;
+      const w = (k >>> 16) === 0 ? '8b' : (k >>> 16) === 1 ? '16b' : '32b';
+      console.log(`  0x040000${off.toString(16).padStart(2,'0')} ${w}: ${n}`);
+    }
+  });
+}
+
+// Sample PC at high frequency to find tight init loops.
+// Look at VRAM/PRAM utilization to see if the game is actually drawing.
+if (process.env.RAM_AUDIT_AT_END) {
+  process.on('exit', () => {
+    const vNonZero = Array.from(emu.bus.vram).reduce((a, b) => a + (b ? 1 : 0), 0);
+    const pNonZero = Array.from(emu.bus.pram).reduce((a, b) => a + (b ? 1 : 0), 0);
+    const oNonZero = Array.from(emu.bus.oam).reduce((a, b) => a + (b ? 1 : 0), 0);
+    const eNonZero = Array.from(emu.bus.ewram).reduce((a, b) => a + (b ? 1 : 0), 0);
+    const iNonZero = Array.from(emu.bus.iwram).reduce((a, b) => a + (b ? 1 : 0), 0);
+    console.log(`Non-zero: VRAM=${vNonZero}/${emu.bus.vram.length} PRAM=${pNonZero}/${emu.bus.pram.length} OAM=${oNonZero}/${emu.bus.oam.length}  EWRAM=${eNonZero}/${emu.bus.ewram.length}  IWRAM=${iNonZero}/${emu.bus.iwram.length}`);
+    // First palette entries
+    const p16 = new Uint16Array(emu.bus.pram.buffer);
+    console.log('PRAM[0..7]:', Array.from(p16.slice(0, 8)).map(x => '0x' + x.toString(16).padStart(4, '0')).join(' '));
+  });
+}
+
+// Trace writes to PRAM and DMA channel 3 (palette transfers).
+if (process.env.PRAM_TRACE) {
+  const origW16 = emu.bus.write16.bind(emu.bus);
+  const origW32 = emu.bus.write32.bind(emu.bus);
+  let count = 0;
+  emu.bus.write16 = (addr: number, v: number) => {
+    if (count < 20 && (addr >>> 24) === 5) {
+      console.log(`  PRAM[0x${(addr & 0x3FF).toString(16)}] <= 0x${(v & 0xFFFF).toString(16)} @pc=0x${(emu.cpu.state.r[15]).toString(16)}`);
+      count++;
+    }
+    origW16(addr, v);
+  };
+  emu.bus.write32 = (addr: number, v: number) => {
+    if (count < 20 && (addr >>> 24) === 5) {
+      console.log(`  PRAM[0x${(addr & 0x3FF).toString(16)}] <= 0x${(v >>> 0).toString(16).padStart(8, '0')} @pc=0x${(emu.cpu.state.r[15]).toString(16)}`);
+      count++;
+    }
+    origW32(addr, v);
+  };
+}
+
+if (process.env.PC_HIST) {
+  const counts = new Map<number, number>();
+  const origStep = emu.cpu.step.bind(emu.cpu);
+  emu.cpu.step = () => {
+    const pc = emu.cpu.state.r[15] & ~3;
+    counts.set(pc, (counts.get(pc) ?? 0) + 1);
+    return origStep();
+  };
+  process.on('exit', () => {
+    console.log('PC histogram (top 20):');
+    const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 20);
+    for (const [pc, n] of sorted) {
+      console.log(`  0x${pc.toString(16).padStart(8, '0')}: ${n}`);
+    }
+  });
+}
+
+if (process.env.VCOUNT_TRACE) {
+  const origR16 = emu.io.read16.bind(emu.io);
+  const hist = new Map<number, number>();
+  emu.io.read16 = (a: number) => {
+    const v = origR16(a);
+    if ((a & 0x3FF) === 0x006) hist.set(v, (hist.get(v) ?? 0) + 1);
+    return v;
+  };
+  process.on('exit', () => {
+    console.log('VCOUNT read histogram:');
+    for (const [v, n] of Array.from(hist.entries()).sort((a,b)=>a[0]-b[0])) {
+      console.log(`  vcount=${v.toString().padStart(3)}: ${n}`);
+    }
+  });
+}
+
 // Trace timer-control writes to see if the game uses hardware timers
 // for game-state pacing (which would run too fast/slow if our cycle
 // counting is off relative to runFrame).
