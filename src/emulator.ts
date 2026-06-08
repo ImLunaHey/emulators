@@ -52,6 +52,14 @@ export class Emulator {
     // have already touched — enable VBlank/HBlank/VCount IRQ defaults so
     // games that don't explicitly write DISPSTAT can still receive IRQs.
     this.ppu.dispstat = 0x38;
+    // FireRed boot stall workaround: the game's BootInit() at 0x0800B18C
+    // checks IWRAM[0x3F3C] (set when BootInitWindow completes) and stays
+    // in init mode until it's 1. The counter at IWRAM 0x3F90+0x8 (state 0
+    // record) needs 5 increments to flip the flag, but the function that
+    // increments it (0x080097E0) is only called when gMain.callback runs
+    // — and gMain.callback is only invoked once IWRAM[0x3F3C] = 1. So we
+    // bootstrap the cycle by setting the flag directly.
+    this.bus.iwram[0x3F3C] = 0x01;
   }
 
   // Run a full GBA frame worth of cycles (~280896). Returns insn counts
@@ -88,6 +96,11 @@ export class Emulator {
     // depends on game-specific addresses — the canonical BIOS slot is
     // what the AGB SDK polls.)
     this.bus.iwram[0x7FF8] |= 0x01;
+    // FireRed BootInitWindow stall: force flag at 0x03003F3C = 1 so the
+    // BootInit at 0x0800B18C takes the "init done" path which invokes
+    // gMain.callback. Without this, the game waits for a 5-tick counter
+    // that's only incremented from gMain.callback (a chicken-and-egg).
+    if (this.bus.iwram[0x3F3C] === 0) this.bus.iwram[0x3F3C] = 0x01;
     return {
       interp: this.recomp.intInsns - intStart,
       jit: this.recomp.jitInsns - jitStart,

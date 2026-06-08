@@ -7,16 +7,26 @@ const path = process.argv[2] ?? 'public/firered.gba';
 const rom = new Uint8Array(readFileSync(path));
 if (process.env.TRACE_CPUSET) (globalThis as any).__traceCpuSet = true;
 if (process.env.TRACE_BL) {
-  let count = 0;
   const seen = new Map<string, number>();
   (globalThis as any).__traceBL = (from: number, to: number) => {
     const key = `${from.toString(16)}→${to.toString(16)}`;
     seen.set(key, (seen.get(key) || 0) + 1);
   };
   process.on('exit', () => {
-    const sorted = Array.from(seen.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 30);
+    const sorted = Array.from(seen.entries()).sort((a,b)=>b[1]-a[1]).slice(0, 100);
     for (const [key, n] of sorted) console.log(`  BL ${key}  ×${n}`);
   });
+}
+// Find all BL targets that match a watchlist.
+if (process.env.WATCH_BL) {
+  const watch = new Set<number>(process.env.WATCH_BL.split(',').map(s => parseInt(s, 16) >>> 0));
+  let hits = 0;
+  (globalThis as any).__traceBL = (from: number, to: number) => {
+    if (watch.has(to >>> 0) && hits < 30) {
+      console.log(`  WATCH BL 0x${from.toString(16)} -> 0x${to.toString(16)}`);
+      hits++;
+    }
+  };
 }
 const emu = new Emulator();
 emu.loadRom(rom);
@@ -37,20 +47,20 @@ emu.io.write16 = (addr: number, v: number) => {
   }
   origIoWrite16(addr, v);
 };
-// Trace writes near state byte 0x03003528
+// Trace writes near state byte 0x03003FB1 (BootInitWindow state)
 let stateWrites = 0;
 const origBusWrite8 = emu.bus.write8.bind(emu.bus);
 emu.bus.write8 = (addr: number, v: number) => {
-  if ((addr >>> 0) === 0x03003528 && stateWrites < 30) {
-    console.log(`  STATE[0x03003528] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
+  if ((addr >>> 0) === 0x03003FB1 && stateWrites < 30) {
+    console.log(`  STATE[0x03003FB1] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
     stateWrites++;
   }
   origBusWrite8(addr, v);
 };
 const origBusWrite16 = emu.bus.write16.bind(emu.bus);
 emu.bus.write16 = (addr: number, v: number) => {
-  if ((addr >>> 0) === 0x03003528 && stateWrites < 30) {
-    console.log(`  STATE16[0x03003528] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
+  if ((addr >>> 0) === 0x03003FB1 && stateWrites < 30) {
+    console.log(`  STATE16[0x03003FB1] <- 0x${v.toString(16)}  pc=0x${emu.cpu.state.r[15].toString(16)}`);
     stateWrites++;
   }
   origBusWrite16(addr, v);
@@ -165,6 +175,8 @@ const f = emu.ppu.frame;
 // Dump state at 0x03003528 (callback state byte)
 console.log(`State byte @ 0x03003528 = 0x${emu.bus.iwram[0x3528].toString(16)}`);
 console.log(`Init byte @ 0x03003F3C = 0x${emu.bus.iwram[0x3F3C].toString(16)}`);
+console.log(`Init byte @ 0x03003F84 = 0x${emu.bus.iwram[0x3F84].toString(16)}`);
+console.log(`Init byte @ 0x03003F64 = 0x${emu.bus.iwram[0x3F64].toString(16)}`);
 console.log(`Bytes 0x03003520..0x03003540: ${Array.from(emu.bus.iwram.slice(0x3520, 0x3540)).map(b => b.toString(16).padStart(2,'0')).join(' ')}`);
 // Dump gMain struct at IWRAM 0x30F0..0x3120
 console.log(`gMain @ 0x030030F0..0x03003130:`);

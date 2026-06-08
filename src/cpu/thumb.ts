@@ -374,7 +374,9 @@ export function thumbExecute(cpu: Cpu, instr: number): void {
         // Low half: PC = LR + (offset << 1); LR = (oldPC+2) | 1.
         const newPc = (s.r[14] + ((instr & 0x7FF) << 1)) >>> 0;
         const newLr = ((s.r[15] - 2) | 1) >>> 0;
-        s.r[15] = newPc & ~1;
+        const tg = newPc & ~1;
+        if ((globalThis as any).__traceBL) (globalThis as any).__traceBL(s.r[15] - 4, tg);
+        s.r[15] = tg;
         s.r[14] = newLr;
         cpu.flushPipeline();
         return;
