@@ -12,13 +12,22 @@ export function renderModeText(ppu: Ppu, bg: number, y: number): void {
   const charBase = ((ctrl >> 2) & 3) * 0x4000;
   const screenBase = ((ctrl >> 8) & 0x1F) * 0x800;
   const colorMode8 = (ctrl & 0x80) !== 0;
+  const mosaicOn = (ctrl & 0x40) !== 0;
   const sizeIdx = (ctrl >> 14) & 3;
   const mapW = SIZE_W[sizeIdx];
   const mapH = SIZE_H[sizeIdx];
 
+  // BG mosaic: MOSAIC reg low nibble is the horizontal block size - 1,
+  // second nibble is vertical block size - 1. The effect is a per-axis
+  // "step" that quantizes sample coords to integer multiples of the
+  // block size, producing the chunky pixelated look games use for
+  // transitions / damage flashes.
+  const mosBgH = mosaicOn ? ((ppu.mosaic & 0x0F) + 1) : 1;
+  const mosBgV = mosaicOn ? (((ppu.mosaic >> 4) & 0x0F) + 1) : 1;
+
   const hofs = ppu.bgHOFS[bg];
   const vofs = ppu.bgVOFS[bg];
-  const yEff = (y + vofs) & (mapH - 1);
+  const yEff = ((mosaicOn ? (y - (y % mosBgV)) : y) + vofs) & (mapH - 1);
 
   const layerHi = (bg << 16) | (priority << 18);
   const out = ppu.bgLine[bg];
@@ -26,7 +35,8 @@ export function renderModeText(ppu: Ppu, bg: number, y: number): void {
   const pram16 = ppu.bus.pram16;
 
   for (let x = 0; x < 240; x++) {
-    const xEff = (x + hofs) & (mapW - 1);
+    const xMos = mosaicOn ? (x - (x % mosBgH)) : x;
+    const xEff = (xMos + hofs) & (mapW - 1);
 
     // Map quadrant selection (32x32 tiles per quadrant).
     let mapOff = screenBase;

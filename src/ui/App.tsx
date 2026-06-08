@@ -74,27 +74,29 @@ export function App() {
     setHeaderInfo(`${title.trim()} · ${code}`);
     setCurrentRom(meta ?? { id, filename: title, title, code, size: bytes.length, addedAt: 0 });
     emu.loadRom(bytes);
+    // emu.save is now whichever backend Emulator.loadRom picked from the
+    // ROM signature (Flash 128 KB, SRAM 32 KB, or — eventually — EEPROM).
     try {
       const raw = localStorage.getItem(saveKey);
       if (raw) {
         const arr = base64ToBytes(raw);
-        emu.flash.loadSave(arr);
-        append(`restored save (${arr.length} bytes)`);
+        emu.save.loadSave(arr);
+        append(`restored save (${arr.length} bytes, ${emu.saveType})`);
       }
     } catch (e) {
       append('save restore failed:', (e as Error).message);
     }
     setSelectedRom(id);
-    append(`loaded "${title.trim() || code}"`);
+    append(`loaded "${title.trim() || code}" (${emu.saveType})`);
     let writeTimer: number | null = null;
-    emu.flash.onChange = () => {
+    emu.save.onChange = () => {
       if (writeTimer !== null) return;
       writeTimer = window.setTimeout(() => {
         writeTimer = null;
         try {
-          localStorage.setItem(saveKey, bytesToBase64(emu.flash.data));
+          localStorage.setItem(saveKey, bytesToBase64(emu.save.data));
         } catch (e) {
-          console.warn('Flash persist failed', e);
+          console.warn('Save persist failed', e);
         }
       }, 250);
     };
@@ -138,27 +140,31 @@ export function App() {
     emu.loadRom(romBufRef.current);
     try {
       const raw = localStorage.getItem(saveKeyRef.current);
-      if (raw) emu.flash.loadSave(base64ToBytes(raw));
+      if (raw) emu.save.loadSave(base64ToBytes(raw));
     } catch { /* ignore */ }
   };
 
   const onDownloadSave = () => {
-    const blob = new Blob([emu.flash.data], { type: 'application/octet-stream' });
+    // Re-wrap the Uint8Array into a fresh one with explicit ArrayBuffer
+    // backing — TypeScript can't guarantee `emu.save.data` isn't backed
+    // by a SharedArrayBuffer, even though we never allocate one.
+    const bytes = new Uint8Array(emu.save.data);
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `${currentRom?.code || 'gba'}.sav`;
     a.click();
     URL.revokeObjectURL(url);
-    append('downloaded .sav file');
+    append(`downloaded ${emu.save.data.length}-byte .sav`);
   };
   const onUploadSave = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     file.arrayBuffer().then((buf) => {
-      emu.flash.loadSave(new Uint8Array(buf));
+      emu.save.loadSave(new Uint8Array(buf));
       try {
-        localStorage.setItem(saveKeyRef.current, bytesToBase64(emu.flash.data));
+        localStorage.setItem(saveKeyRef.current, bytesToBase64(emu.save.data));
       } catch { /* ignore */ }
       append(`uploaded save (${buf.byteLength} bytes)`);
     });
@@ -167,7 +173,7 @@ export function App() {
   const onClearSave = () => {
     if (!confirm('Delete the saved game data for this ROM?')) return;
     localStorage.removeItem(saveKeyRef.current);
-    emu.flash.data.fill(0xFF);
+    emu.save.data.fill(0xFF);
     append('cleared save');
   };
 

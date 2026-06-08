@@ -1,5 +1,7 @@
-import { Bus } from './memory/bus';
+import { Bus, SaveBridge } from './memory/bus';
 import { Flash128K } from './memory/flash';
+import { Sram32K } from './memory/sram';
+import { detectSaveType, type SaveType } from './memory/saveDetect';
 import { Rtc } from './memory/rtc';
 import { Cpu } from './cpu/cpu';
 import { Ppu } from './ppu/ppu';
@@ -17,7 +19,14 @@ const CYCLES_PER_FRAME = 280896;
 export class Emulator {
   bus = new Bus();
   flash = new Flash128K();
+  sram = new Sram32K();
   rtc = new Rtc();
+  saveType: SaveType = 'flash128';
+  // The currently-active save backend (= one of `flash` or `sram`,
+  // picked by detectSaveType at loadRom time). Type widened to the
+  // common SaveBridge so `Emulator.save` can be substituted freely
+  // without callers needing to know which chip it is.
+  save: SaveBridge & { data: Uint8Array; onChange: (() => void) | null; loadSave: (b: Uint8Array) => void } = this.flash;
   irq = new Irq();
   keypad = new Keypad();
   ppu: Ppu;
@@ -45,9 +54,11 @@ export class Emulator {
     this.cpu.bios = this.bios;
     this.recomp = new Recompiler(this.cpu);
     this.bus.attachIo(this.io);
+    // attachSave gets a thin closure so we can swap `this.save` per
+    // ROM (Flash vs SRAM vs eventually EEPROM) without re-attaching.
     this.bus.attachSave({
-      read:  (a) => this.flash.read(a),
-      write: (a, v) => this.flash.write(a, v),
+      read:  (a) => this.save.read(a),
+      write: (a, v) => this.save.write(a, v),
     });
     this.installRtcInterposer();
   }
@@ -76,6 +87,25 @@ export class Emulator {
 
   loadRom(bytes: Uint8Array): void {
     this.bus.loadRom(bytes);
+    // Pick the save backend from the ROM's embedded "SRAM_V" /
+    // "FLASH_V" / "FLASH1M_V" / "EEPROM_V" signature. Default is
+    // 128 KB Flash so unknown ROMs still get something workable.
+    this.saveType = detectSaveType(bytes);
+    switch (this.saveType) {
+      case 'sram':
+        this.save = this.sram;
+        break;
+      // EEPROM 512/8K not yet implemented; both fall back to Flash 128
+      // until the bit-serial protocol lands.
+      case 'flash64':
+      case 'flash128':
+      case 'eeprom512':
+      case 'eeprom8k':
+      case 'none':
+      default:
+        this.save = this.flash;
+        break;
+    }
     this.cpu.reset();
     // Cartridge-bypass boot leaves DISPSTAT in a state the real BIOS would
     // have already touched — enable VBlank/HBlank/VCount IRQ defaults so
