@@ -169,6 +169,19 @@ console.log(`DISPCNT=${emu.ppu.dispcnt.toString(16)}  DISPSTAT=${emu.ppu.dispsta
 console.log(`IWRAM[310C-310F] (wait flag) = ${[0x310C,0x310D,0x310E,0x310F].map(o=>emu.bus.iwram[o].toString(16)).join(' ')}`);
 console.log(`SWI counts:`, Array.from(swiCounts.entries()).map(([k,v]) => `0x${k.toString(16)}=${v}`).join(' '));
 console.log(`IRQ entry IF distribution:`, Array.from(irqIfHist.entries()).map(([k,v]) => `0x${k.toString(16)}=${v}`).join(' '));
+// Dump anything non-zero in EWRAM beyond the bare state area.
+let ewramRanges = '';
+let inRange = false;
+let rangeStart = 0;
+for (let i = 0; i < emu.bus.ewram.length; i++) {
+  if (emu.bus.ewram[i] !== 0) {
+    if (!inRange) { rangeStart = i; inRange = true; }
+  } else if (inRange) {
+    inRange = false;
+    if (i - rangeStart >= 4) ewramRanges += ` 0x${(0x02000000 + rangeStart).toString(16)}..0x${(0x02000000 + i - 1).toString(16)}`;
+  }
+}
+console.log(`Non-zero EWRAM ranges (>=4 bytes):${ewramRanges || ' (none)'}`);
 
 // Sample frame buffer pixels.
 const f = emu.ppu.frame;
