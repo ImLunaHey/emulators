@@ -381,7 +381,7 @@ describe('IO register behavior', () => {
 
   it('write to IF (0x4000202) acks (clears)', () => {
     const { bus } = setupRunArm([]);
-    (bus.io as any).irq.iflag = 0x0001;
+    (bus.io as any).irq.raise(0x0001);
     bus.write16(0x04000202, 0x0001);
     expect((bus.io as any).irq.iflag).toBe(0);
   });
@@ -418,18 +418,15 @@ describe('Halt + IRQ wakeup (the boot stall pattern)', () => {
     cpu.state.halted = true;
     cpu.state.cpsr = Mode.SYS;  // I bit clear → IRQ enabled
     const irq = (bus.io as any).irq;
-    irq.ime = 1;
-    irq.ie = 0x0001;  // VBlank
-    irq.iflag = 0x0001;  // VBlank pending
-    // emulator.runFrame normally syncs irqLine; do it manually.
+    irq.setIme(1);
+    irq.setIe(0x0001);  // VBlank
+    irq.raise(0x0001);  // VBlank pending
     cpu.irqLine = irq.pending();
     expect(cpu.irqLine).toBe(true);
     cpu.step();  // un-halts but doesn't take IRQ
     expect(cpu.state.halted).toBe(false);
     cpu.step();  // takes IRQ; same step also fetches+executes vector instr (B 0x128)
     expect(cpu.state.mode()).toBe(Mode.IRQ);
-    // BIOS stub at 0x18 is `B 0x128` — the branch executed in this step, so
-    // PC is now at the dispatcher.
     expect(cpu.state.r[15]).toBe(0x128);
   });
 
@@ -438,9 +435,9 @@ describe('Halt + IRQ wakeup (the boot stall pattern)', () => {
     cpu.state.halted = true;
     cpu.state.cpsr = Mode.SYS | 0x80;  // I bit set → IRQ masked
     const irq = (bus.io as any).irq;
-    irq.ime = 1;
-    irq.ie = 0x0001;
-    irq.iflag = 0x0001;
+    irq.setIme(1);
+    irq.setIe(0x0001);
+    irq.raise(0x0001);
     cpu.irqLine = irq.pending();
     cpu.step();
     expect(cpu.state.halted).toBe(true);  // stays halted
@@ -451,9 +448,9 @@ describe('Halt + IRQ wakeup (the boot stall pattern)', () => {
     cpu.state.halted = true;
     cpu.state.cpsr = Mode.SYS;
     const irq = (bus.io as any).irq;
-    irq.ime = 0;  // master disable
-    irq.ie = 0x0001;
-    irq.iflag = 0x0001;
+    irq.setIme(0);  // master disable
+    irq.setIe(0x0001);
+    irq.raise(0x0001);
     cpu.irqLine = irq.pending();
     expect(cpu.irqLine).toBe(false);  // pending() respects IME
     cpu.step();
@@ -498,9 +495,9 @@ describe('BIOS IRQ dispatcher round-trip', () => {
     cpu.state.cpsr = Mode.SYS;
     cpu.state.r[15] = 0x08000100;  // pretend we're in game code at 0x08000100
     const irq = (bus.io as any).irq;
-    irq.ime = 1;
-    irq.ie = 0x0001;
-    irq.iflag = 0x0001;
+    irq.setIme(1);
+    irq.setIe(0x0001);
+    irq.raise(0x0001);
     cpu.irqLine = true;
     // Step CPU until we return to user code. Should take ~10-15 instructions:
     // takeIrq+B(0x128) → STMFD → MOV → ADR → LDR PC → MOV/LDR/STRH/BX LR

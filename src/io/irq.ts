@@ -22,19 +22,34 @@ export class Irq {
   ie = 0;
   iflag = 0;
   ime = 0;
+  // Cached pending bit so the hot CPU loop doesn't have to recompute it
+  // every step. Setters keep it in sync.
+  cachedPending = false;
 
   raise(bits: number): void {
     this.iflag = (this.iflag | bits) & 0x3FFF;
+    this.cachedPending = (this.ime & 1) !== 0 && (this.ie & this.iflag) !== 0;
+  }
+
+  setIe(v: number): void {
+    this.ie = v & 0x3FFF;
+    this.cachedPending = (this.ime & 1) !== 0 && (this.ie & this.iflag) !== 0;
+  }
+
+  setIme(v: number): void {
+    this.ime = v & 1;
+    this.cachedPending = (this.ime & 1) !== 0 && (this.ie & this.iflag) !== 0;
   }
 
   // The CPU's irqLine should be driven by (IME & 1) && (IE & IF) and the
   // CPU's own CPSR.I being clear. The IO bridge polls this.
   pending(): boolean {
-    return (this.ime & 1) !== 0 && (this.ie & this.iflag) !== 0;
+    return this.cachedPending;
   }
 
   // Writes to IF clear the corresponding bits.
   ackWrite16(v: number): void {
     this.iflag &= ~(v & 0x3FFF);
+    this.cachedPending = (this.ime & 1) !== 0 && (this.ie & this.iflag) !== 0;
   }
 }

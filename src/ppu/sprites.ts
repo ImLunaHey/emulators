@@ -65,11 +65,15 @@ export function renderSprites(ppu: Ppu, y: number): void {
     const tileRow = inSpriteY >> 3;
     const inTileY = inSpriteY & 7;
 
-    const tileBytes = color8 ? 64 : 32;
     const tileBase = 0x10000;
-    // 1D mapping: tiles are linear. 2D mapping: 32 tiles per row in the
-    // 0x10000 region (in 16-color units). For 8-color we step by 2.
-    const tileStride = objMappingLinear ? (w >> 3) : 32;
+    const tilesPerTile = color8 ? 2 : 1; // 8bpp tiles occupy 2 adjacent 4bpp slots
+    // Row stride differs between 1D and 2D mapping:
+    //   1D: each row of the sprite is laid out linearly after the previous,
+    //       so row stride = (sprite_width_in_tiles) * tilesPerTile.
+    //   2D: tiles are arranged in a fixed 32-wide grid in the OBJ tile area,
+    //       so row stride is ALWAYS 32 slots regardless of color depth.
+    //       Within a row, an 8bpp tile still occupies 2 slots (col step = 2).
+    const rowStride = objMappingLinear ? (w >> 3) * tilesPerTile : 32;
 
     for (let px = 0; px < w; px++) {
       const screenX = xPos + px;
@@ -79,8 +83,7 @@ export function renderSprites(ppu: Ppu, y: number): void {
       const tileCol = inSpriteX >> 3;
       const inTileX = inSpriteX & 7;
 
-      const tilesPerTile = color8 ? 2 : 1; // 8bpp uses 2 4bpp tile slots
-      const baseTile = tileIdx + tileRow * tileStride * tilesPerTile + tileCol * tilesPerTile;
+      const baseTile = tileIdx + tileRow * rowStride + tileCol * tilesPerTile;
       const tileAddr = tileBase + (baseTile & 0x3FF) * 32 + inTileY * (color8 ? 8 : 4) + (color8 ? inTileX : (inTileX >> 1));
       if (tileAddr >= 0x18000) continue;
 

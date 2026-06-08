@@ -114,10 +114,10 @@ export class Io implements IoBridge {
     }
     // Interrupt + system.
     switch (addr) {
-      case 0x200: this.irq.ie = v & 0x3FFF; this.raw16[0x200 >>> 1] = v; return;
+      case 0x200: this.irq.setIe(v); this.raw16[0x200 >>> 1] = this.irq.ie; return;
       case 0x202: this.irq.ackWrite16(v); this.raw16[0x202 >>> 1] = this.irq.iflag; return;
       case 0x204: this.waitcnt = v; this.raw16[0x204 >>> 1] = v; return;
-      case 0x208: this.irq.ime = v & 1; this.raw16[0x208 >>> 1] = v & 1; return;
+      case 0x208: this.irq.setIme(v); this.raw16[0x208 >>> 1] = this.irq.ime; return;
     }
     this.raw16[addr >>> 1] = v;
   }

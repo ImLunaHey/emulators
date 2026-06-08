@@ -58,35 +58,35 @@ export class Emulator {
   // for the UI's stat readout.
   runFrame(): { interp: number; jit: number; frames: number } {
     let executed = 0;
-    let jitStart = this.recomp.jitInsns;
-    let intStart = this.recomp.intInsns;
+    const jitStart = this.recomp.jitInsns;
+    const intStart = this.recomp.intInsns;
     const cpu = this.cpu;
+    const ppu = this.ppu;
+    const timers = this.timers;
+    const irq = this.irq;
     while (executed < CYCLES_PER_FRAME) {
-      cpu.irqLine = this.irq.pending();
-      let cycles: number;
-      if (this.recomp.tryDispatch()) {
-        cycles = 1;
-      } else {
-        cycles = cpu.step();
-        this.recomp.intInsns++;
+      // Batch CPU steps before touching PPU/Timer. Bound by min(remaining
+      // frame budget, cycles until next scanline, 64) so PPU never lags a
+      // scanline boundary by more than a batch.
+      const lineRemaining = 1232 - ppu.cyclesAccum;
+      let batch = lineRemaining < 64 ? lineRemaining : 64;
+      if (batch > CYCLES_PER_FRAME - executed) batch = CYCLES_PER_FRAME - executed;
+      if (batch <= 0) batch = 1;
+      let i = 0;
+      while (i < batch) {
+        cpu.irqLine = irq.cachedPending;
+        if (this.recomp.tryDispatch()) i++;
+        else { cpu.step(); i++; this.recomp.intInsns++; }
+        if (cpu.state.halted) { i = batch; break; }
       }
-      this.ppu.step(cycles);
-      this.timers.step(cycles);
-      executed += cycles;
-      if (this.ppu.frameDone) { this.ppu.frameDone = false; break; }
+      ppu.step(i);
+      timers.step(i);
+      executed += i;
+      if (ppu.frameDone) { ppu.frameDone = false; break; }
     }
-    // HBlank IRQ bits left in IF can persist across re-enables of DISPSTAT
-    // and confuse game IRQ handlers. The handler only acks bits it actually
-    // services; HBlank IRQs raised from the BIOS-state hack survive
-    // forever otherwise. Clear stale HBlank bits at frame boundary if the
-    // PPU no longer has HBlank IRQ enabled.
-    if (!(this.ppu.dispstat & 0x10)) this.irq.iflag &= ~0x2;
     // BIOS-side IntrCheck flag: the BIOS sets bit 0 of *(u16*)0x03007FF8 on
     // VBlank IRQ. Our HLE doesn't drive this through a real BIOS handler,
-    // so we set it directly each frame. (FireRed/Emerald's own ROM IRQ
-    // handler ALSO sets bit 0 of gMain.intrCheck at 0x0300310C, but that
-    // depends on game-specific addresses — the canonical BIOS slot is
-    // what the AGB SDK polls.)
+    // so we set it directly each frame.
     this.bus.iwram[0x7FF8] |= 0x01;
     return {
       interp: this.recomp.intInsns - intStart,
