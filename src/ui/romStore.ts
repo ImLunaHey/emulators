@@ -92,6 +92,27 @@ export async function addRom(filename: string, bytes: Uint8Array, md5?: string):
   return { id: row.id, filename, title: row.title, code, size: bytes.length, addedAt: row.addedAt, md5 };
 }
 
+// Backfill an existing ROM's md5 (older library entries pre-date the
+// hash-on-import change). Keeps the bytes blob in place; just merges
+// the md5 field into the existing row.
+export async function updateRomMd5(id: string, md5: string): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    const get = store.get(id);
+    get.onsuccess = () => {
+      const row = get.result;
+      if (!row) { resolve(); return; }
+      row.md5 = md5;
+      const put = store.put(row);
+      put.onsuccess = () => resolve();
+      put.onerror = () => reject(put.error);
+    };
+    get.onerror = () => reject(get.error);
+  });
+}
+
 export async function deleteRom(id: string): Promise<void> {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {

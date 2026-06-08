@@ -56,7 +56,7 @@ export function CartArt({ title, subtitle, className }: Props) {
           color: c.fg,
         }}
       >
-        <div className="text-[10px] font-bold uppercase tracking-wider leading-tight line-clamp-3">
+        <div className="text-[11px] font-bold tracking-wide leading-tight">
           {title}
         </div>
         {subtitle && (

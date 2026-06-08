@@ -1,15 +1,8 @@
-// Hasheous client. Hashes a ROM byte buffer (MD5 via SubtleCrypto) and
-// looks it up through our /api/hasheous worker proxy. The proxy adds
-// the missing CORS header and edge-caches results.
-//
-// Hasheous's response is a large nested object pulling metadata from
-// IGDB / TheGamesDb / GiantBomb; we narrow it down to the few fields
-// the library UI actually uses.
+// Hasheous client. Hashes a ROM byte buffer (MD5 via small inline
+// implementation — SubtleCrypto omits MD5), looks it up through our
+// /api/hasheous Cloudflare Worker proxy (Hasheous omits CORS headers),
+// and returns the fields we care about for the library UI.
 
-// SubtleCrypto.digest gives SHA-1/256/384/512, not MD5 — and we want
-// MD5 because Hasheous's catalog is keyed primarily off MD5 hashes
-// from the No-Intro datfiles. Implement a small MD5 routine inline
-// rather than pulling a dependency.
 export async function md5Hex(bytes: Uint8Array): Promise<string> {
   // RFC 1321 MD5. Straight transcription with no optimization.
   // Returns a 32-character lowercase hex string.
@@ -24,13 +17,11 @@ export async function md5Hex(bytes: Uint8Array): Promise<string> {
     k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
   }
 
-  // Pad to 64-byte blocks: 0x80, then zeros, then bit-length (LE 64).
   const bitLen = BigInt(bytes.length) * 8n;
   const padLen = ((bytes.length + 9 + 63) & ~63) - bytes.length;
   const buf = new Uint8Array(bytes.length + padLen);
   buf.set(bytes);
   buf[bytes.length] = 0x80;
-  // Little-endian 64-bit bit-length at the end.
   const bl = new DataView(buf.buffer, buf.length - 8);
   bl.setUint32(0, Number(bitLen & 0xFFFFFFFFn), true);
   bl.setUint32(4, Number((bitLen >> 32n) & 0xFFFFFFFFn), true);
@@ -71,25 +62,26 @@ export async function md5Hex(bytes: Uint8Array): Promise<string> {
   return hex;
 }
 
-// The bits of Hasheous's response we care about for library display.
+// Normalized metadata we surface to the UI.
 export interface HasheousMeta {
-  name: string | null;
-  platform: string | null;
-  releaseDate: string | null;
-  coverUrl: string | null;
-  // Raw response if a caller wants more.
-  raw: unknown;
+  name: string | null;        // canonical title — "Pokemon - FireRed Version"
+  platform: string | null;    // "Nintendo Game Boy Advance"
+  publisher: string | null;   // "Nintendo"
+  year: string | null;        // "2004" (string, not int — Hasheous sometimes has ranges)
+  region: string | null;      // first known region code: "USA", "Europe", "Japan", etc.
+  description: string | null; // long-form blurb (AI-generated or curated)
+  // Box-art URL candidates to try in order. First successful load wins;
+  // last entry is the placeholder fallback signal (empty string).
+  thumbnails: string[];
 }
 
-// In-memory + localStorage cache so we don't re-query Hasheous for
-// every library list render. Keyed by md5.
 const KEY_PREFIX = 'gba-recomp:hasheous:';
 
 function readCache(md5: string): HasheousMeta | null | undefined {
   try {
     const raw = localStorage.getItem(KEY_PREFIX + md5);
-    if (!raw) return undefined;            // never queried
-    if (raw === 'null') return null;       // queried, no match
+    if (!raw) return undefined;
+    if (raw === 'null') return null;
     return JSON.parse(raw) as HasheousMeta;
   } catch {
     return undefined;
@@ -112,43 +104,63 @@ export async function lookupByMd5(md5: string): Promise<HasheousMeta | null> {
     }
     if (!r.ok) return null;
     const body = await r.json() as Record<string, unknown>;
-    const meta: HasheousMeta = {
-      name: (body.name as string) ?? null,
-      platform: ((body.platform as Record<string, unknown> | undefined)?.name as string) ?? null,
-      releaseDate: extractReleaseDate(body),
-      coverUrl: extractCoverUrl(body),
-      raw: body,
-    };
+    const meta = parseHasheousBody(body);
     writeCache(md5, meta);
     return meta;
   } catch {
-    // Network/proxy errors — don't cache so a retry on next session
-    // can try again.
     return null;
   }
 }
 
-function extractReleaseDate(body: Record<string, unknown>): string | null {
-  // Hasheous bundles platform metadata + signatures. The first matching
-  // release date in body.signatures[0].game.releasedate is the usual one.
-  const sigs = body.signatures as Array<Record<string, unknown>> | undefined;
-  if (!sigs || sigs.length === 0) return null;
-  const game = sigs[0].game as Record<string, unknown> | undefined;
-  const date = game?.releasedate as string | undefined;
-  return date ?? null;
+function parseHasheousBody(body: Record<string, unknown>): HasheousMeta {
+  const platform = (body.platform as Record<string, unknown> | undefined);
+  const sig = body.signature as Record<string, unknown> | undefined;
+  const game = sig?.game as Record<string, unknown> | undefined;
+  const attrs = body.attributes as Array<Record<string, unknown>> | undefined;
+
+  const name = (game?.name as string) ?? (body.name as string) ?? null;
+  const platformName = (platform?.name as string) ?? null;
+  const publisher = (game?.publisher as string) ?? (body.publisher as string) ?? null;
+  const year = (game?.year as string) ?? null;
+  const countries = game?.countries as Record<string, string> | undefined;
+  const region = countries ? Object.values(countries)[0] ?? null : null;
+
+  // Pull description from the attributes block — Hasheous lists per-source
+  // entries; "AIDescription" is the most reliably populated.
+  let description: string | null = null;
+  if (attrs) {
+    const desc = attrs.find((a) => a.attributeName === 'AIDescription' || a.attributeName === 'Description');
+    if (desc) description = (desc.value as string) ?? null;
+  }
+
+  const thumbnails = name && platformName ? buildThumbnailUrls(name, platformName, region) : [];
+
+  return { name, platform: platformName, publisher, year, region, description, thumbnails };
 }
 
-function extractCoverUrl(body: Record<string, unknown>): string | null {
-  // Try IGDB cover first.
-  const metas = body.metadata as Array<Record<string, unknown>> | undefined;
-  if (!metas) return null;
-  for (const m of metas) {
-    if (m.source === 'IGDB' && typeof m.link === 'string') {
-      // IGDB doesn't put a cover URL directly here; we'd need a second
-      // call to MetadataProxy. Skip for now — keeping this stub so
-      // future caller can wire it up without a second API roundtrip.
-      return null;
-    }
-  }
-  return null;
+// Construct the URL candidates we'll try, in order, against the
+// LibRetro thumbnails CDN (free + public + no auth). LibRetro names
+// follow the No-Intro convention <Title> (<Regions>) [+ flags].png.
+// Hasheous gives us the canonical title and at least one region, so we
+// guess: name + region first, then name + USA, then name + Europe,
+// then name + World, then name alone.
+function buildThumbnailUrls(name: string, platform: string, region: string | null): string[] {
+  if (!platform.toLowerCase().includes('boy advance')) return [];
+  const system = 'Nintendo - Game Boy Advance';
+  const enc = (s: string) =>
+    encodeURIComponent(s)
+      .replace(/%20/g, '%20')
+      .replace(/'/g, '%27');
+  const base = `https://thumbnails.libretro.com/${encodeURIComponent(system)}/Named_Boxarts/`;
+  const variants: string[] = [];
+  const tryFile = (rom: string) => variants.push(base + enc(rom) + '.png');
+  if (region) tryFile(`${name} (${region})`);
+  tryFile(`${name} (USA)`);
+  tryFile(`${name} (USA, Europe)`);
+  tryFile(`${name} (Europe)`);
+  tryFile(`${name} (World)`);
+  tryFile(`${name} (Japan)`);
+  tryFile(name);
+  // Dedupe while preserving order.
+  return Array.from(new Set(variants));
 }

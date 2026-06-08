@@ -2,10 +2,10 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { unzipSync } from 'fflate';
 import { ErrorBoundary } from './ErrorBoundary';
-import { addRom, deleteRom, listRoms, type RomMeta } from './romStore';
+import { addRom, deleteRom, getRomBytes, listRoms, updateRomMd5, type RomMeta } from './romStore';
 import { md5Hex, lookupByMd5, type HasheousMeta } from './hasheous';
 import { useConfirm } from './ConfirmModal';
-import { CartArt } from './CartArt';
+import { CoverImage } from './CoverImage';
 
 // Pull every .gba member out of a ZIP archive.
 function extractGbaFromZip(zipBytes: Uint8Array): Array<{ filename: string; bytes: Uint8Array }> {
@@ -36,17 +36,46 @@ export function LibraryPage() {
 
   const append = (msg: string) => setLog((p) => [...p, msg]);
 
+  // "loading" while we're walking the library populating md5 + Hasheous
+  // metadata. Shown as a small status line above the grid.
+  const [enriching, setEnriching] = useState(0);
+
   const refresh = async () => {
     const r = await listRoms();
     setRoms(r);
     setSelected(new Set());
-    // Kick off Hasheous lookups for any ROMs we have an md5 for and
-    // haven't already resolved.
-    for (const rom of r) {
-      if (!rom.md5 || meta[rom.id] !== undefined) continue;
-      lookupByMd5(rom.md5).then((m) => {
+    enrichAll(r);
+  };
+  // For each ROM in the library, ensure we have an md5 (backfilling
+  // by hashing the bytes if it was added pre-Hasheous-integration),
+  // then trigger a Hasheous lookup if we haven't already cached one.
+  const enrichAll = async (rs: RomMeta[]) => {
+    const todo = rs.filter((rom) => meta[rom.id] === undefined);
+    if (todo.length === 0) return;
+    setEnriching(todo.length);
+    for (const rom of todo) {
+      let md5 = rom.md5;
+      if (!md5) {
+        try {
+          const bytes = await getRomBytes(rom.id);
+          if (!bytes) { setEnriching((n) => n - 1); continue; }
+          md5 = await md5Hex(bytes);
+          await updateRomMd5(rom.id, md5);
+          setRoms((cur) => cur.map((x) => (x.id === rom.id ? { ...x, md5 } : x)));
+        } catch (e) {
+          append(`hash failed for ${rom.title || rom.filename}: ${(e as Error).message}`);
+          setEnriching((n) => n - 1);
+          continue;
+        }
+      }
+      try {
+        const m = await lookupByMd5(md5);
         setMeta((cur) => ({ ...cur, [rom.id]: m }));
-      });
+      } catch (e) {
+        append(`lookup failed for ${rom.title || rom.filename}: ${(e as Error).message}`);
+        setMeta((cur) => ({ ...cur, [rom.id]: null }));
+      }
+      setEnriching((n) => n - 1);
     }
   };
   useEffect(() => { refresh(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
@@ -186,11 +215,11 @@ export function LibraryPage() {
           <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
             {roms.map((rom) => {
               const isSelected = selected.has(rom.id);
-              const m = rom.md5 ? meta[rom.id] : undefined;
+              const m = meta[rom.id];
               const displayName = m?.name || rom.title || rom.filename;
-              const year = m?.releaseDate?.slice(0, 4);
+              const year = m?.year ?? null;
               const subtitleParts: string[] = [rom.code];
-              if (year && /^\d{4}$/.test(year)) subtitleParts.push(year);
+              if (year) subtitleParts.push(year);
               subtitleParts.push(`${(rom.size / (1024 * 1024)).toFixed(0)}M`);
               return (
                 <li
@@ -205,9 +234,10 @@ export function LibraryPage() {
                   onClick={() => selectMode ? toggleSelected(rom.id) : navigate(`/play/${rom.id}`)}
                 >
                   <div className="relative">
-                    <CartArt
+                    <CoverImage
                       title={displayName}
                       subtitle={year || rom.code}
+                      thumbnails={m?.thumbnails ?? []}
                     />
                     {selectMode && (
                       <input
@@ -220,14 +250,14 @@ export function LibraryPage() {
                     {!selectMode && (
                       <button
                         onClick={(e) => { e.stopPropagation(); onDeleteOne(rom.id, displayName); }}
-                        className="absolute top-1 right-1 w-6 h-6 flex items-center justify-center rounded bg-black/60 text-[#9a9aa6] text-xs opacity-0 group-hover:opacity-100 hover:!text-red-400 transition-opacity"
+                        className="absolute top-1 right-1 w-6 h-6 flex items-center justify-center rounded bg-black/60 text-[#9a9aa6] text-xs opacity-0 group-hover:opacity-100 focus:opacity-100 hover:!text-red-400 transition-opacity"
                         title="Remove from library"
                         aria-label="Remove"
                       >🗑</button>
                     )}
                   </div>
                   <div className="min-w-0">
-                    <div className="text-[11px] font-medium truncate" title={displayName}>{displayName}</div>
+                    <div className="text-[11px] font-medium leading-tight line-clamp-2" title={displayName}>{displayName}</div>
                     <div className="text-[9px] opacity-50 truncate" title={`${rom.filename} · ${m?.platform || 'GBA'}`}>
                       {subtitleParts.join(' · ')}
                     </div>
