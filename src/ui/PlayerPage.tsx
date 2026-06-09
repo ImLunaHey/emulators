@@ -178,6 +178,27 @@ export function PlayerPage() {
     });
     e.target.value = '';
   };
+  // Fullscreen target wraps just the Screen (+ stats line) so the
+  // toolbar and modals don't render while fullscreen is active. The
+  // `:fullscreen` CSS rule on canvas#screen handles the aspect-
+  // preserving scale to viewport.
+  const fsContainerRef = useRef<HTMLDivElement>(null);
+  const [isFs, setIsFs] = useState(false);
+  useEffect(() => {
+    const onFsChange = () => setIsFs(document.fullscreenElement === fsContainerRef.current);
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => { /* user-cancelled */ });
+      return;
+    }
+    fsContainerRef.current?.requestFullscreen().catch((e) => {
+      append('fullscreen blocked: ' + (e as Error).message);
+    });
+  };
+
   const onClearSave = () => {
     confirm.ask({
       title: 'Clear save data',
@@ -199,7 +220,9 @@ export function PlayerPage() {
         <div className="text-xs opacity-60 font-mono truncate">{headerInfo || 'no ROM loaded'}</div>
       </header>
       <ErrorBoundary label="Player" resetKey={currentRom?.id ?? null}>
-        <Screen emu={emu} paused={paused} audio={audio} onStats={setStats} />
+        <div ref={fsContainerRef} className="fs-container">
+          <Screen emu={emu} paused={paused} audio={audio} onStats={setStats} />
+        </div>
         <div className="w-full max-w-[720px] flex justify-between items-center px-2 text-[11px]">
           <span className="text-[var(--color-accent)] opacity-85 font-mono">{stats}</span>
           <span className="opacity-50 hidden sm:inline">arrows · z/x · a/s · enter/shift</span>
@@ -213,6 +236,7 @@ export function PlayerPage() {
           <button onClick={() => navigate('/')} className="btn-default">📂 Library</button>
           <button onClick={() => setPaused((p) => !p)} className="btn-default" disabled={!currentRom}>{paused ? '▶ Resume' : '❚❚ Pause'}</button>
           <button onClick={onReset} className="btn-default" disabled={!currentRom}>↻ Reset</button>
+          <button onClick={toggleFullscreen} className="btn-default" disabled={!currentRom}>{isFs ? '↙ Exit FS' : '⛶ Fullscreen'}</button>
           {/* Save submenu condenses Export/Import/Clear into one popover. */}
           <div className="relative">
             <button
