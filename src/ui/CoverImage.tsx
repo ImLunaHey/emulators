@@ -4,8 +4,8 @@ import { __sweepOldVersions as sweep } from './hasheous';
 
 // Try the LibRetro thumbnail URLs in order. First one that loads wins;
 // if all fail (404 / network error), fall back to the styled CartArt
-// placeholder. Each successful load is cached in sessionStorage so a
-// second mount doesn't repeat the probe.
+// placeholder. Each successful or definitive-miss probe is cached in
+// sessionStorage so a re-render doesn't repeat the network work.
 
 interface Props {
   title: string;
@@ -37,13 +37,17 @@ export function CoverImage({ title, subtitle, thumbnails, className }: Props) {
   const [resolved, setResolved] = useState<string | null | undefined>(() => readCached(title));
 
   useEffect(() => {
+    // Already settled this title from a previous render — keep showing it.
     if (resolved !== undefined) return;
-    if (thumbnails.length === 0) { setResolved(null); writeCached(title, null); return; }
+    // Nothing to probe yet. The parent is likely still fetching Hasheous
+    // metadata; leave `resolved` at undefined so the placeholder shows
+    // and a later prop change (non-empty thumbnails) re-triggers this
+    // effect. The previous build cached null here, which permanently
+    // stuck the card on the placeholder even after metadata arrived.
+    if (thumbnails.length === 0) return;
     let cancelled = false;
     (async () => {
       for (const url of thumbnails) {
-        // Probe via Image() so the browser caches it for the eventual
-        // <img src>. HEAD via fetch() doesn't work for these (CORS).
         const ok = await new Promise<boolean>((res) => {
           const img = new Image();
           img.onload = () => res(true);
@@ -54,6 +58,8 @@ export function CoverImage({ title, subtitle, thumbnails, className }: Props) {
         if (ok) { setResolved(url); writeCached(title, url); return; }
       }
       if (cancelled) return;
+      // We tried every URL the parent gave us and none loaded — cache
+      // the miss so we don't keep probing on every re-render.
       setResolved(null);
       writeCached(title, null);
     })();
