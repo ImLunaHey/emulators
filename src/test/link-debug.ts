@@ -111,17 +111,23 @@ const connectAtFrame = parseInt(process.env.CONNECT_AT ?? '720', 10);
 //   - A          → select Multi-Pak (cable cartridge)
 //   - Now on the "insert link cable" screen.
 interface InputEvent { frame: number; key: Key; release?: number; }
-const inputScript: InputEvent[] = [
-  // Title screen → main menu. One START is enough; a second one ends
-  // up selecting whatever's highlighted (Single Player by default).
-  { frame: 320,  key: Key.START,  release: 326  },
-  // Main menu shows "SINGLE PLAYER" highlighted. Move down to
-  // Multi-Player and enter.
-  { frame: 540,  key: Key.DOWN,   release: 548  },
-  { frame: 600,  key: Key.A,      release: 608  },
-  // Multi-Player submenu — first option is Multi-Pak (real cable).
-  { frame: 660,  key: Key.A,      release: 668  },
-];
+// Per-ROM scripted nav. ROMs that need menu navigation get their
+// own entry; the rest just run untouched. Mario Kart's path takes
+// us to the cable-check screen; Emerald has none because reaching
+// the trade center requires hours of in-game progress without a
+// pre-existing save.
+const inputScripts: Record<string, InputEvent[]> = {
+  'mario-kart-super-circuit.gba': [
+    { frame: 320, key: Key.START, release: 326 },
+    { frame: 540, key: Key.DOWN,  release: 548 },
+    { frame: 600, key: Key.A,     release: 608 },
+    { frame: 660, key: Key.A,     release: 668 },
+  ],
+  // Pokemon Emerald: no input — we just observe boot-time SIO probes.
+  'emerald.gba': [],
+};
+const romName = romPath.split('/').pop() ?? '';
+const inputScript = inputScripts[romName] ?? [];
 
 const rom = new Uint8Array(readFileSync(romPath));
 

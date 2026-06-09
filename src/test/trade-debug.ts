@@ -24,6 +24,36 @@
 // then exchanges command codes (0x10/0x26/0x30/0x3d/0x41/0x42), each
 // of which has its own sub-protocol. Failing any command-exchange
 // step trips the link-error path. That's where remaining work lives.
+//
+// Deeper map (added next round):
+//   Main-loop dispatcher  = ROM 0x0800b638  (state-indexed jump
+//     table at 0x0800b65c). Index = struct1[1]. Targets:
+//       state 0 → 0x0800b670  (sets state=1, error)
+//       state 1 → 0x0800b680  (recovery if struct1[0]==1, else
+//                              stays stuck)
+//       state 2 → 0x0800b698
+//       state 3 → 0x0800b6d4  (sets state=4 then falls through)
+//       state 4 → 0x0800b6de  (BL 0x0800c7c0, BL 0x0800c4a8)
+//   Phase 2 command dispatcher = ROM 0x0800c7c0
+//     - reads struct2[14] at 0x0300414e; returns early if 0
+//     - clears struct2[14] back to 0
+//     - dispatches on (arg0 - 0x10) over a 0x2E-entry jump table
+//       at 0x0800c7f0; valid command range = 0x10..0x3D
+//   State-clear trap: a BIOS SWI 0x0B (CpuSet) wrapper at ROM
+//   0x082e7084 fires every frame in phase 2 with src=zero,
+//   dest=0x03003170, count=1 word. By design — phase 2 expects the
+//   command exchange to RE-initialize struct1 with new values BETWEEN
+//   clears. Our model fails because the command exchange produces
+//   zeros instead of valid 0x10..0x3D codes, so struct1 stays
+//   zeroed, the next dispatch hits state-0 → state=1 → error.
+//
+// Strategic takeaway: the user's actual bug lives in either (a) the
+// SIO model's per-byte semantics in Multi-play mode (slot-ID
+// encoding, IRQ timing, SIOMULTI clear-after-read), or (b) some
+// command handler our SIO model doesn't reach. Reproducing it from
+// a single savestate adds the symmetry artifact on top, but the
+// underlying failure is the same: phase 2's command exchange is
+// reading zeros instead of valid command codes.
 
 import { readFileSync } from 'node:fs';
 import { Emulator } from '../emulator';
