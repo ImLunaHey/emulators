@@ -178,7 +178,11 @@ export function PlayerPage() {
       } catch (err) {
         append('localStorage write failed:', (err as Error).message);
       }
-      append(`uploaded save (${buf.byteLength} bytes) — press Reset to apply`);
+      // Auto-reset so the game's cold boot picks up the freshly
+      // imported save — otherwise the new bytes just sit in Flash
+      // while the title screen still reflects the old state.
+      if (romBufRef.current) emu.loadRom(romBufRef.current);
+      append(`uploaded save (${buf.byteLength} bytes) — game reset`);
     }).catch((err) => {
       append('save upload failed:', (err as Error).message);
     });
