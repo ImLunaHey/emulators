@@ -5,6 +5,25 @@
 // which transfer Emerald rejects to produce "link error."
 //
 // Usage:  npx tsx src/test/trade-debug.ts /tmp/em.state 600
+//
+// Protocol notes (reverse-engineered against US Emerald):
+//   IWRAM struct1 base   = 0x03003170     (phase 1 — handshake)
+//   IWRAM struct2 base   = 0x03004140     (phase 2 — command exchange)
+//   struct1[1]            = state byte (2=probing, 3/4=advance, 0/1=error)
+//   struct1[14]           = phase marker (0=phase 1, 1=phase 2)
+//   struct1[23]           = missed-packet counter (>=8 → abort)
+//   SEND function         = ROM 0x0800bad0  (writes SIOMLT_SEND)
+//     struct1[14]!=1 → write 0xB9A0  (probe magic)
+//     struct1[14]==1 → write 0x8FFF  (phase 2 magic)
+//   SEND wrapper          = ROM 0x0800ba38  (state machine)
+//   Phase 2 entry         = ROM 0x0800cbcc, 0x0800cce4, 0x0800cdcc
+//   Timeout-abort point   = ROM 0x0800bcce  (STRH 0 → 0x03000d70)
+//
+// Setting struct1[14]=1 on both sides before each frame is enough to
+// get past phase 1 ("Please wait" → state advances 2 → 4). Phase 2
+// then exchanges command codes (0x10/0x26/0x30/0x3d/0x41/0x42), each
+// of which has its own sub-protocol. Failing any command-exchange
+// step trips the link-error path. That's where remaining work lives.
 
 import { readFileSync } from 'node:fs';
 import { Emulator } from '../emulator';
