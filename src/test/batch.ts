@@ -33,7 +33,20 @@ interface Result {
   mode: number;
   bgEnables: number;
   colors: number;
+  peakColors: number;
+  peakFrame: number;
   wallMs: number;
+}
+
+const W = 240, H = 160;
+
+// Count distinct RGB colors in a 240×160×4 RGBA framebuffer.
+function countColors(fb: Uint8Array | Uint8ClampedArray): number {
+  const seen = new Set<number>();
+  for (let i = 0; i < W * H; i++) {
+    seen.add((fb[i*4]<<16) | (fb[i*4+1]<<8) | fb[i*4+2]);
+  }
+  return seen.size;
 }
 
 const results: Result[] = [];
@@ -46,6 +59,13 @@ for (const f of roms) {
   let ranFrames = 0;
   const pcs = new Set<number>();
   let lastPc = 0;
+  // Snapshot the frame with the most distinct colors over the whole run
+  // so the saved PPM reflects the most interesting moment, not a random
+  // loading-screen sample. Sampling every frame for 600 frames at
+  // 240×160 is cheap (~23 ms total for the Set build).
+  let peakColors = 0;
+  let peakFrame = 0;
+  let peakFb = new Uint8Array(W * H * 4);
   const t0 = performance.now();
   try {
     emu.loadRom(rom);
@@ -54,21 +74,25 @@ for (const f of roms) {
       ranFrames++;
       pcs.add(emu.cpu.state.r[15] & ~3);
       lastPc = emu.cpu.state.r[15];
+      const c = countColors(emu.ppu.frame);
+      if (c > peakColors) {
+        peakColors = c;
+        peakFrame = i;
+        peakFb.set(emu.ppu.frame);
+      }
     }
   } catch (e) {
     err = (e as Error).message;
   }
   const wallMs = performance.now() - t0;
 
-  // Snapshot the framebuffer as a PPM in outDir.
-  const W = 240, H = 160;
-  const fb = emu.ppu.frame;
+  // Snapshot the peak-color frame as a PPM in outDir.
   const header = `P6\n${W} ${H}\n255\n`;
   const body = Buffer.alloc(W * H * 3);
   for (let i = 0; i < W * H; i++) {
-    body[i * 3] = fb[i * 4];
-    body[i * 3 + 1] = fb[i * 4 + 1];
-    body[i * 3 + 2] = fb[i * 4 + 2];
+    body[i * 3] = peakFb[i * 4];
+    body[i * 3 + 1] = peakFb[i * 4 + 1];
+    body[i * 3 + 2] = peakFb[i * 4 + 2];
   }
   const stem = f.replace(/\.gba$/i, '');
   const ppmPath = `${outDir}/${stem}.ppm`;
@@ -76,10 +100,7 @@ for (const f of roms) {
     writeFileSync(ppmPath, Buffer.concat([Buffer.from(header, 'ascii'), body]));
   } catch { /* outDir might not exist; caller pre-mkdirs */ }
 
-  const colors = new Set<number>();
-  for (let i = 0; i < W * H; i++) {
-    colors.add((fb[i*4]<<16) | (fb[i*4+1]<<8) | fb[i*4+2]);
-  }
+  const colors = countColors(emu.ppu.frame);
 
   const title = new TextDecoder('ascii').decode(rom.subarray(0xA0, 0xAC)).replace(/[\0\x01-\x1F]/g, '').trim();
   const code = new TextDecoder('ascii').decode(rom.subarray(0xAC, 0xB0));
@@ -98,20 +119,26 @@ for (const f of roms) {
     dispcnt: emu.ppu.dispcnt,
     mode: emu.ppu.dispcnt & 7,
     bgEnables: (emu.ppu.dispcnt >> 8) & 0x1F,
-    colors: colors.size,
+    colors,
+    peakColors,
+    peakFrame,
     wallMs,
   });
 }
 
-// Pretty table.
-console.log('| ROM                          | Code | Size | Save     | Frames | PCs |  Mode | BGs    | Colors |  Wall | OK |');
-console.log('|------------------------------|------|------|----------|--------|-----|-------|--------|--------|-------|----|');
+// Pretty table. "Colors" is the final-frame distinct-RGB count; "Peak"
+// is the best frame seen during the run (with its frame index) — much
+// better signal for "did the game ever draw something" since the final
+// frame often lands in a transition.
+console.log('| ROM                          | Code | Size | Save     | Frames | PCs |  Mode | BGs    | Colors |  Peak  |  Wall | OK |');
+console.log('|------------------------------|------|------|----------|--------|-----|-------|--------|--------|--------|-------|----|');
 for (const r of results) {
   const sizeMb = (r.size / (1024*1024)).toFixed(0) + 'M';
   const bgs = ['BG0', 'BG1', 'BG2', 'BG3', 'OBJ']
     .filter((_, i) => r.bgEnables & (1 << i))
     .join('+') || '—';
-  console.log(`| ${r.name.slice(0, 28).padEnd(28)} | ${r.code} | ${sizeMb.padStart(4)} | ${r.saveType.padEnd(8)} | ${r.frames.toString().padStart(6)} | ${r.pcCount.toString().padStart(3)} | ${r.mode.toString().padStart(5)} | ${bgs.padEnd(6)} | ${r.colors.toString().padStart(6)} | ${(r.wallMs|0).toString().padStart(4)}ms | ${r.ok ? '✓' : '✗'} |`);
+  const peak = `${r.peakColors}@${r.peakFrame}`;
+  console.log(`| ${r.name.slice(0, 28).padEnd(28)} | ${r.code} | ${sizeMb.padStart(4)} | ${r.saveType.padEnd(8)} | ${r.frames.toString().padStart(6)} | ${r.pcCount.toString().padStart(3)} | ${r.mode.toString().padStart(5)} | ${bgs.padEnd(6)} | ${r.colors.toString().padStart(6)} | ${peak.padStart(6)} | ${(r.wallMs|0).toString().padStart(4)}ms | ${r.ok ? '✓' : '✗'} |`);
 }
 
 const failed = results.filter((r) => !r.ok);
