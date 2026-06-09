@@ -144,7 +144,7 @@
 import { readFileSync } from 'node:fs';
 import { Emulator } from '../emulator';
 import { loadState } from '../savestate';
-import { LocalLoopback, type LinkTransport, type MultiplayResult } from '../io/sio';
+import { type LinkTransport, type MultiplayResult } from '../io/sio';
 
 const statePath = process.argv[2] ?? '/tmp/em.state';
 const frames = parseInt(process.argv[3] ?? '600', 10);

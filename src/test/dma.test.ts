@@ -140,7 +140,7 @@ describe('DMA: count + length edge cases', () => {
 
 describe('DMA: VBlank-triggered repeat (Pokemon shadow-OAM pattern)', () => {
   it('DMA3 with VBlank timing fires on triggerVBlank, repeats', () => {
-    const { bus, dma, ppu } = makeEmu();
+    const { bus, dma } = makeEmu();
     // Set source/dest, count=8 halfwords, ctrl=enable+repeat+halfword+VBlank timing.
     // ctrl bits: 0x8000 enable | 0x0200 repeat | 0x1000 vblank.
     for (let i = 0; i < 16; i++) bus.write8(0x03000100 + i, 0x80 + i);
@@ -157,7 +157,7 @@ describe('DMA: VBlank-triggered repeat (Pokemon shadow-OAM pattern)', () => {
   });
 
   it('Pokemon-style 1 KB OAM update: EWRAM shadow → OAM via DMA3 halfword copy', () => {
-    const { bus, dma } = makeEmu();
+    const { bus } = makeEmu();
     // Build a shadow OAM in EWRAM: 128 sprites x 8 bytes = 1024 bytes,
     // each sprite given a recognizable a0/a1/a2.
     for (let i = 0; i < 128; i++) {
@@ -237,7 +237,7 @@ describe('DMA: completion observable via CNT_H readback', () => {
 
 describe('DMA: IRQ on completion', () => {
   it('Channel with IRQ enable raises IRQ_DMA0..3 on completion', () => {
-    const { bus, dma, irq } = makeEmu();
+    const { bus, irq } = makeEmu();
     irq.setIe(0xFFFF);
     irq.setIme(1);
     // ctrl: enable + halfword + immediate + IRQ enable (bit 14 = 0x4000).
@@ -246,7 +246,7 @@ describe('DMA: IRQ on completion', () => {
   });
 
   it('DMA3 IRQ uses bit 11', () => {
-    const { bus, dma, irq } = makeEmu();
+    const { bus, irq } = makeEmu();
     irq.setIe(0xFFFF);
     irq.setIme(1);
     triggerDma(bus, 3, 0x03000100, 0x03000200, 1, 0xC000);

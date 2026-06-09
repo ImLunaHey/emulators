@@ -368,7 +368,7 @@ describe('IRQ entry and return', () => {
 
 describe('IO register behavior', () => {
   it('write to DISPCNT (0x4000000) reflects in PPU', () => {
-    const { cpu, bus } = setupRunArm([]);
+    const { bus } = setupRunArm([]);
     bus.write16(0x04000000, 0x0100);  // BG0 enable
     expect((bus.io as any).ppu.dispcnt).toBe(0x0100);
   });
@@ -460,7 +460,7 @@ describe('Halt + IRQ wakeup (the boot stall pattern)', () => {
 
 describe('BIOS IRQ dispatcher round-trip', () => {
   it('BIOS branch at 0x18 reaches dispatcher at 0x128', () => {
-    const { cpu, bus } = setupRunArm([]);
+    const { bus } = setupRunArm([]);
     // Read the branch instruction the reset() installed at 0x18.
     const insn = bus.read32(0x18);
     expect(insn).toBe(0xEA000042);  // B 0x128
