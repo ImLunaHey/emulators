@@ -49,13 +49,16 @@ canvas#screen {
   background: #000;
 }
 .fs-container:fullscreen canvas#screen {
-  width: auto;
+  /* Scale to fill the larger axis of the viewport while keeping the
+     3:2 aspect. width = min(viewport-width, viewport-height * 3/2)
+     picks whichever bound applies; height follows from aspect-ratio.
+     `width: auto` would just fall back to the canvas's intrinsic
+     240×160 — which is why the previous build kept the game tiny. */
+  width: min(100vw, calc(100vh * 3 / 2));
   height: auto;
-  max-width: 100vw;
-  max-height: 100vh;
-  /* aspect-ratio keeps the 3:2 GBA shape while max-w/max-h does the
-     letterboxing for whichever axis is bound. */
   aspect-ratio: 3 / 2;
+  max-width: none;
+  max-height: none;
   border: none;
   box-shadow: none;
 }
