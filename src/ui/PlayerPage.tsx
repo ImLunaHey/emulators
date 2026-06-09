@@ -15,6 +15,7 @@ import type { Cheat } from '../io/cheats';
 import { getRomBytes, setSelectedRom, type RomMeta } from './romStore';
 import { useEmu } from './EmuContext';
 import { useConfirm } from './ConfirmModal';
+import { saveState, loadState } from '../savestate';
 
 function bytesToBase64(bytes: Uint8Array): string {
   let bin = '';
@@ -196,6 +197,44 @@ export function PlayerPage() {
   // the input at the top level + triggering it via a ref dodges that
   // entirely.
   const saveInputRef = useRef<HTMLInputElement>(null);
+  // Same trick for savestate import.
+  const stateInputRef = useRef<HTMLInputElement>(null);
+
+  const onSaveState = () => {
+    try {
+      const blob = saveState(emu);
+      // Copy into a fresh ArrayBuffer so the Blob ctor accepts the
+      // payload (the TS DOM types don't accept SharedArrayBuffer-
+      // backed views even when the runtime would).
+      const copy = new Uint8Array(new ArrayBuffer(blob.length));
+      copy.set(blob);
+      const url = URL.createObjectURL(new Blob([copy], { type: 'application/octet-stream' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${currentRom?.code || 'gba'}.state`;
+      a.click();
+      URL.revokeObjectURL(url);
+      append(`saved state (${blob.length} bytes)`);
+    } catch (err) {
+      append('save state failed:', (err as Error).message);
+    }
+  };
+
+  const onLoadState = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) { append('state load cancelled'); return; }
+    file.arrayBuffer().then((buf) => {
+      try {
+        loadState(emu, new Uint8Array(buf));
+        append(`loaded state (${buf.byteLength} bytes)`);
+      } catch (err) {
+        append('load state failed:', (err as Error).message);
+      }
+    }).catch((err) => {
+      append('state read failed:', (err as Error).message);
+    });
+    e.target.value = '';
+  };
   // Fullscreen target wraps just the Screen (+ stats line) so the
   // toolbar and modals don't render while fullscreen is active. The
   // `:fullscreen` CSS rule on canvas#screen handles the aspect-
@@ -275,6 +314,16 @@ export function PlayerPage() {
                   onClick={() => { saveInputRef.current?.click(); setShowSaveMenu(false); }}
                   className="w-full text-left px-3 py-1.5 hover:bg-[#24242a] text-xs"
                 >Import .sav</button>
+                <div className="border-t border-[#2a2a30] my-1"></div>
+                <button
+                  onClick={() => { onSaveState(); setShowSaveMenu(false); }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-[#24242a] text-xs"
+                >Save state ↓</button>
+                <button
+                  onClick={() => { stateInputRef.current?.click(); setShowSaveMenu(false); }}
+                  className="w-full text-left px-3 py-1.5 hover:bg-[#24242a] text-xs"
+                >Load state ↑</button>
+                <div className="border-t border-[#2a2a30] my-1"></div>
                 <button
                   onClick={() => { onClearSave(); setShowSaveMenu(false); }}
                   className="w-full text-left px-3 py-1.5 hover:bg-[#24242a] text-xs text-red-300"
@@ -324,6 +373,13 @@ export function PlayerPage() {
         type="file"
         accept=".sav,.bin"
         onChange={onUploadSave}
+        className="hidden"
+      />
+      <input
+        ref={stateInputRef}
+        type="file"
+        accept=".state,.bin"
+        onChange={onLoadState}
         className="hidden"
       />
       {confirm.node}
