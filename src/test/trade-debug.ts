@@ -54,6 +54,43 @@
 // a single savestate adds the symmetry artifact on top, but the
 // underlying failure is the same: phase 2's command exchange is
 // reading zeros instead of valid command codes.
+//
+// Round 3 (the deepest pass): traced the role-byte transition. struct1[14]
+// = 1 is set by state-2 dispatcher target (PC 0x0800b6b6) gated on three
+// conditions: arg0[0]=1 (where arg0=IWRAM 0x03003144), struct1[0]==8
+// (master role), struct1[3]>1 (count of valid SIOMULTI slots > 1). In our
+// model the last two are satisfied (master detects role correctly, sees
+// slave's response); the first is NOT — arg0[0] stays 0.
+//
+// Two ROM-level setters for arg0[0] = 1:
+//   PC 0x080096fc — increments halfword at 0x03005e00 + slot*40 + 8;
+//                   fires when counter hits 5. Function pointer at ROM
+//                   0x080097a4. Indirect-called, never reached in our
+//                   trace (counter at slot 2 = 0x0a06, others = 0).
+//   PC 0x0800a620 — fires when (*(u32*)0x030030e0 & 0x20) != 0 AND
+//                   (word & 0x1c) > 4. In our state byte[0x30e0] = 0x20
+//                   (bit 5 set ✓) but bits 2-4 are 0 so (word & 0x1C) = 0,
+//                   condition fails. Setting byte to 0x28 doesn't trigger
+//                   either — the function isn't being called.
+//
+// Both setters live inside larger functions called via indirect (table /
+// dispatch) paths. Even injecting arg0[0] = 1 directly does set struct1[14]
+// = 1 briefly (once per frame), but the SEND function clears it on every
+// SIO IRQ, so the sustained struct1[14] = 1 needed for master to write
+// 0x8FFF on the right transfer never lands.
+//
+// The closer I get, the more nested the gating. We've gone from "no idea"
+// to "exactly which byte at which address, gated by which condition"
+// several times now. The remaining unknown is which game-level event
+// (player input, timer fire, RNG state, etc.) drives the dispatch tables
+// that lead to the trigger functions. That's a layer above the link
+// library proper — it's the trade flow's outer state machine.
+//
+// The infrastructure built this round (savestate, two-emu mock harness,
+// trace + IWRAM watch hooks, byte-level reverse engineering pipeline)
+// will make the next pass much faster. The right input for the next
+// session is a real-hardware reference trace of a working Pokemon trade
+// connection so we can diff at the byte level.
 
 import { readFileSync } from 'node:fs';
 import { Emulator } from '../emulator';
