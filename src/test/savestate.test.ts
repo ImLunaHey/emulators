@@ -4,9 +4,12 @@
 // that runFrame actually mutates.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { Emulator } from '../emulator';
 import { saveState, loadState } from '../savestate';
+import { hasRom, readRom, romPath } from './roms';
+
+// Needs a real ROM (gitignored), so it's skipped when absent (e.g. CI).
+const ROM = romPath('firered.gba');
 
 function snapshot(emu: Emulator): Record<string, unknown> {
   const cpu = emu.cpu;
@@ -32,9 +35,9 @@ function snapshot(emu: Emulator): Record<string, unknown> {
   };
 }
 
-describe('savestate round-trip', () => {
+describe.skipIf(!hasRom(ROM))('savestate round-trip', () => {
   it('preserves emulator state across save+load', { timeout: 30000 }, () => {
-    const rom = new Uint8Array(readFileSync('public/firered.gba'));
+    const rom = readRom(ROM);
     const emu = new Emulator();
     emu.loadRom(rom);
     // Boot far enough to have meaningful state.
@@ -59,7 +62,7 @@ describe('savestate round-trip', () => {
     // restore the same blob → run N frames again → snapshot S2.
     // S1 should equal S2. Catches "we forgot to serialize field X
     // and the next frame's behavior diverges because of it."
-    const rom = new Uint8Array(readFileSync('public/firered.gba'));
+    const rom = readRom(ROM);
     const emu = new Emulator();
     emu.loadRom(rom);
     for (let i = 0; i < 30; i++) emu.runFrame();
