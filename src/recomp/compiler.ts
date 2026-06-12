@@ -151,8 +151,8 @@ export class Recompiler {
     const I_w8  = builder.addImport('h', 'w8',  [W.I32, W.I32], []);
 
     // Locals. f has 1 i32 param (unused), so locals start at index 1.
-    f.addLocals(5, W.I32);
-    const L_A = 1, L_B = 2, L_R = 3, L_TMP = 4, L_TMP2 = 5;
+    f.addLocals(6, W.I32);
+    const L_A = 1, L_B = 2, L_R = 3, L_TMP = 4, L_TMP2 = 5, L_C = 6;
 
     // ----- emitter primitives. All assume linear memory base is at 0.
 
@@ -346,6 +346,103 @@ export class Recompiler {
       f.i32Store(CPSR_OFF);
     };
 
+    // Set the CPSR C flag from a 0/1 value in local `localIdx` —
+    // mirrors shifter.ts applyCarry (clear bit 29, OR in carry << 29).
+    const emitSetC = (localIdx: number) => {
+      f.i32Const(0);                          // addr for the final store
+      f.i32Const(0); f.i32Load(CPSR_OFF);
+      f.i32Const(~0x20000000); f.op(W.OP_I32_AND);   // clear C
+      f.localGet(localIdx);
+      f.i32Const(29); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_OR);
+      f.i32Store(CPSR_OFF);
+    };
+
+    // Format 4 register shift (LSL/LSR/ASR/ROR Rd, Rs). Expects the
+    // value in L_A and the shift register in L_B; mirrors shifter.ts
+    // regShift exactly. `shiftOp` is the SHIFT_* constant (0=LSL,
+    // 1=LSR, 2=ASR, 3=ROR). amount = r[rs] & 0xFF; amount==0 leaves
+    // both value and carry unchanged, but N/Z still update from the
+    // (unchanged) value — exactly what the interpreter does.
+    const emitRegShift = (shiftOp: number, rd: number) => {
+      // amount = b & 0xFF → L_TMP
+      f.localGet(L_B); f.i32Const(0xFF); f.op(W.OP_I32_AND); f.localSet(L_TMP);
+      f.localGet(L_TMP);
+      f.op(W.OP_IF); f.body.push(0x40);       // amount != 0
+      if (shiftOp === 0) {                    // LSL
+        f.localGet(L_TMP); f.i32Const(32); f.op(W.OP_I32_LT_U);
+        f.op(W.OP_IF); f.body.push(0x40);
+        // amount in 1..31 — native wasm shifts are exact here.
+        f.localGet(L_A); f.localGet(L_TMP); f.op(W.OP_I32_SHL); f.localSet(L_R);
+        // carry = (a >>> (32 - amount)) & 1
+        f.localGet(L_A);
+        f.i32Const(32); f.localGet(L_TMP); f.op(W.OP_I32_SUB);
+        f.op(W.OP_I32_SHR_U);
+        f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+        f.op(W.OP_ELSE);
+        f.i32Const(0); f.localSet(L_R);
+        f.localGet(L_TMP); f.i32Const(32); f.op(W.OP_I32_EQ);
+        f.op(W.OP_IF); f.body.push(0x40);     // ==32: carry = a & 1
+        f.localGet(L_A); f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+        f.op(W.OP_ELSE);                      // >32: carry = 0
+        f.i32Const(0); f.localSet(L_C);
+        f.op(W.OP_END);
+        f.op(W.OP_END);
+      } else if (shiftOp === 1) {             // LSR
+        f.localGet(L_TMP); f.i32Const(32); f.op(W.OP_I32_LT_U);
+        f.op(W.OP_IF); f.body.push(0x40);
+        f.localGet(L_A); f.localGet(L_TMP); f.op(W.OP_I32_SHR_U); f.localSet(L_R);
+        // carry = (a >>> (amount - 1)) & 1
+        f.localGet(L_A);
+        f.localGet(L_TMP); f.i32Const(1); f.op(W.OP_I32_SUB);
+        f.op(W.OP_I32_SHR_U);
+        f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+        f.op(W.OP_ELSE);
+        f.i32Const(0); f.localSet(L_R);
+        f.localGet(L_TMP); f.i32Const(32); f.op(W.OP_I32_EQ);
+        f.op(W.OP_IF); f.body.push(0x40);     // ==32: carry = (a >>> 31) & 1
+        f.localGet(L_A); f.i32Const(31); f.op(W.OP_I32_SHR_U); f.localSet(L_C);
+        f.op(W.OP_ELSE);                      // >32: carry = 0
+        f.i32Const(0); f.localSet(L_C);
+        f.op(W.OP_END);
+        f.op(W.OP_END);
+      } else if (shiftOp === 2) {             // ASR
+        f.localGet(L_TMP); f.i32Const(32); f.op(W.OP_I32_LT_U);
+        f.op(W.OP_IF); f.body.push(0x40);
+        f.localGet(L_A); f.localGet(L_TMP); f.op(W.OP_I32_SHR_S); f.localSet(L_R);
+        // carry = ((a|0) >> (amount - 1)) & 1
+        f.localGet(L_A);
+        f.localGet(L_TMP); f.i32Const(1); f.op(W.OP_I32_SUB);
+        f.op(W.OP_I32_SHR_S);
+        f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+        f.op(W.OP_ELSE);
+        // ≥32: value = all sign bits, carry = sign.
+        f.localGet(L_A); f.i32Const(31); f.op(W.OP_I32_SHR_S); f.localSet(L_R);
+        f.localGet(L_A); f.i32Const(31); f.op(W.OP_I32_SHR_U); f.localSet(L_C);
+        f.op(W.OP_END);
+      } else {                                // ROR — branch-free.
+        // regShift: a31 = amount & 31; a31==0 (nonzero multiple of 32)
+        // → value unchanged, carry = bit 31; else rotate by a31, carry
+        // = bit (a31-1). wasm i32.rotr masks the amount to 5 bits, so
+        // rotr(a, amount) covers both: rotr by 0 is the identity.
+        // Carry: (a >>> ((amount-1) & 31)) & 1 — for a31==0,
+        // (amount-1)&31 == 31 → bit 31; for a31>0 it's a31-1. shr_u
+        // masks natively, so no explicit & 31 is needed.
+        f.localGet(L_A); f.localGet(L_TMP); f.op(W.OP_I32_ROTR); f.localSet(L_R);
+        f.localGet(L_A);
+        f.localGet(L_TMP); f.i32Const(1); f.op(W.OP_I32_SUB);
+        f.op(W.OP_I32_SHR_U);
+        f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+      }
+      storeRegFromLocal(rd, L_R);
+      emitSetC(L_C);
+      f.op(W.OP_ELSE);
+      // amount == 0: value and carry both unchanged; N/Z still update.
+      f.localGet(L_A); f.localSet(L_R);
+      f.op(W.OP_END);
+      emitSetNZ(L_R);
+    };
+
     // Push CPSR's C bit (0/1) onto the stack.
     const pushCarryIn = () => {
       f.i32Const(0); f.i32Load(CPSR_OFF);
@@ -415,6 +512,56 @@ export class Recompiler {
         return { ok: true, endsBlock: false };
       }
 
+      // -------- Format 1: LSL/LSR/ASR Rd, Rs, #imm5
+      // top3 == 0b000 with op != 3 — Format 2 (op == 3) matched above,
+      // so anything still here is a shift. The shift amount is a
+      // compile-time constant, so every immShift edge case resolves
+      // here and the emitted code is straight-line.
+      if (top3 === 0b000) {
+        const op  = (insn >>> 11) & 3;        // 0=LSL, 1=LSR, 2=ASR
+        const imm = (insn >>> 6) & 0x1F;
+        const rs  = (insn >>> 3) & 7;
+        const rd  = insn & 7;
+        pushReg(rs); f.localSet(L_A);
+        if (op === 0 && imm === 0) {
+          // LSL #0: value unchanged, carry unchanged — do NOT touch C.
+          f.localGet(L_A); f.localSet(L_R);
+          storeRegFromLocal(rd, L_R);
+          emitSetNZ(L_R);
+          return { ok: true, endsBlock: false };
+        }
+        // Carry from the ORIGINAL value → L_C. Per immShift:
+        //   LSL #n: (v >>> (32-n)) & 1
+        //   LSR #0 (=#32): (v >>> 31) & 1     LSR #n: (v >>> (n-1)) & 1
+        //   ASR #0 (=#32): (v >>> 31) & 1     ASR #n: ((v|0) >> (n-1)) & 1
+        f.localGet(L_A);
+        if (op === 0) {
+          f.i32Const(32 - imm); f.op(W.OP_I32_SHR_U);
+        } else if (op === 1) {
+          f.i32Const(imm === 0 ? 31 : imm - 1); f.op(W.OP_I32_SHR_U);
+        } else if (imm === 0) {
+          f.i32Const(31); f.op(W.OP_I32_SHR_U);
+        } else {
+          f.i32Const(imm - 1); f.op(W.OP_I32_SHR_S);
+        }
+        f.i32Const(1); f.op(W.OP_I32_AND); f.localSet(L_C);
+        // Value → L_R. LSR #0 means #32 (value 0); ASR #0 means #32
+        // (all sign bits, same as >> 31).
+        if (op === 0) {
+          f.localGet(L_A); f.i32Const(imm); f.op(W.OP_I32_SHL);
+        } else if (op === 1) {
+          if (imm === 0) f.i32Const(0);
+          else { f.localGet(L_A); f.i32Const(imm); f.op(W.OP_I32_SHR_U); }
+        } else {
+          f.localGet(L_A); f.i32Const(imm === 0 ? 31 : imm); f.op(W.OP_I32_SHR_S);
+        }
+        f.localSet(L_R);
+        storeRegFromLocal(rd, L_R);
+        emitSetNZ(L_R);
+        emitSetC(L_C);
+        return { ok: true, endsBlock: false };
+      }
+
       // -------- Format 3: MOV/CMP/ADD/SUB Rd, #imm8
       if (top3 === 0b001) {
         const op = (insn >>> 11) & 3;
@@ -467,8 +614,18 @@ export class Recompiler {
             storeRegFromLocal(rd, L_R);
             emitSetNZ(L_R);
             return { ok: true, endsBlock: false };
-          // 0x2/0x3/0x4/0x7 (register shifts) intentionally unhandled —
-          // they fall through to the `return { ok: false }` below.
+          case 0x2: // LSL Rd, Rs (by register)
+            emitRegShift(0, rd);
+            return { ok: true, endsBlock: false };
+          case 0x3: // LSR Rd, Rs
+            emitRegShift(1, rd);
+            return { ok: true, endsBlock: false };
+          case 0x4: // ASR Rd, Rs
+            emitRegShift(2, rd);
+            return { ok: true, endsBlock: false };
+          case 0x7: // ROR Rd, Rs
+            emitRegShift(3, rd);
+            return { ok: true, endsBlock: false };
           case 0x5: // ADC: r = a + b + cIn
             pushCarryIn(); f.localSet(L_TMP2);
             // t = a + b

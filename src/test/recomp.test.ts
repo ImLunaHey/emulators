@@ -10,6 +10,14 @@ function placeInsns(emu: Emulator, addr: number, insns: number[]) {
   for (let i = 0; i < insns.length; i++) {
     emu.bus.write16(addr + i * 2, insns[i] & 0xFFFF);
   }
+  // Terminate the block with an instruction the JIT can't compile
+  // (PUSH {R0, LR}, Format 14). Zero-filled memory used to do this
+  // implicitly, but 0x0000 decodes to LSL R0, R0, #0 — a valid Format
+  // 1 shift the JIT now supports — so without a sentinel the compiler
+  // would run straight past the test sequence up to MAX_BLOCK_INSNS.
+  // Never executed: the interpreter steps exactly insns.length times
+  // and compiled blocks stop just before it.
+  emu.bus.write16(addr + insns.length * 2, 0xB501);
 }
 
 function initThumb(emu: Emulator, startPc: number) {
@@ -268,6 +276,52 @@ describe('Recompiler (JIT)', () => {
     for (const [a, b] of pairs) {
       for (const insn of [0x4208, 0x4248, 0x42C8, 0x4348]) {
         runDiff([insn], (e) => { e.cpu.state.r[0] = a; e.cpu.state.r[1] = b; });
+      }
+    }
+  });
+
+  it('Format 1 LSL/LSR/ASR immediate matches interpreter incl. carry', () => {
+    // LSL R0, R1, #imm = 0x0008 | imm<<6
+    // LSR R0, R1, #imm = 0x0808 | imm<<6   (imm=0 encodes #32)
+    // ASR R0, R1, #imm = 0x1008 | imm<<6   (imm=0 encodes #32)
+    // Each op at imm 0/1/31; values chosen so the carry-out differs
+    // between high and low bits. C is seeded both ways via CMP R2,#0
+    // (r2=0 → C set) / CMP R2,#1 (→ C clear) so LSL #0's
+    // carry-unchanged path is actually exercised in both states.
+    const insns: number[] = [];
+    for (const base of [0x0008, 0x0808, 0x1008]) {
+      for (const imm of [0, 1, 31]) insns.push(base | (imm << 6));
+    }
+    const values = [0, 1, 2, 0x80000000, 0x80000001, 0xC0000001, 0x40000000, 0x7FFFFFFF, 0xFFFFFFFF];
+    for (const v of values) {
+      for (const insn of insns) {
+        for (const seedC of [0x2A00, 0x2A01]) {
+          runDiff([seedC, insn], (e) => { e.cpu.state.r[1] = v; e.cpu.state.r[2] = 0; });
+        }
+      }
+    }
+  });
+
+  it('Format 4 LSL/LSR/ASR/ROR by register matches interpreter incl. carry', () => {
+    // LSL R0, R1 = 0x4088 ; LSR R0, R1 = 0x40C8
+    // ASR R0, R1 = 0x4108 ; ROR R0, R1 = 0x41C8
+    // Amounts hit every regShift range: 0 (value+carry unchanged),
+    // 1/31 (<32), 32 (boundary), 33/64/255 (>32; 64 is ROR's nonzero
+    // multiple of 32), 0x100 (masks to 0 via & 0xFF). Values include
+    // both bit-31 states so ASR ≥32 and ROR-at-32 carry are covered,
+    // and C is seeded both ways via CMP so unchanged-carry cases diff.
+    const insns = [0x4088, 0x40C8, 0x4108, 0x41C8];
+    const values = [0, 1, 0x80000001, 0x7FFFFFFF, 0xC0000001];
+    const amounts = [0, 1, 2, 31, 32, 33, 64, 255, 0x100];
+    for (const insn of insns) {
+      for (const v of values) {
+        for (const amt of amounts) {
+          for (const seedC of [0x2A00, 0x2A01]) {
+            runDiff([seedC, insn], (e) => {
+              e.cpu.state.r[0] = v; e.cpu.state.r[1] = amt; e.cpu.state.r[2] = 0;
+            });
+          }
+        }
       }
     }
   });
