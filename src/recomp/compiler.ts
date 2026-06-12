@@ -30,6 +30,14 @@ interface CompiledBlock {
   run: () => number;
   startPc: number;
   insnCount: number;
+  // For blocks compiled from writable memory (EWRAM/IWRAM): a live
+  // Uint16Array view onto the backing store plus a snapshot of the
+  // halfwords at compile time. Verified on every dispatch — games
+  // routinely copy fresh code into RAM (Pokemon's flash routines land
+  // on the IWRAM stack), and running a stale block silently executes
+  // the OLD instructions. ROM blocks set both to null (immutable).
+  liveCode: Uint16Array | null;
+  snapshot: Uint16Array | null;
 }
 
 const HOT_THRESHOLD = 50;
@@ -98,11 +106,29 @@ export class Recompiler {
   tryDispatch(): number {
     if (!this.enabled) return 0;
     const s = this.cpu.state;
+    // The interpreter's step() handles halt wake-up and IRQ entry
+    // BEFORE executing an instruction. A JIT block must not run in
+    // either situation — otherwise a fully-jitted wait loop (e.g.
+    // Emerald's `ldrb r0, [VCOUNT]; cmp r0, #n; beq .-4`) starves IRQ
+    // delivery forever and the game soft-locks on a black screen.
+    if (s.halted) return 0;
+    if (this.cpu.irqLine && !(s.cpsr & 0x80)) return 0;
     if (!(s.cpsr & 0x20)) return 0;            // ARM blocks not jitted
     const pc = s.r[15] & ~1;
     const cached = this.cache.get(pc);
     if (cached === null) return 0;              // known-uncompilable
     if (cached) {
+      // RAM blocks: verify the code bytes haven't changed since
+      // compilation. On mismatch drop the block and fall back to the
+      // interpreter; the hit counter will recompile it if the new
+      // code turns out to be hot too.
+      const snap = cached.snapshot;
+      if (snap) {
+        const live = cached.liveCode!;
+        for (let i = 0; i < snap.length; i++) {
+          if (live[i] !== snap[i]) { this.cache.delete(pc); return 0; }
+        }
+      }
       return this.runBlock(cached);
     }
     const c = (this.hits.get(pc) || 0) + 1;
@@ -136,6 +162,13 @@ export class Recompiler {
 
   private compile(startPc: number): CompiledBlock | null {
     const bus = this.cpu.bus;
+    // Only compile from EWRAM (0x02), IWRAM (0x03) or cart ROM
+    // (0x08..0x0D). Other regions either can't sensibly hold THUMB
+    // code (IO/PRAM/OAM) or have mirroring quirks we don't want to
+    // re-validate (VRAM, BIOS).
+    const region = startPc >>> 24;
+    const inRam = region === 0x02 || region === 0x03;
+    if (!inRam && !(region >= 0x08 && region <= 0x0D)) return null;
     const builder = new W.WasmModuleBuilder();
     const f = builder.func;
 
@@ -1143,6 +1176,22 @@ export class Recompiler {
 
     if (count === 0) return null;
 
+    // RAM blocks get a live view + snapshot of their source halfwords
+    // so tryDispatch can detect the game overwriting the code. Blocks
+    // that would straddle a region mirror boundary are refused (the
+    // compile loop's bus reads wrapped, so a flat subarray can't
+    // represent what was compiled).
+    let liveCode: Uint16Array | null = null;
+    let snapshot: Uint16Array | null = null;
+    if (inRam) {
+      const arr16 = region === 0x02 ? bus.ewram16 : bus.iwram16;
+      const mask = region === 0x02 ? 0x3FFFF : 0x7FFF;
+      const off = (startPc & mask) >>> 1;
+      if (off + count > arr16.length) return null;
+      liveCode = arr16.subarray(off, off + count);
+      snapshot = liveCode.slice();
+    }
+
     if (needsExitPc) {
       storeRegConst(15, pc >>> 0);
     }
@@ -1167,6 +1216,8 @@ export class Recompiler {
     return {
       startPc,
       insnCount: count,
+      liveCode,
+      snapshot,
       run: () => exported(0),
     };
   }

@@ -721,6 +721,71 @@ describe('Recompiler (JIT)', () => {
     });
   });
 
+  it('defers to the interpreter when an IRQ is pending or the CPU is halted', () => {
+    // Regression: tryDispatch used to run cached blocks unconditionally,
+    // but the interpreter's step() takes pending IRQs (and handles halt
+    // wake-up) BEFORE executing. A fully-jitted wait loop — Emerald's
+    // `ldrb r0, [VCOUNT]; cmp r0, #n; beq .-4` — then starved IRQ
+    // delivery forever and the game never left a black screen.
+    const emu = new Emulator();
+    emu.loadRom(new Uint8Array(0x100));
+    emu.recomp.enabled = true;
+    const pc = 0x03002000;
+    placeInsns(emu, pc, [0x2005]);            // MOV R0, #5
+    initThumb(emu, pc);
+    (emu.recomp as any).hits.set(pc, 1000);
+    expect(emu.recomp.tryDispatch()).toBe(1); // block compiles + caches
+
+    // Pending IRQ with I clear (SYS mode): must NOT dispatch.
+    initThumb(emu, pc);
+    emu.cpu.irqLine = true;
+    expect(emu.recomp.tryDispatch()).toBe(0);
+
+    // Pending IRQ but I masked: IRQ can't be taken, so dispatch is fine.
+    emu.cpu.state.cpsr |= 0x80;
+    expect(emu.recomp.tryDispatch()).toBe(1);
+
+    // Halted: must NOT dispatch (step() handles the wake-up no-op).
+    initThumb(emu, pc);
+    emu.cpu.irqLine = false;
+    emu.cpu.state.halted = true;
+    expect(emu.recomp.tryDispatch()).toBe(0);
+  });
+
+  it('drops a cached RAM block when the game overwrites its code', () => {
+    // Regression: blocks compiled from IWRAM/EWRAM were never
+    // re-validated, so when Emerald copied fresh flash-write routines
+    // onto the IWRAM stack the JIT kept executing the STALE code that
+    // used to live there (caught by the jit-lockstep harness at
+    // 0x03007d56 after ~49M instructions).
+    const emu = new Emulator();
+    emu.loadRom(new Uint8Array(0x100));
+    emu.recomp.enabled = true;
+    const pc = 0x03002000;
+    placeInsns(emu, pc, [0x2005]);            // MOV R0, #5
+    initThumb(emu, pc);
+    (emu.recomp as any).hits.set(pc, 1000);
+    expect(emu.recomp.tryDispatch()).toBe(1);
+    expect(emu.cpu.state.r[0]).toBe(5);
+
+    // The game "loads new code" at the same address.
+    emu.bus.write16(pc, 0x2106);              // MOV R1, #6
+    initThumb(emu, pc);
+    emu.cpu.state.r[0] = 0; emu.cpu.state.r[1] = 0;
+    // Stale block detected → no dispatch, interpreter handles it.
+    expect(emu.recomp.tryDispatch()).toBe(0);
+    emu.cpu.step();
+    expect(emu.cpu.state.r[1]).toBe(6);
+    expect(emu.cpu.state.r[0]).toBe(0);       // stale MOV R0,#5 must not run
+
+    // Once hot again, the NEW code compiles and runs.
+    initThumb(emu, pc);
+    emu.cpu.state.r[1] = 0;
+    (emu.recomp as any).hits.set(pc, 1000);
+    expect(emu.recomp.tryDispatch()).toBe(1);
+    expect(emu.cpu.state.r[1]).toBe(6);
+  });
+
   it('bails out and returns false on unsupported instruction at start', () => {
     const emu = new Emulator();
     emu.loadRom(new Uint8Array(0x100));
