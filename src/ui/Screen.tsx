@@ -1,6 +1,7 @@
 import { useEffect, useRef, type MutableRefObject } from 'react';
 import type { Emulator } from '../emulator';
 import type { AudioSink } from './audio';
+import { getGbaColorLut } from './colorCorrect';
 
 interface Props {
   emu: Emulator;
@@ -11,6 +12,8 @@ interface Props {
   speed?: number;
   /** When false, the canvas is bilinear-smoothed instead of pixelated. */
   smooth?: boolean;
+  /** Apply GBA LCD color correction to the output. */
+  colorCorrect?: boolean;
   /** Screen writes a single-frame-advance fn here for the parent's
       frame-step control to call while paused. */
   stepRef?: MutableRefObject<(() => void) | null>;
@@ -24,14 +27,29 @@ interface Props {
 const GBA_FRAME_MS = 1000 / 59.7275;
 const MAX_FRAMES_PER_RAF = 4;
 
-export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false, stepRef }: Props) {
+export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false, colorCorrect = false, stepRef }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current!;
     const ctx = canvas.getContext('2d')!;
     const imageData = ctx.createImageData(240, 160);
-    const blit = () => { imageData.data.set(emu.ppu.frame); ctx.putImageData(imageData, 0, 0); };
+    // 32-bit view over the same buffer, for the color-correction path.
+    const out32 = new Uint32Array(imageData.data.buffer);
+    const lut = colorCorrect ? getGbaColorLut() : null;
+    const blit = () => {
+      if (lut) {
+        // Recover the 5-bit channels (PPU expanded via (c<<3)|(c>>2), so
+        // >>3 is exact) → BGR555 index → corrected packed RGBA.
+        const f = emu.ppu.frame;
+        for (let i = 0, p = 0; i < 240 * 160; i++, p += 4) {
+          out32[i] = lut[(f[p] >> 3) | ((f[p + 1] >> 3) << 5) | ((f[p + 2] >> 3) << 10)];
+        }
+      } else {
+        imageData.data.set(emu.ppu.frame);
+      }
+      ctx.putImageData(imageData, 0, 0);
+    };
 
     // Expose a one-frame advance for the parent's frame-step button.
     // Drains (but doesn't play) audio so the FIFO doesn't back up.
@@ -104,7 +122,7 @@ export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false,
       cancelAnimationFrame(raf);
       if (stepRef) stepRef.current = null;
     };
-  }, [emu, paused, onStats, speed, stepRef]);
+  }, [emu, paused, onStats, speed, colorCorrect, stepRef]);
 
   return <canvas ref={canvasRef} id="screen" className={smooth ? 'smooth' : ''} width={240} height={160} />;
 }

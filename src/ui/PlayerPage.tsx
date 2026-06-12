@@ -99,6 +99,13 @@ export function PlayerPage() {
     setCrt(v);
     try { localStorage.setItem('gba-recomp:crt', v ? '1' : '0'); } catch { /* ignore */ }
   };
+  const [colorCorrect, setColorCorrect] = useState(() => {
+    try { return localStorage.getItem('gba-recomp:colorcorrect') === '1'; } catch { return false; }
+  });
+  const changeColorCorrect = (v: boolean) => {
+    setColorCorrect(v);
+    try { localStorage.setItem('gba-recomp:colorcorrect', v ? '1' : '0'); } catch { /* ignore */ }
+  };
   // Rewind: opt-in ring of recent savestates the user can scrub back
   // through. rewinding pauses the forward loop and drives frames from
   // the buffer instead.
@@ -613,7 +620,7 @@ export function PlayerPage() {
       <ErrorBoundary label="Player" resetKey={currentRom?.id ?? null}>
         <div ref={fsContainerRef} className="fs-container">
           <div className="screen-wrap">
-            <Screen emu={emu} paused={effectivePaused} audio={audio} onStats={setStats} speed={effectiveSpeed} smooth={smooth} stepRef={stepRef} />
+            <Screen emu={emu} paused={effectivePaused} audio={audio} onStats={setStats} speed={effectiveSpeed} smooth={smooth} colorCorrect={colorCorrect} stepRef={stepRef} />
             {crt && <div className="crt-overlay" aria-hidden />}
           </div>
         </div>
@@ -777,6 +784,8 @@ export function PlayerPage() {
         onSmoothChange={changeSmooth}
         crt={crt}
         onCrtChange={changeCrt}
+        colorCorrect={colorCorrect}
+        onColorCorrectChange={changeColorCorrect}
         rewind={rewindOn}
         onRewindChange={changeRewind}
         autoResume={autoResumeOn}

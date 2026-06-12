@@ -13,6 +13,8 @@ interface Props {
   onSmoothChange: (v: boolean) => void;
   crt: boolean;
   onCrtChange: (v: boolean) => void;
+  colorCorrect: boolean;
+  onColorCorrectChange: (v: boolean) => void;
   rewind: boolean;
   onRewindChange: (v: boolean) => void;
   autoResume: boolean;
@@ -23,7 +25,7 @@ interface Props {
 // is muted by the Screen loop above 1× to avoid buffer thrash).
 const SPEEDS = [0.5, 1, 2, 4];
 
-export function SettingsPanel({ open, onClose, audio, speed, onSpeedChange, smooth, onSmoothChange, crt, onCrtChange, rewind, onRewindChange, autoResume, onAutoResumeChange }: Props) {
+export function SettingsPanel({ open, onClose, audio, speed, onSpeedChange, smooth, onSmoothChange, crt, onCrtChange, colorCorrect, onColorCorrectChange, rewind, onRewindChange, autoResume, onAutoResumeChange }: Props) {
   // Mirror the sink's persisted values into local state so the slider
   // re-renders; the sink remains the source of truth.
   const [vol, setVol] = useState(audio.volume);
@@ -109,6 +111,16 @@ export function SettingsPanel({ open, onClose, audio, speed, onSpeedChange, smoo
             />
             <span className="text-xs">LCD grid overlay</span>
             <span className="opacity-50 text-[10px]">faux-handheld scanlines</span>
+          </label>
+          <label className="flex items-center gap-3 cursor-pointer select-none mt-2.5">
+            <input
+              type="checkbox"
+              checked={colorCorrect}
+              onChange={(e) => onColorCorrectChange(e.target.checked)}
+              className="w-4 h-4 accent-[var(--color-accent-strong)]"
+            />
+            <span className="text-xs">Color correction</span>
+            <span className="opacity-50 text-[10px]">GBA LCD gamma + gamut</span>
           </label>
         </section>
 
