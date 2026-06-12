@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { type RomMeta } from './romStore';
 import { CoverImage } from './CoverImage';
 import { useRomList } from './hooks/useRomList';
 import { useRomMd5 } from './hooks/useRomMd5';
 import { useHasheousMeta } from './hooks/useHasheousMeta';
 import { useRomMutations } from './hooks/useRomMutations';
+import { useCustomCover } from './hooks/useCustomCover';
+import { putCover, deleteCover } from './coverStore';
 import { useConfirm } from './ConfirmModal';
 import { ErrorBoundary } from './ErrorBoundary';
 
@@ -23,6 +26,19 @@ export function RomDetailsPage() {
   const md5Query = useRomMd5(rom?.id ?? null, rom?.md5);
   const metaQuery = useHasheousMeta(md5Query.data);
   const m = metaQuery.data ?? null;
+
+  // Custom cover art upload (stored per library id, used everywhere).
+  const qc = useQueryClient();
+  const customCover = useCustomCover(rom?.id);
+  const coverInputRef = useRef<HTMLInputElement>(null);
+  const refreshCover = () => { if (rom) qc.invalidateQueries({ queryKey: ['custom-cover', rom.id] }); };
+  const onUploadCover = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !rom) return;
+    putCover(rom.id, file).then(refreshCover).catch(() => { /* ignore */ });
+  };
+  const onRemoveCover = () => { if (rom) deleteCover(rom.id).then(refreshCover).catch(() => { /* ignore */ }); };
 
   // Per-game notes / known issues — user-editable, stored locally.
   const notesKey = rom ? `gba-recomp:notes:${rom.code}` : '';
@@ -85,8 +101,17 @@ export function RomDetailsPage() {
         <div className="flex flex-col sm:flex-row gap-5">
           <div className="w-full sm:w-[200px] shrink-0">
             <div className="rounded-lg overflow-hidden border border-[var(--color-border)]">
-              <CoverImage title={displayName} subtitle={m?.year || rom.code} thumbnails={candidates} />
+              <CoverImage title={displayName} subtitle={m?.year || rom.code} thumbnails={candidates} romId={rom.id} />
             </div>
+            <div className="flex gap-2 mt-2">
+              <button onClick={() => coverInputRef.current?.click()} className="btn flex-1 !text-[10px]">
+                {customCover ? 'Change cover' : 'Set cover'}
+              </button>
+              {customCover && (
+                <button onClick={onRemoveCover} className="btn btn-ghost !text-[10px]" title="Remove custom cover">Reset</button>
+              )}
+            </div>
+            <input ref={coverInputRef} type="file" accept="image/*" onChange={onUploadCover} className="hidden" />
             <button onClick={() => navigate(`/play/${rom.id}`)} className="btn btn-primary w-full mt-3 py-2.5">▶ Play</button>
             <button onClick={onDelete} className="btn btn-danger w-full mt-2">Delete from library</button>
           </div>

@@ -30,7 +30,7 @@ export function ContinueCard({ rom, onPlay }: Props) {
       className="group w-full mb-4 flex items-center gap-3 sm:gap-4 text-left rounded-xl p-2.5 sm:p-3 border border-[var(--color-border)] bg-[var(--color-card)] hover:border-[var(--color-accent-strong)] hover:bg-[var(--color-card-hover)] transition-colors cursor-pointer"
     >
       <div className="w-16 sm:w-20 shrink-0 rounded-md overflow-hidden">
-        <CoverImage title={displayName} subtitle={rom.code} thumbnails={candidates} />
+        <CoverImage title={displayName} subtitle={rom.code} thumbnails={candidates} romId={rom.id} />
       </div>
       <div className="min-w-0 flex-1">
         <div className="eyebrow text-[var(--color-accent)] mb-1">Continue playing</div>
