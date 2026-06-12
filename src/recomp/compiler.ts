@@ -700,11 +700,96 @@ export class Recompiler {
         return { ok: false };
       }
 
+      // -------- Format 5: hi-register ops / BX
+      if ((insn & 0xFC00) === 0x4400) {
+        const op = (insn >>> 8) & 3;
+        const H1 = (insn & 0x80) !== 0;
+        const H2 = (insn & 0x40) !== 0;
+        const rs = ((insn >>> 3) & 7) | (H2 ? 8 : 0);
+        const rd = (insn & 7) | (H1 ? 8 : 0);
+        // PC in THUMB hi ops reads as the aligned architectural PC — a
+        // compile-time constant. The interpreter masks bit 0; pc + 4 is
+        // already even but mask anyway for byte-for-byte parity.
+        const pcRead = ((pc + 4) & ~1) >>> 0;
+        const loadA = () => { if (rd === 15) f.i32Const(pcRead | 0); else pushReg(rd); f.localSet(L_A); };
+        const loadB = () => { if (rs === 15) f.i32Const(pcRead | 0); else pushReg(rs); f.localSet(L_B); };
+        if (op === 0) {                       // ADD (no flags)
+          loadA(); loadB();
+          f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_ADD);
+          if (rd === 15) {
+            // ADD PC, Rs: r15 = (a + b) & ~1 — block-ender.
+            f.i32Const(~1); f.op(W.OP_I32_AND); f.localSet(L_R);
+            storeRegFromLocal(15, L_R);
+            needsExitPc = false;
+            return { ok: true, endsBlock: true };
+          }
+          f.localSet(L_R);
+          storeRegFromLocal(rd, L_R);
+          return { ok: true, endsBlock: false };
+        }
+        if (op === 1) {                       // CMP (flags only)
+          loadA(); loadB();
+          f.localGet(L_A); f.localGet(L_B); f.op(W.OP_I32_SUB); f.localSet(L_R);
+          emitSetFlagsSub(L_A, L_B, L_R);
+          return { ok: true, endsBlock: false };
+        }
+        if (op === 2) {                       // MOV (no flags)
+          if (rd === 15) {
+            // MOV PC, Rs: r15 = b & ~1 — block-ender.
+            if (rs === 15) {
+              storeRegConst(15, pcRead);
+            } else {
+              pushReg(rs); f.i32Const(~1); f.op(W.OP_I32_AND); f.localSet(L_R);
+              storeRegFromLocal(15, L_R);
+            }
+            needsExitPc = false;
+            return { ok: true, endsBlock: true };
+          }
+          if (rs === 15) {
+            storeRegConst(rd, pcRead);
+          } else {
+            pushReg(rs); f.localSet(L_R);
+            storeRegFromLocal(rd, L_R);
+          }
+          return { ok: true, endsBlock: false };
+        }
+        // op == 3: BX Rs. H1 must be 0 in this encoding (H1 set is BLX
+        // on later cores / undefined on the ARM7TDMI) — leave it to the
+        // interpreter.
+        if (H1) return { ok: false };
+        loadB();
+        f.localGet(L_B); f.i32Const(1); f.op(W.OP_I32_AND);
+        f.op(W.OP_IF); f.body.push(0x40);
+        // bit 0 set: stay THUMB (cpsr |= T, matching the interpreter's
+        // redundant-but-exact OR), r15 = b & ~1.
+        f.i32Const(0);
+        f.i32Const(0); f.i32Load(CPSR_OFF);
+        f.i32Const(0x20); f.op(W.OP_I32_OR);
+        f.i32Store(CPSR_OFF);
+        f.i32Const(0);
+        f.localGet(L_B); f.i32Const(~1); f.op(W.OP_I32_AND);
+        f.i32Store(REG_BASE + 15 * 4);
+        f.op(W.OP_ELSE);
+        // bit 0 clear: switch to ARM (cpsr &= ~T), r15 = b & ~3. The
+        // dispatcher re-checks T before every dispatch, so the next
+        // block safely falls back to the (ARM) interpreter.
+        f.i32Const(0);
+        f.i32Const(0); f.i32Load(CPSR_OFF);
+        f.i32Const(~0x20); f.op(W.OP_I32_AND);
+        f.i32Store(CPSR_OFF);
+        f.i32Const(0);
+        f.localGet(L_B); f.i32Const(~3); f.op(W.OP_I32_AND);
+        f.i32Store(REG_BASE + 15 * 4);
+        f.op(W.OP_END);
+        needsExitPc = false;
+        return { ok: true, endsBlock: true };
+      }
+
       // -------- Format 6: LDR Rd, [PC, #imm8*4]
       // 0x4800/0xF800 shares the `010` top-bits region with Format 4
-      // (0x4000/0xFC00, checked above) and Format 5 (0x4400/0xFC00,
-      // intentionally unimplemented) — neither range matches this mask,
-      // so there's no shadowing either way.
+      // (0x4000/0xFC00) and Format 5 (0x4400/0xFC00), both checked
+      // above — neither range matches this mask, so there's no
+      // shadowing either way.
       if ((insn & 0xF800) === 0x4800) {
         const rd  = (insn >>> 8) & 7;
         const imm = (insn & 0xFF) << 2;
@@ -866,13 +951,129 @@ export class Recompiler {
 
       // -------- Format 13: ADD SP, #±imm7*4
       // Exact-match 0xB0xx only — 0xB4/0xB5/0xBC/0xBD are Format 14
-      // PUSH/POP, which stay unsupported here.
+      // PUSH/POP, handled below.
       if ((insn & 0xFF00) === 0xB000) {
         const imm = (insn & 0x7F) << 2;
         pushReg(13); f.i32Const(imm);
         f.op((insn & 0x80) ? W.OP_I32_SUB : W.OP_I32_ADD);
         f.localSet(L_R);
         storeRegFromLocal(13, L_R);
+        return { ok: true, endsBlock: false };
+      }
+
+      // -------- Format 14: PUSH/POP
+      // The register list is a compile-time constant, so the whole
+      // transfer unrolls into straight-line bus calls. Addresses mask
+      // & ~3 like the interpreter; since each slot is start + 4k, the
+      // mask is applied once to the base and the +4k offsets folded in
+      // as constants. r13 keeps its UNMASKED value, exactly like the
+      // interpreter.
+      if ((insn & 0xF600) === 0xB400) {
+        const isPop = (insn & 0x0800) !== 0;
+        const R = (insn & 0x0100) !== 0;
+        const list = insn & 0xFF;
+        let n = 0;
+        for (let i = 0; i < 8; i++) if (list & (1 << i)) n++;
+        if (isPop) {
+          // POP — read ascending from sp.
+          pushReg(13); f.localSet(L_TMP);                       // unmasked sp
+          f.localGet(L_TMP); f.i32Const(~3); f.op(W.OP_I32_AND); f.localSet(L_TMP2);
+          let off = 0;
+          for (let i = 0; i < 8; i++) {
+            if (!(list & (1 << i))) continue;
+            f.i32Const(0);
+            f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+            f.call(I_r32);
+            f.i32Store(REG_BASE + i * 4);
+            off += 4;
+          }
+          if (R) {
+            // POP {PC} — ARMv4T (GBA) does NOT interwork here: bit 0 of
+            // the loaded value is masked off and T stays THUMB (the only
+            // way to switch to ARM from THUMB is BX). ARMv5T+ flips T
+            // from bit 0, which on the ARM7TDMI would let THUMB-internal
+            // returns accidentally hop to ARM.
+            f.i32Const(0);
+            f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+            f.call(I_r32);
+            f.i32Const(~1); f.op(W.OP_I32_AND);
+            f.i32Store(REG_BASE + 15 * 4);
+            off += 4;
+          }
+          // r13 = original sp + 4*count (unmasked), after the loads —
+          // same order as the interpreter.
+          f.i32Const(0);
+          f.localGet(L_TMP); f.i32Const(off); f.op(W.OP_I32_ADD);
+          f.i32Store(REG_BASE + 13 * 4);
+          if (R) { needsExitPc = false; return { ok: true, endsBlock: true }; }
+          return { ok: true, endsBlock: false };
+        }
+        // PUSH — pre-decrement to newSp, then write ascending (r14, if
+        // requested, lands last/highest).
+        const count = n + (R ? 1 : 0);
+        pushReg(13); f.i32Const(count << 2); f.op(W.OP_I32_SUB); f.localSet(L_TMP);
+        f.localGet(L_TMP); f.i32Const(~3); f.op(W.OP_I32_AND); f.localSet(L_TMP2);
+        let off = 0;
+        for (let i = 0; i < 8; i++) {
+          if (!(list & (1 << i))) continue;
+          f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+          pushReg(i);
+          f.call(I_w32);
+          off += 4;
+        }
+        if (R) {
+          f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+          pushReg(14);
+          f.call(I_w32);
+        }
+        storeRegFromLocal(13, L_TMP);
+        return { ok: true, endsBlock: false };
+      }
+
+      // -------- Format 15: LDMIA/STMIA Rb!, {list}
+      if ((insn & 0xF000) === 0xC000) {
+        const isLoad = (insn & 0x0800) !== 0;
+        const rb = (insn >>> 8) & 7;
+        const list = insn & 0xFF;
+        // Empty-list quirk loads/stores PC and bumps the base by 0x40 —
+        // rare enough to leave to the interpreter.
+        if (list === 0) return { ok: false };
+        const baseInList = (list & (1 << rb)) !== 0;
+        const baseFirst = baseInList && (list & ((1 << rb) - 1)) === 0;
+        let count = 0;
+        for (let i = 0; i < 8; i++) if (list & (1 << i)) count++;
+        // startAddr (unmasked) → L_TMP; per-access mask & ~3 folds into
+        // a masked base in L_TMP2 (slots are start + 4k).
+        pushReg(rb); f.localSet(L_TMP);
+        f.localGet(L_TMP); f.i32Const(~3); f.op(W.OP_I32_AND); f.localSet(L_TMP2);
+        let off = 0;
+        for (let i = 0; i < 8; i++) {
+          if (!(list & (1 << i))) continue;
+          if (isLoad) {
+            f.i32Const(0);
+            f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+            f.call(I_r32);
+            f.i32Store(REG_BASE + i * 4);
+          } else {
+            f.localGet(L_TMP2); f.i32Const(off); f.op(W.OP_I32_ADD);
+            if (i === rb && !baseFirst) {
+              // STM with the base in the list but not FIRST stores the
+              // written-back base (startAddr + count*4), not old r[rb].
+              f.localGet(L_TMP); f.i32Const(count << 2); f.op(W.OP_I32_ADD);
+            } else {
+              pushReg(i);
+            }
+            f.call(I_w32);
+          }
+          off += 4;
+        }
+        // Writeback r[rb] = endAddr (unmasked) — always for STM; for
+        // LDM only when rb is NOT in the list (the loaded value wins).
+        if (!isLoad || !baseInList) {
+          f.i32Const(0);
+          f.localGet(L_TMP); f.i32Const(off); f.op(W.OP_I32_ADD);
+          f.i32Store(REG_BASE + rb * 4);
+        }
         return { ok: true, endsBlock: false };
       }
 
@@ -900,6 +1101,31 @@ export class Recompiler {
         if (off & 0x400) off -= 0x800;
         const target = (pc + 4 + (off << 1)) >>> 0;
         storeRegConst(15, (target & ~1) >>> 0);
+        needsExitPc = false;
+        return { ok: true, endsBlock: true };
+      }
+
+      // -------- Format 19: BL, two halfwords (H=0b00 is Format 18 above)
+      if ((insn & 0xF800) === 0xF000) {
+        // High half (H=0b10): r14 = archPC + signExtend23(off11 << 12) —
+        // a pure compile-time constant. NOT a block-ender: the low half
+        // usually follows in the same block and reads r14 back from
+        // linear memory, which this store keeps current.
+        let off = (insn & 0x7FF) << 12;
+        if (off & 0x00400000) off |= 0xFF800000;
+        storeRegConst(14, ((pc + 4) + off) >>> 0);
+        return { ok: true, endsBlock: false };
+      }
+      if ((insn & 0xF800) === 0xF800) {
+        // Low half (H=0b11): r15 = (r14 + (off11 << 1)) & ~1, THEN
+        // r14 = (pc + 2) | 1. Order matters — the branch target comes
+        // from the OLD r14, computed before r14 is overwritten.
+        pushReg(14);
+        f.i32Const((insn & 0x7FF) << 1); f.op(W.OP_I32_ADD);
+        f.i32Const(~1); f.op(W.OP_I32_AND);
+        f.localSet(L_R);
+        storeRegFromLocal(15, L_R);
+        storeRegConst(14, ((pc + 2) | 1) >>> 0);
         needsExitPc = false;
         return { ok: true, endsBlock: true };
       }

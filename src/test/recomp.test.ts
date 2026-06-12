@@ -11,13 +11,14 @@ function placeInsns(emu: Emulator, addr: number, insns: number[]) {
     emu.bus.write16(addr + i * 2, insns[i] & 0xFFFF);
   }
   // Terminate the block with an instruction the JIT can't compile
-  // (PUSH {R0, LR}, Format 14). Zero-filled memory used to do this
-  // implicitly, but 0x0000 decodes to LSL R0, R0, #0 — a valid Format
-  // 1 shift the JIT now supports — so without a sentinel the compiler
-  // would run straight past the test sequence up to MAX_BLOCK_INSNS.
-  // Never executed: the interpreter steps exactly insns.length times
-  // and compiled blocks stop just before it.
-  emu.bus.write16(addr + insns.length * 2, 0xB501);
+  // (SWI #0, Format 17 — the JIT leaves exceptions to the interpreter).
+  // Zero-filled memory used to do this implicitly, but 0x0000 decodes
+  // to LSL R0, R0, #0 — a valid Format 1 shift the JIT now supports —
+  // so without a sentinel the compiler would run straight past the test
+  // sequence up to MAX_BLOCK_INSNS. (PUSH used to be the sentinel until
+  // Format 14 became compilable.) Never executed: the interpreter steps
+  // exactly insns.length times and compiled blocks stop just before it.
+  emu.bus.write16(addr + insns.length * 2, 0xDF00);
 }
 
 function initThumb(emu: Emulator, startPc: number) {
@@ -498,13 +499,236 @@ describe('Recompiler (JIT)', () => {
     }
   });
 
+  it('Format 5 ADD/CMP/MOV across lo/hi registers matches interpreter', () => {
+    // ADD R1, R8 = 0x4441 ; ADD R8, R2 = 0x4490
+    // MOV R0, R8 = 0x4640 ; MOV R8, R0 = 0x4680
+    // CMP R8, R1 = 0x4588 ; CMP R1, R9 = 0x4549
+    const setup = (e: Emulator) => {
+      e.cpu.state.r[0] = 0xCAFEBABE; e.cpu.state.r[1] = 0x7FFFFFFF;
+      e.cpu.state.r[2] = 0x12345678; e.cpu.state.r[8] = 0xFFFFFFFF;
+      e.cpu.state.r[9] = 0x7FFFFFFF;
+    };
+    for (const insn of [0x4441, 0x4490, 0x4640, 0x4680]) runDiff([insn], setup);
+    // CMP sets flags (incl. carry/overflow edges via the values above)
+    // but must NOT end the block — prove it with a following insn.
+    runDiff([0x4588, 0x2305], setup);
+    runDiff([0x4549, 0x2305], setup);
+    // CMP at a==b: Z + C set.
+    runDiff([0x4588], (e) => { e.cpu.state.r[8] = 42; e.cpu.state.r[1] = 42; });
+  });
+
+  it('Format 5 PC operand reads as the aligned per-insn PC+4', () => {
+    // MOV R0, PC = 0x4678 ; ADD R1, PC = 0x4479
+    runDiff([0x4678]);
+    runDiff([0x4479], (e) => { e.cpu.state.r[1] = 0x100; });
+    // As the 2nd insn — the constant must track the decode address,
+    // not the block start.
+    runDiff([0x2000, 0x4678]);
+  });
+
+  it('Format 5 MOV/ADD into PC end the block where the interpreter lands', () => {
+    const pc = 0x03002000;
+    // MOV PC, R0 = 0x4687 — a target with bit 0 set must be masked.
+    runDiff([0x4687], (e) => { e.cpu.state.r[0] = (pc + 0x41) >>> 0; });
+    runDiff([0x4687], (e) => { e.cpu.state.r[0] = (pc + 0x40) >>> 0; });
+    // ADD PC, R0 = 0x4487: r15 = ((pc + 4) + r0) & ~1.
+    runDiff([0x4487], (e) => { e.cpu.state.r[0] = 0x21; });
+    // As the 2nd insn so the PC constant tracks the decode address.
+    runDiff([0x2000, 0x4487], (e) => { e.cpu.state.r[0] = 0x20; });
+  });
+
+  it('Format 5 BX to a THUMB address keeps T and masks bit 0', () => {
+    const pc = 0x03002000;
+    // BX R0 = 0x4700 ; BX R8 = 0x4740
+    runDiff([0x4700], (e) => { e.cpu.state.r[0] = (pc + 0x81) >>> 0; });
+    runDiff([0x4740], (e) => { e.cpu.state.r[8] = (pc + 0x101) >>> 0; });
+  });
+
+  it('Format 5 BX to an ARM address clears T and the interpreter continues identically', () => {
+    const pc = 0x03002000;
+    const armTarget = 0x03003000;
+    // BX R0 with r0 bit 0 clear → ARM. ARM code at the target:
+    //   MOV R1, #42 (0xE3A0102A) ; ADD R2, R1, R1 (0xE0812001)
+    const arm = [0xE3A0102A, 0xE0812001];
+    const mk = () => {
+      const e = new Emulator();
+      e.loadRom(new Uint8Array(0x100));
+      placeInsns(e, pc, [0x4700]);
+      for (let i = 0; i < arm.length; i++) e.bus.write32(armTarget + i * 4, arm[i]);
+      initThumb(e, pc);
+      e.cpu.state.r[0] = armTarget;
+      return e;
+    };
+    const ref = mk();
+    for (let i = 0; i < 1 + arm.length; i++) ref.cpu.step();
+
+    const emu = mk();
+    emu.recomp.enabled = true;
+    (emu.recomp as any).hits.set(pc, 1000);
+    expect(emu.recomp.tryDispatch()).toBe(1);
+    expect(emu.cpu.state.cpsr & 0x20, 'T cleared').toBe(0);
+    // The dispatcher re-checks T, so it refuses to JIT the ARM target.
+    expect(emu.recomp.tryDispatch()).toBe(0);
+    for (let i = 0; i < arm.length; i++) emu.cpu.step();
+
+    for (let i = 0; i < 16; i++) {
+      expect(emu.cpu.state.r[i] >>> 0, `r${i}`).toBe(ref.cpu.state.r[i] >>> 0);
+    }
+    expect(emu.cpu.state.cpsr >>> 0, 'cpsr').toBe(ref.cpu.state.cpsr >>> 0);
+  });
+
+  it('Format 5 BX with H1 set is left to the interpreter', () => {
+    const emu = new Emulator();
+    emu.loadRom(new Uint8Array(0x100));
+    emu.recomp.enabled = true;
+    const pc = 0x03002000;
+    placeInsns(emu, pc, [0x4787]);   // BX encoding with H1 set — undefined
+    initThumb(emu, pc);
+    (emu.recomp as any).hits.set(pc, 1000);
+    expect(emu.recomp.tryDispatch()).toBe(0);
+  });
+
+  it('Format 19 BL pair lands at the target with LR = return|1', () => {
+    // Forward BL +0x40: high 0xF000 (off=0), low 0xF820 (0x20 halfwords).
+    runDiff([0xF000, 0xF820]);
+    // Backward BL -0x100: 23-bit offset -0x104 from the high half's
+    // arch PC → hi 0x7FF, lo 0x77E.
+    runDiff([0xF7FF, 0xFF7E]);
+    // High half alone (sign-extension path) is NOT a block-ender.
+    runDiff([0xF000 | 0x7FF]);
+    runDiff([0xF000 | 0x3FF]);
+  });
+
+  it('Format 19 BL low half works split across blocks (LR pre-seeded)', () => {
+    // A block starting at the LOW half only: LR carries the high half's
+    // result (seeded with bit 0 set to prove the target mask).
+    runDiff([0xF800 | 0x10], (e) => { e.cpu.state.r[14] = 0x03002441; });
+    runDiff([0xF800 | 0x000], (e) => { e.cpu.state.r[14] = 0x03002400; });
+  });
+
+  it('Format 14 PUSH writes the stack like the interpreter', () => {
+    const sp0 = 0x03007F00;
+    // PUSH {r0-r3} = 0xB40F
+    runDiff([0xB40F], (e) => {
+      e.cpu.state.r[0] = 0x11111111; e.cpu.state.r[1] = 0x22222222;
+      e.cpu.state.r[2] = 0x33333333; e.cpu.state.r[3] = 0x44444444;
+    }, (emu, ref) => {
+      for (let off = -16; off < 0; off += 4) {
+        expect(emu.bus.read32(sp0 + off) >>> 0).toBe(ref.bus.read32(sp0 + off) >>> 0);
+      }
+      expect(emu.bus.read32(sp0 - 16) >>> 0).toBe(0x11111111);  // ascending
+      expect(emu.bus.read32(sp0 - 4) >>> 0).toBe(0x44444444);
+    });
+    // PUSH {r4, lr} = 0xB510 — LR lands last (highest).
+    runDiff([0xB510], (e) => {
+      e.cpu.state.r[4] = 0xAAAA5555; e.cpu.state.r[14] = 0x080001AB;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(sp0 - 8) >>> 0).toBe(ref.bus.read32(sp0 - 8) >>> 0);
+      expect(emu.bus.read32(sp0 - 4) >>> 0).toBe(ref.bus.read32(sp0 - 4) >>> 0);
+      expect(emu.bus.read32(sp0 - 8) >>> 0).toBe(0xAAAA5555);
+      expect(emu.bus.read32(sp0 - 4) >>> 0).toBe(0x080001AB);
+    });
+    // Misaligned SP: writes mask to the aligned word, r13 stays unmasked.
+    runDiff([0xB401], (e) => {
+      e.cpu.state.r[13] = 0x03007F02; e.cpu.state.r[0] = 0xFEEDF00D;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(0x03007EFC) >>> 0).toBe(ref.bus.read32(0x03007EFC) >>> 0);
+      expect(emu.bus.read32(0x03007EFC) >>> 0).toBe(0xFEEDF00D);
+    });
+  });
+
+  it('Format 14 POP without PC restores registers and SP, not a block-ender', () => {
+    // PUSH {r1, r2} = 0xB406 ; POP {r0, r1} = 0xBC03 ; MOV R3, #5 after
+    // the POP proves it does not end the block.
+    runDiff([0xB406, 0xBC03, 0x2305], (e) => {
+      e.cpu.state.r[1] = 0xDEAD0001; e.cpu.state.r[2] = 0xBEEF0002;
+    });
+  });
+
+  it('Format 14 POP {.., pc} masks bit 0 and leaves T unchanged', () => {
+    const pc = 0x03002000;
+    const sp = 0x03004000;
+    // POP {r0, pc} = 0xBD01 — return address with bit 0 SET: ARMv4T does
+    // not interwork on POP, so the bit is masked and T stays THUMB.
+    runDiff([0xBD01], (e) => {
+      e.cpu.state.r[13] = sp;
+      e.bus.write32(sp, 0x12345678);
+      e.bus.write32(sp + 4, (pc + 0x101) >>> 0);
+    });
+    // Round trip: PUSH {r0, lr} then POP {r0, pc} = the old sentinel pair.
+    runDiff([0xB501, 0xBD01], (e) => {
+      e.cpu.state.r[0] = 0x5A5A5A5A;
+      e.cpu.state.r[14] = 0x03002A31;     // bit 0 set — must be masked
+    });
+  });
+
+  it('Format 15 LDMIA/STMIA multiple registers match interpreter', () => {
+    const base = 0x03004000;
+    // STMIA R1!, {r0, r2, r3} = 0xC10D
+    runDiff([0xC10D], (e) => {
+      e.cpu.state.r[0] = 0x11111111; e.cpu.state.r[2] = 0x33333333;
+      e.cpu.state.r[3] = 0x44444444; e.cpu.state.r[1] = base;
+    }, (emu, ref) => {
+      for (let off = 0; off < 12; off += 4) {
+        expect(emu.bus.read32(base + off) >>> 0).toBe(ref.bus.read32(base + off) >>> 0);
+      }
+      expect(emu.bus.read32(base) >>> 0).toBe(0x11111111);
+      expect(emu.bus.read32(base + 8) >>> 0).toBe(0x44444444);
+    });
+    // LDMIA R1!, {r0, r2, r3} = 0xC90D — writeback r1 = base + 12.
+    runDiff([0xC90D], (e) => {
+      e.cpu.state.r[1] = base;
+      e.bus.write32(base, 0xA1); e.bus.write32(base + 4, 0xA2); e.bus.write32(base + 8, 0xA3);
+    });
+    // Misaligned base: accesses mask & ~3, writeback stays unmasked.
+    runDiff([0xC905], (e) => {            // LDMIA R1!, {r0, r2}
+      e.cpu.state.r[1] = base + 2;
+      e.bus.write32(base, 0x12121212); e.bus.write32(base + 4, 0x34343434);
+    });
+  });
+
+  it('Format 15 STM base-in-list quirks match interpreter', () => {
+    const base = 0x03004000;
+    // Base FIRST in list: STMIA R0!, {r0, r1} = 0xC003 — stores OLD base.
+    runDiff([0xC003], (e) => {
+      e.cpu.state.r[0] = base; e.cpu.state.r[1] = 0x55667788;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(base) >>> 0).toBe(ref.bus.read32(base) >>> 0);
+      expect(emu.bus.read32(base) >>> 0).toBe(base >>> 0);
+      expect(emu.bus.read32(base + 4) >>> 0).toBe(0x55667788);
+    });
+    // Base in list NOT first: STMIA R1!, {r0, r1} = 0xC103 — stores the
+    // WRITTEN-BACK base (start + 8).
+    runDiff([0xC103], (e) => {
+      e.cpu.state.r[0] = 0x99AABBCC; e.cpu.state.r[1] = base;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(base + 4) >>> 0).toBe(ref.bus.read32(base + 4) >>> 0);
+      expect(emu.bus.read32(base + 4) >>> 0).toBe((base + 8) >>> 0);
+    });
+  });
+
+  it('Format 15 LDM with base in list: loaded value wins, no writeback', () => {
+    const base = 0x03004000;
+    // LDMIA R1!, {r1} = 0xC902
+    runDiff([0xC902], (e) => {
+      e.cpu.state.r[1] = base;
+      e.bus.write32(base, 0xCAFED00D);
+    });
+    // LDMIA R1!, {r0, r1} = 0xC903
+    runDiff([0xC903], (e) => {
+      e.cpu.state.r[1] = base;
+      e.bus.write32(base, 0x0BADF00D); e.bus.write32(base + 4, 0xD00DF00D);
+    });
+  });
+
   it('bails out and returns false on unsupported instruction at start', () => {
     const emu = new Emulator();
     emu.loadRom(new Uint8Array(0x100));
     emu.recomp.enabled = true;
     const pc = 0x03002000;
-    // PUSH {R0, LR} — Format 14, not supported in this build
-    placeInsns(emu, pc, [0xB501]);
+    // STMIA R0!, {} — Format 15 with an empty register list, a PC quirk
+    // the JIT leaves to the interpreter.
+    placeInsns(emu, pc, [0xC000]);
     initThumb(emu, pc);
     (emu.recomp as any).hits.set(pc, 1000);
     expect(emu.recomp.tryDispatch()).toBe(0);
