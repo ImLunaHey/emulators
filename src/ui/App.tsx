@@ -6,6 +6,7 @@ import { AudioSink } from './audio';
 import { EmuContext } from './EmuContext';
 import { LibraryPage } from './LibraryPage';
 import { PlayerPage } from './PlayerPage';
+import { RomDetailsPage } from './RomDetailsPage';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -34,6 +35,7 @@ export function App() {
           <BrowserRouter>
             <Routes>
               <Route path="/" element={<LibraryPage />} />
+              <Route path="/rom/:romId" element={<RomDetailsPage />} />
               <Route path="/play/:romId" element={<PlayerPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

@@ -13,11 +13,12 @@ interface Props {
   rom: RomMeta;
   selectMode: boolean;
   selected: boolean;
-  onActivate: () => void;
+  onActivate: () => void;             // cover click → play
+  onDetails: () => void;              // title click → details page
   onDelete: (displayName: string) => void;
 }
 
-export function CoverCard({ rom, selectMode, selected, onActivate, onDelete }: Props) {
+export function CoverCard({ rom, selectMode, selected, onActivate, onDetails, onDelete }: Props) {
   const md5Query = useRomMd5(rom.id, rom.md5);
   const metaQuery = useHasheousMeta(md5Query.data);
   const m = metaQuery.data ?? null;
@@ -43,11 +44,15 @@ export function CoverCard({ rom, selectMode, selected, onActivate, onDelete }: P
           ? selected
             ? 'ring-2 ring-[#5060a0]'
             : 'opacity-80 hover:opacity-100'
-          : 'cursor-pointer hover:scale-[1.02] hover:z-10 transition-transform'
+          : 'hover:z-10'
       }`}
-      onClick={onActivate}
+      onClick={selectMode ? onActivate : undefined}
     >
-      <div className="relative rounded-md overflow-hidden">
+      <div
+        className={`relative rounded-md overflow-hidden ${selectMode ? '' : 'cursor-pointer hover:scale-[1.02] transition-transform'}`}
+        onClick={selectMode ? undefined : onActivate}
+        title={selectMode ? undefined : `Play ${displayName}`}
+      >
         <CoverImage
           title={displayName}
           subtitle={year || rom.code}
@@ -76,7 +81,11 @@ export function CoverCard({ rom, selectMode, selected, onActivate, onDelete }: P
         )}
       </div>
       <div className="min-w-0 mt-1.5 px-0.5">
-        <div className="text-[11px] font-medium leading-tight line-clamp-2" title={displayName}>{displayName}</div>
+        <div
+          className={`text-[11px] font-medium leading-tight line-clamp-2 ${selectMode ? '' : 'cursor-pointer hover:text-[var(--color-accent)]'}`}
+          title={selectMode ? displayName : `${displayName} — details`}
+          onClick={selectMode ? undefined : (e) => { e.stopPropagation(); onDetails(); }}
+        >{displayName}</div>
         <div className="text-[9px] opacity-50 truncate" title={`${rom.filename} · ${m?.platform || 'GBA'}`}>
           {subtitleParts.join(' · ')}
         </div>

@@ -257,6 +257,7 @@ export function LibraryPage() {
                 selectMode={selectMode}
                 selected={selected.has(rom.id)}
                 onActivate={() => selectMode ? toggleSelected(rom.id) : navigate(`/play/${rom.id}`)}
+                onDetails={() => navigate(`/rom/${rom.id}`)}
                 onDelete={(displayName) => onDeleteOne(rom.id, displayName)}
               />
             ))}
