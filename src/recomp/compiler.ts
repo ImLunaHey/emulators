@@ -210,6 +210,35 @@ export class Recompiler {
       f.call(I_w32);
     };
 
+    // Load a halfword with ARM unaligned-LDRH semantics, matching the
+    // interpreter: read16(addr & ~1), then rotate the result right by
+    // (addr & 1) * 8 bits. r16 returns ≤ 0xFFFF, so
+    // rotr(v, 8) == (v >>> 8) | (v << 24) — exactly the interpreter's
+    // formula — and rotr(v, 0) is a no-op, so no branch is needed.
+    // Shared by Format 8/10 LDRH.
+    const emitLoadHalfRotated = (addrLocal: number, destLocal: number) => {
+      // read16(addr & ~1)
+      f.localGet(addrLocal);
+      f.i32Const(~1); f.op(W.OP_I32_AND);
+      f.call(I_r16);
+      // rotr by (addr & 1) << 3
+      f.localGet(addrLocal);
+      f.i32Const(1); f.op(W.OP_I32_AND);
+      f.i32Const(3); f.op(W.OP_I32_SHL);
+      f.op(W.OP_I32_ROTR);
+      f.localSet(destLocal);
+    };
+
+    // Store a halfword with ARM semantics, matching the interpreter:
+    // write16(addr & ~1, value). The w16 hook masks the value to 16
+    // bits, same as the interpreter's `& 0xFFFF`.
+    const emitStoreHalfMasked = (addrLocal: number, valLocal: number) => {
+      f.localGet(addrLocal);
+      f.i32Const(~1); f.op(W.OP_I32_AND);
+      f.localGet(valLocal);
+      f.call(I_w16);
+    };
+
     // setNZ(value-in-localIdx) — updates the CPSR's N+Z bits in place.
     // Equivalent to CpuState.setNZ.
     const emitSetNZ = (localIdx: number) => {
@@ -514,6 +543,90 @@ export class Recompiler {
         return { ok: false };
       }
 
+      // -------- Format 6: LDR Rd, [PC, #imm8*4]
+      // 0x4800/0xF800 shares the `010` top-bits region with Format 4
+      // (0x4000/0xFC00, checked above) and Format 5 (0x4400/0xFC00,
+      // intentionally unimplemented) — neither range matches this mask,
+      // so there's no shadowing either way.
+      if ((insn & 0xF800) === 0x4800) {
+        const rd  = (insn >>> 8) & 7;
+        const imm = (insn & 0xFF) << 2;
+        // addr = (arch PC & ~3) + imm. Arch PC = pc + 4 is a compile-
+        // time constant, so the whole address folds to a constant.
+        // Word-aligned by construction → plain read32, no rotation.
+        const addr = (((pc + 4) & ~3) + imm) >>> 0;
+        f.i32Const(0);                          // reg-store base addr
+        f.i32Const(addr | 0);
+        f.call(I_r32);
+        f.i32Store(REG_BASE + rd * 4);
+        return { ok: true, endsBlock: false };
+      }
+
+      // -------- Formats 7+8: load/store with register offset
+      if ((insn & 0xF000) === 0x5000) {
+        const ro = (insn >>> 6) & 7;
+        const rb = (insn >>> 3) & 7;
+        const rd = insn & 7;
+        // addr = r[rb] + r[ro]
+        pushReg(rb); pushReg(ro); f.op(W.OP_I32_ADD); f.localSet(L_TMP);
+        if ((insn & 0x0200) === 0) {
+          // Format 7: LDR/STR Rd, [Rb, Ro] with byte/word toggle.
+          const L = (insn & 0x0800) !== 0;
+          const B = (insn & 0x0400) !== 0;
+          if (L) {
+            if (B) { f.localGet(L_TMP); f.call(I_r8); f.localSet(L_R); }
+            else   { emitLoadWordRotated(L_TMP, L_R); }
+            storeRegFromLocal(rd, L_R);
+          } else {
+            pushReg(rd); f.localSet(L_R);
+            // The w8 hook masks the value to 8 bits, matching the
+            // interpreter's `s.r[rd] & 0xFF`.
+            if (B) { f.localGet(L_TMP); f.localGet(L_R); f.call(I_w8); }
+            else   { emitStoreWordMasked(L_TMP, L_R); }
+          }
+        } else {
+          // Format 8: STRH/LDSB/LDRH/LDSH via the H + S bits.
+          const H = (insn & 0x0800) !== 0;
+          const S = (insn & 0x0400) !== 0;
+          if (!H && !S) {
+            // STRH: write16(addr & ~1, r[rd]) — hook masks the value.
+            pushReg(rd); f.localSet(L_R);
+            emitStoreHalfMasked(L_TMP, L_R);
+          } else if (!H && S) {
+            // LDSB: read8(addr), sign-extend 8→32.
+            f.localGet(L_TMP); f.call(I_r8);
+            f.i32Const(24); f.op(W.OP_I32_SHL);
+            f.i32Const(24); f.op(W.OP_I32_SHR_S);
+            f.localSet(L_R);
+            storeRegFromLocal(rd, L_R);
+          } else if (H && !S) {
+            // LDRH (unaligned rotated, never sign-extended).
+            emitLoadHalfRotated(L_TMP, L_R);
+            storeRegFromLocal(rd, L_R);
+          } else {
+            // LDSH — ARM7TDMI quirk: an odd address reads the BYTE at
+            // addr sign-extended 8→32; an even address reads the half-
+            // word sign-extended 16→32. Runtime branch on addr & 1.
+            f.localGet(L_TMP); f.i32Const(1); f.op(W.OP_I32_AND);
+            f.op(W.OP_IF); f.body.push(0x40);
+            f.localGet(L_TMP); f.call(I_r8);
+            f.i32Const(24); f.op(W.OP_I32_SHL);
+            f.i32Const(24); f.op(W.OP_I32_SHR_S);
+            f.localSet(L_R);
+            f.op(W.OP_ELSE);
+            // addr is even here, so no & ~1 needed (interpreter passes
+            // the raw address to read16 too).
+            f.localGet(L_TMP); f.call(I_r16);
+            f.i32Const(16); f.op(W.OP_I32_SHL);
+            f.i32Const(16); f.op(W.OP_I32_SHR_S);
+            f.localSet(L_R);
+            f.op(W.OP_END);
+            storeRegFromLocal(rd, L_R);
+          }
+        }
+        return { ok: true, endsBlock: false };
+      }
+
       // -------- Format 9: LDR/STR Rd, [Rb, #imm5*4 / *1] (word or byte)
       if ((insn & 0xE000) === 0x6000) {
         const isByte = (insn & 0x1000) !== 0;
@@ -538,6 +651,41 @@ export class Recompiler {
           } else {
             emitStoreWordMasked(L_TMP, L_R);
           }
+        }
+        return { ok: true, endsBlock: false };
+      }
+
+      // -------- Format 10: STRH/LDRH Rd, [Rb, #imm5*2]
+      if ((insn & 0xF000) === 0x8000) {
+        const isLoad = (insn & 0x0800) !== 0;
+        const imm    = ((insn >>> 6) & 0x1F) << 1;
+        const rb     = (insn >>> 3) & 7;
+        const rd     = insn & 7;
+        // addr = r[rb] + imm
+        pushReg(rb); f.i32Const(imm); f.op(W.OP_I32_ADD); f.localSet(L_TMP);
+        if (isLoad) {
+          emitLoadHalfRotated(L_TMP, L_R);
+          storeRegFromLocal(rd, L_R);
+        } else {
+          pushReg(rd); f.localSet(L_R);
+          emitStoreHalfMasked(L_TMP, L_R);
+        }
+        return { ok: true, endsBlock: false };
+      }
+
+      // -------- Format 11: LDR/STR Rd, [SP, #imm8*4]
+      if ((insn & 0xF000) === 0x9000) {
+        const isLoad = (insn & 0x0800) !== 0;
+        const rd     = (insn >>> 8) & 7;
+        const imm    = (insn & 0xFF) << 2;
+        // addr = r13 + imm
+        pushReg(13); f.i32Const(imm); f.op(W.OP_I32_ADD); f.localSet(L_TMP);
+        if (isLoad) {
+          emitLoadWordRotated(L_TMP, L_R);
+          storeRegFromLocal(rd, L_R);
+        } else {
+          pushReg(rd); f.localSet(L_R);
+          emitStoreWordMasked(L_TMP, L_R);
         }
         return { ok: true, endsBlock: false };
       }

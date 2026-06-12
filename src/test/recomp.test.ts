@@ -21,7 +21,13 @@ function initThumb(emu: Emulator, startPc: number) {
 // Differential harness: run `insns` through a JIT-forced emulator and
 // a pure-interpreter emulator, then compare ALL of r0..r15 + cpsr.
 // `setup` runs on both instances before execution (set registers etc.).
-function runDiff(insns: number[], setup?: (emu: Emulator) => void) {
+// `verify` runs after the register compare with both instances — use it
+// to assert that stores landed where the interpreter put them.
+function runDiff(
+  insns: number[],
+  setup?: (emu: Emulator) => void,
+  verify?: (emu: Emulator, ref: Emulator) => void,
+) {
   const pc = 0x03002000;
 
   const ref = new Emulator();
@@ -44,6 +50,7 @@ function runDiff(insns: number[], setup?: (emu: Emulator) => void) {
     expect(emu.cpu.state.r[i] >>> 0, `r${i}`).toBe(ref.cpu.state.r[i] >>> 0);
   }
   expect(emu.cpu.state.cpsr >>> 0, 'cpsr').toBe(ref.cpu.state.cpsr >>> 0);
+  verify?.(emu, ref);
 }
 
 describe('Recompiler (JIT)', () => {
@@ -285,6 +292,156 @@ describe('Recompiler (JIT)', () => {
     runDiff([0xB00A, 0xB08A]);          // net zero round-trip
     // Wrap-around edge.
     runDiff([0xB08A], (e) => { e.cpu.state.r[13] = 4; });
+  });
+
+  it('Format 6 LDR PC-relative matches interpreter', () => {
+    const pc = 0x03002000;
+    // LDR R0, [PC, #4] = 0x4801 → addr = ((pc+4) & ~3) + 4 = pc + 8.
+    runDiff([0x4801], (e) => { e.bus.write32(pc + 8, 0xDEADBEEF); });
+    // imm8 = 0: addr = (pc+4) & ~3 = pc + 4 (just past the code).
+    runDiff([0x4800], (e) => { e.bus.write32(pc + 4, 0xCAFEF00D); });
+    // As the 2nd insn: decode addr pc+2 → arch PC pc+6 → (&~3) pc+4 →
+    // +4 → pc+8. The constant must track the per-insn decode address.
+    runDiff([0x2100, 0x4801], (e) => { e.bus.write32(pc + 8, 0x12345678); });
+  });
+
+  it('Format 7 LDR/STR register offset (word + byte) matches interpreter', () => {
+    const base = 0x03004000;
+    // STR R0, [R1, R2] = 0x5088 ; LDR R3, [R1, R2] = 0x588B
+    runDiff([0x5088, 0x588B], (e) => {
+      e.cpu.state.r[0] = 0xCAFEBABE; e.cpu.state.r[1] = base; e.cpu.state.r[2] = 8;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(base + 8) >>> 0).toBe(ref.bus.read32(base + 8) >>> 0);
+      expect(emu.bus.read32(base + 8) >>> 0).toBe(0xCAFEBABE);
+    });
+    // Unaligned word load: rotation comes from rb+ro, not an immediate.
+    for (const mis of [1, 2, 3]) {
+      runDiff([0x588B], (e) => {
+        e.bus.write32(base, 0x11223344);
+        e.cpu.state.r[1] = base; e.cpu.state.r[2] = mis;
+      });
+    }
+    // Unaligned word store masks down to the aligned word.
+    runDiff([0x5088], (e) => {
+      e.cpu.state.r[0] = 0xDEADBEEF; e.cpu.state.r[1] = base; e.cpu.state.r[2] = 2;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(base) >>> 0).toBe(ref.bus.read32(base) >>> 0);
+      expect(emu.bus.read32(base) >>> 0).toBe(0xDEADBEEF);
+      expect(emu.bus.read32(base + 4) >>> 0).toBe(0);
+    });
+    // STRB R0, [R1, R2] = 0x5488 ; LDRB R3, [R1, R2] = 0x5C8B
+    runDiff([0x5488, 0x5C8B], (e) => {
+      e.cpu.state.r[0] = 0x1234ABCD;       // only 0xCD must land
+      e.cpu.state.r[1] = base; e.cpu.state.r[2] = 5;
+    }, (emu, ref) => {
+      expect(emu.bus.read8(base + 5)).toBe(ref.bus.read8(base + 5));
+      expect(emu.bus.read8(base + 5)).toBe(0xCD);
+      expect(emu.bus.read8(base + 4)).toBe(0);   // neighbours untouched
+      expect(emu.bus.read8(base + 6)).toBe(0);
+    });
+    // LDRB of a high-bit byte must NOT sign-extend.
+    runDiff([0x5C8B], (e) => {
+      e.bus.write8(base + 1, 0xFE);
+      e.cpu.state.r[1] = base; e.cpu.state.r[2] = 1;
+    });
+  });
+
+  it('Format 8 STRH/LDSB/LDRH/LDSH matches interpreter', () => {
+    const base = 0x03004000;
+    // STRH R0, [R1, R2] = 0x5288 ; LDSB R3, [R1, R2] = 0x568B
+    // LDRH R3, [R1, R2] = 0x5A8B ; LDSH R3, [R1, R2] = 0x5E8B
+    // STRH stores the low 16 bits; an odd address masks to the aligned
+    // halfword.
+    runDiff([0x5288], (e) => {
+      e.cpu.state.r[0] = 0x9876FEDC; e.cpu.state.r[1] = base; e.cpu.state.r[2] = 5;
+    }, (emu, ref) => {
+      expect(emu.bus.read16(base + 4)).toBe(ref.bus.read16(base + 4));
+      expect(emu.bus.read16(base + 4)).toBe(0xFEDC);
+      expect(emu.bus.read16(base + 6)).toBe(0);
+    });
+    // LDRH aligned with the high bit set (no sign extension).
+    runDiff([0x5A8B], (e) => {
+      e.bus.write16(base + 2, 0xBEEF);
+      e.cpu.state.r[1] = base; e.cpu.state.r[2] = 2;
+    });
+    // LDRH at an ODD address: rotated right by 8, not sign-extended.
+    runDiff([0x5A8B], (e) => {
+      e.bus.write16(base, 0xBEEF);
+      e.cpu.state.r[1] = base; e.cpu.state.r[2] = 1;
+    });
+    // LDSB negative + positive bytes.
+    for (const v of [0x80, 0x7F, 0xFF, 0x00]) {
+      runDiff([0x568B], (e) => {
+        e.bus.write8(base + 3, v);
+        e.cpu.state.r[1] = base; e.cpu.state.r[2] = 3;
+      });
+    }
+    // LDSH even: sign-extends 16→32 (negative and positive).
+    for (const v of [0x8000, 0x7FFF, 0xFFFF, 0x1234]) {
+      runDiff([0x5E8B], (e) => {
+        e.bus.write16(base + 2, v);
+        e.cpu.state.r[1] = base; e.cpu.state.r[2] = 2;
+      });
+    }
+    // LDSH at an ODD address — the ARM7TDMI byte quirk: reads the BYTE
+    // at addr (the halfword's high byte here) sign-extended 8→32.
+    for (const v of [0x80FF, 0x7F00, 0xFF7F]) {
+      runDiff([0x5E8B], (e) => {
+        e.bus.write16(base, v);
+        e.cpu.state.r[1] = base; e.cpu.state.r[2] = 1;
+      });
+    }
+  });
+
+  it('Format 10 STRH/LDRH immediate matches interpreter', () => {
+    const base = 0x03004000;
+    // STRH R0, [R1, #4] = 0x8088 ; LDRH R2, [R1, #4] = 0x888A
+    runDiff([0x8088, 0x888A], (e) => {
+      e.cpu.state.r[0] = 0xABCD1234; e.cpu.state.r[1] = base;
+    }, (emu, ref) => {
+      expect(emu.bus.read16(base + 4)).toBe(ref.bus.read16(base + 4));
+      expect(emu.bus.read16(base + 4)).toBe(0x1234);
+    });
+    // Odd effective address (rb odd, imm even): LDRH rotates...
+    runDiff([0x888A], (e) => {
+      e.bus.write16(base + 4, 0xBEEF);
+      e.cpu.state.r[1] = base + 1;
+    });
+    // ...and STRH masks down to the aligned halfword.
+    runDiff([0x8088], (e) => {
+      e.cpu.state.r[0] = 0xFEDC; e.cpu.state.r[1] = base + 1;
+    }, (emu, ref) => {
+      expect(emu.bus.read16(base + 4)).toBe(ref.bus.read16(base + 4));
+      expect(emu.bus.read16(base + 4)).toBe(0xFEDC);
+      expect(emu.bus.read16(base + 6)).toBe(0);
+    });
+  });
+
+  it('Format 11 SP-relative LDR/STR matches interpreter', () => {
+    const sp = 0x03004100;
+    // STR R0, [SP, #8] = 0x9002 ; LDR R1, [SP, #8] = 0x9902
+    runDiff([0x9002, 0x9902], (e) => {
+      e.cpu.state.r[13] = sp; e.cpu.state.r[0] = 0xFEEDFACE;
+    }, (emu, ref) => {
+      expect(emu.bus.read32(sp + 8) >>> 0).toBe(ref.bus.read32(sp + 8) >>> 0);
+      expect(emu.bus.read32(sp + 8) >>> 0).toBe(0xFEEDFACE);
+    });
+    // Misaligned SP: the load rotates and the store masks, exactly like
+    // the interpreter.
+    for (const mis of [1, 2, 3]) {
+      runDiff([0x9902], (e) => {
+        e.cpu.state.r[13] = sp + mis;
+        e.bus.write32(sp + 8, 0x11223344);
+      });
+      runDiff([0x9002], (e) => {
+        e.cpu.state.r[13] = sp + mis;
+        e.cpu.state.r[0] = 0xDEADBEEF;
+      }, (emu, ref) => {
+        expect(emu.bus.read32(sp + 8) >>> 0).toBe(ref.bus.read32(sp + 8) >>> 0);
+        expect(emu.bus.read32(sp + 8) >>> 0).toBe(0xDEADBEEF);
+        expect(emu.bus.read32(sp + 12) >>> 0).toBe(0);
+      });
+    }
   });
 
   it('bails out and returns false on unsupported instruction at start', () => {
