@@ -85,6 +85,16 @@ export const OP_I32_LOAD8_U = 0x2D;
 export const OP_I32_STORE   = 0x36;
 export const OP_I32_STORE8  = 0x3A;
 export const OP_I32_STORE16 = 0x3B;
+// 64-bit ops — used by the ARM long-multiply path (UMULL/SMULL/…).
+export const OP_I64_CONST       = 0x42;
+export const OP_I64_ADD         = 0x7C;
+export const OP_I64_MUL         = 0x7E;
+export const OP_I64_OR          = 0x84;
+export const OP_I64_SHL         = 0x86;
+export const OP_I64_SHR_U       = 0x88;
+export const OP_I32_WRAP_I64    = 0xA7;
+export const OP_I64_EXTEND_I32_S = 0xAC;
+export const OP_I64_EXTEND_I32_U = 0xAD;
 
 export class WasmFunction {
   locals: number[] = []; // count, type, count, type, ...
@@ -99,6 +109,7 @@ export class WasmFunction {
   }
 
   i32Const(v: number): this { this.body.push(OP_I32_CONST); sleb(v | 0, this.body); return this; }
+  i64Const(v: number): this { this.body.push(OP_I64_CONST); sleb(v, this.body); return this; }
   localGet(i: number): this { this.body.push(OP_LOCAL_GET); uleb(i, this.body); return this; }
   localSet(i: number): this { this.body.push(OP_LOCAL_SET); uleb(i, this.body); return this; }
   localTee(i: number): this { this.body.push(OP_LOCAL_TEE); uleb(i, this.body); return this; }

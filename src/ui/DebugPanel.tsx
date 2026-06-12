@@ -503,10 +503,10 @@ function AdvancedView({ emu }: { emu: Emulator }) {
         format (1-16, 18, 19) except SWI, and nearly all of ARM:
         data-processing (all operand forms, conditional, PC-relative),
         branches (B/BL/BX), loads/stores (LDR/STR, LDRH/STRH/LDRSB/LDRSH),
-        block transfer (LDM/STM), and MUL/MLA. Only the registers a block
-        touches are synced across the dispatch boundary. SWI, long
-        multiply, MRS/MSR and SWP still interpret. If a game misbehaves,
-        turn this off and reload.
+        block transfer (LDM/STM), and multiply (incl. 64-bit). Only the
+        registers a block touches are synced across the dispatch
+        boundary. SWI, MRS/MSR and SWP still interpret. If a game
+        misbehaves, turn this off and reload.
       </div>
     </div>
   );
