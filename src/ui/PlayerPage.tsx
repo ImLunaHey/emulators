@@ -34,6 +34,16 @@ function base64ToBytes(s: string): Uint8Array {
   return out;
 }
 
+// Set an input/select value through the native prototype setter so a
+// controlled React component still sees the change (React installs its
+// own `value` setter + tracker; assigning `el.value` directly bypasses
+// onChange). Used by controller-driven slider/select adjustment.
+function setNativeValue(el: HTMLInputElement | HTMLSelectElement, value: string): void {
+  const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+  if (desc?.set) desc.set.call(el, value);
+  else el.value = value;
+}
+
 // Rewind ring: snapshot every CAPTURE_MS of play, keep the last MAX.
 // At 120 ms × 100 that's ~12 s of scrub-back. Each snapshot is a full
 // savestate (~400 KB+), so this trades memory for the feature — hence
@@ -149,11 +159,41 @@ export function PlayerPage() {
       panel.querySelector<HTMLElement>('[aria-label="Close"]')?.click();
       return;
     }
+    const active = document.activeElement as HTMLElement | null;
+
+    // Left/Right adjust the focused control's VALUE (slider/select) so
+    // sliders like volume are usable with a pad; on other elements they
+    // fall through to focus movement.
+    if ((action === 'left' || action === 'right') && active) {
+      const dir = action === 'right' ? 1 : -1;
+      if (active instanceof HTMLInputElement && active.type === 'range') {
+        const min = parseFloat(active.min || '0');
+        const max = parseFloat(active.max || '1');
+        const step = parseFloat(active.step) || 0;
+        const delta = Math.max(step, (max - min) / 10) * dir;   // ~10 presses end-to-end
+        const v = Math.min(max, Math.max(min, parseFloat(active.value) + delta));
+        setNativeValue(active, String(v));
+        active.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      if (active instanceof HTMLSelectElement && active.options.length) {
+        const n = active.options.length;
+        setNativeValue(active, active.options[(active.selectedIndex + dir + n) % n].value);
+        active.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+    }
+
     const sel = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
     const items = Array.from(panel.querySelectorAll<HTMLElement>(sel)).filter((el) => el.offsetParent !== null);
     if (!items.length) return;
-    const cur = items.indexOf(document.activeElement as HTMLElement);
-    if (action === 'select') { (cur >= 0 ? items[cur] : items[0]).click(); return; }
+    const cur = items.indexOf(active as HTMLElement);
+    if (action === 'select') {
+      const el = cur >= 0 ? items[cur] : items[0];
+      // A on a slider does nothing useful; everything else clicks.
+      if (!(el instanceof HTMLInputElement && el.type === 'range')) el.click();
+      return;
+    }
     let next: number;
     if (cur < 0) next = 0;
     else if (action === 'down' || action === 'right') next = (cur + 1) % items.length;
