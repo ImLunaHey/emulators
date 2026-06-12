@@ -81,6 +81,10 @@ export function PlayerPage() {
   const [showStates, setShowStates] = useState(false);
   // Controller-driven menu launcher (opened by a hotkey combo / touchpad).
   const [showMenu, setShowMenu] = useState(false);
+  // Video recording (MediaRecorder over the canvas).
+  const [recording, setRecording] = useState(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
   // Base emulation speed (set via Settings / fast-forward toggle) and a
   // momentary turbo while a key is held. Effective speed feeds Screen.
   const [speed, setSpeed] = useState(1);
@@ -531,38 +535,93 @@ export function PlayerPage() {
     };
   }, []);
 
-  // Download the current frame as a 4× nearest-neighbour PNG.
+  // Render the current frame to a 4× nearest-neighbour canvas, shared by
+  // screenshot download + clipboard copy.
+  const renderFrameCanvas = (): HTMLCanvasElement | null => {
+    const src = document.createElement('canvas');
+    src.width = 240; src.height = 160;
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    const img = sctx.createImageData(240, 160);
+    img.data.set(emu.ppu.frame);
+    sctx.putImageData(img, 0, 0);
+    const scale = 4;
+    const out = document.createElement('canvas');
+    out.width = 240 * scale; out.height = 160 * scale;
+    const octx = out.getContext('2d');
+    if (!octx) return null;
+    octx.imageSmoothingEnabled = false;
+    octx.drawImage(src, 0, 0, out.width, out.height);
+    return out;
+  };
+
   const takeScreenshot = () => {
     if (!currentRom) return;
+    const out = renderFrameCanvas();
+    if (!out) { notify('Screenshot failed', 'error'); return; }
+    out.toBlob((blob) => {
+      if (!blob) { notify('Screenshot failed', 'error'); return; }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${currentRom.code || 'gba'}-${Date.now()}.png`; a.click();
+      URL.revokeObjectURL(url);
+      notify('Screenshot saved', 'success');
+    }, 'image/png');
+  };
+
+  const copyScreenshot = () => {
+    if (!currentRom) return;
+    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
+      notify('Clipboard images not supported here', 'error'); return;
+    }
+    const out = renderFrameCanvas();
+    if (!out) { notify('Screenshot failed', 'error'); return; }
+    // ClipboardItem accepts a Promise<Blob>, keeping us inside the
+    // user-gesture window despite toBlob being async.
+    const blob = new Promise<Blob>((resolve, reject) =>
+      out.toBlob((b) => (b ? resolve(b) : reject(new Error('encode failed'))), 'image/png'));
+    navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+      .then(() => notify('Screenshot copied', 'success'))
+      .catch((e) => notify('Copy failed: ' + (e as Error).message, 'error'));
+  };
+
+  // Record the canvas to a .webm via MediaRecorder.
+  const startRecording = () => {
+    const canvas = document.getElementById('screen') as HTMLCanvasElement | null;
+    if (!canvas || typeof canvas.captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
+      notify('Recording not supported here', 'error'); return;
+    }
     try {
-      const src = document.createElement('canvas');
-      src.width = 240; src.height = 160;
-      const sctx = src.getContext('2d');
-      if (!sctx) return;
-      const img = sctx.createImageData(240, 160);
-      img.data.set(emu.ppu.frame);
-      sctx.putImageData(img, 0, 0);
-      const scale = 4;
-      const out = document.createElement('canvas');
-      out.width = 240 * scale; out.height = 160 * scale;
-      const octx = out.getContext('2d');
-      if (!octx) return;
-      octx.imageSmoothingEnabled = false;
-      octx.drawImage(src, 0, 0, out.width, out.height);
-      out.toBlob((blob) => {
-        if (!blob) { notify('Screenshot failed', 'error'); return; }
+      const stream = canvas.captureStream(60);
+      const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9' : 'video/webm';
+      const rec = new MediaRecorder(stream, { mimeType: mime });
+      recChunksRef.current = [];
+      rec.ondataavailable = (e) => { if (e.data.size) recChunksRef.current.push(e.data); };
+      rec.onstop = () => {
+        const blob = new Blob(recChunksRef.current, { type: mime });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url;
-        a.download = `${currentRom.code || 'gba'}-${Date.now()}.png`;
-        a.click();
+        a.href = url; a.download = `${currentRom?.code || 'gba'}-${Date.now()}.webm`; a.click();
         URL.revokeObjectURL(url);
-        notify('Screenshot saved', 'success');
-      }, 'image/png');
+        notify(`Recording saved (${(blob.size / 1e6).toFixed(1)} MB)`, 'success');
+      };
+      rec.start();
+      recorderRef.current = rec;
+      setRecording(true);
+      notify('Recording…');
     } catch (e) {
-      notify('Screenshot failed: ' + (e as Error).message, 'error');
+      notify('Recording failed: ' + (e as Error).message, 'error');
     }
   };
+  const stopRecording = () => {
+    try { recorderRef.current?.stop(); } catch { /* ignore */ }
+    recorderRef.current = null;
+    setRecording(false);
+  };
+  const toggleRecord = () => (recording ? stopRecording() : startRecording());
+  // Flush any in-progress recording when leaving the player.
+  useEffect(() => () => { try { recorderRef.current?.stop(); } catch { /* ignore */ } }, []);
 
   // Secondary actions (panel toggles). Rendered inline on wide screens
   // and folded into a "⋯ More" dropdown on phones to keep the toolbar
@@ -571,6 +630,8 @@ export function PlayerPage() {
     { key: 'settings', icon: '⚙', label: 'Settings', onClick: () => setShowSettings(true), disabled: false },
     { key: 'states', icon: '🗂', label: 'States', onClick: () => setShowStates(true), disabled: !currentRom },
     { key: 'shot', icon: '📸', label: 'Screenshot', onClick: takeScreenshot, disabled: !currentRom },
+    { key: 'copy', icon: '🖼', label: 'Copy frame', onClick: copyScreenshot, disabled: !currentRom },
+    { key: 'record', icon: recording ? '⏹' : '⏺', label: recording ? 'Stop recording' : 'Record video', onClick: toggleRecord, disabled: !currentRom },
     { key: 'cp', icon: '🎮', label: 'Controller', onClick: () => setShowCp(true), disabled: false },
     { key: 'cheats', icon: '★', label: 'Cheats', onClick: () => setShowCheats(true), disabled: !currentRom },
     { key: 'link', icon: '🔗', label: 'Link', onClick: () => setShowLink(true), disabled: !currentRom },
