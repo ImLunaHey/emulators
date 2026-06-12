@@ -105,7 +105,10 @@ for (let frame = 0; frame < frames; frame++) {
     B.cpu.irqLine = B.irq.cachedPending;
 
     let n: number;
-    const jitN = A.recomp.tryDispatch();
+    // Budget > 1 exercises block linking: tryDispatch may chain several
+    // blocks and return the total. B replays exactly that many steps, so
+    // the two stay aligned at the chain boundary where we compare.
+    const jitN = A.recomp.tryDispatch(64);
     if (jitN > 0) {
       lastBlockPc = (B.cpu.state.r[15] & ~1) >>> 0;
       lastBlockN = jitN;

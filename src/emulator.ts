@@ -59,6 +59,8 @@ export class Emulator {
     this.bios = new BiosHle(this.cpu, this.bus);
     this.cpu.bios = this.bios;
     this.recomp = new Recompiler(this.cpu);
+    // Let the recompiler re-sample IRQ state when chaining blocks.
+    this.recomp.irqPending = () => this.irq.cachedPending;
     this.bus.attachIo(this.io);
     // attachSave gets a thin closure so we can swap `this.save` per
     // ROM (Flash vs SRAM vs eventually EEPROM) without re-attaching.
@@ -156,7 +158,10 @@ export class Emulator {
         // that count, not by 1 — otherwise a JIT block of 20 insns
         // counts as a single cycle, PPU/timers under-step by 20×, and
         // the game's main loop ticks ~20× per real-time VBlank.
-        const jitN = this.recomp.tryDispatch();
+        // Pass the remaining batch budget so chained blocks stop at the
+        // same cycle granularity the interpreter would (keeps PPU/timer/
+        // IRQ timing identical — the lockstep depends on it).
+        const jitN = this.recomp.tryDispatch(batch - i);
         if (jitN > 0) i += jitN;
         else { cpu.step(); i++; this.recomp.intInsns++; }
         if (cpu.state.halted) { i = batch; break; }

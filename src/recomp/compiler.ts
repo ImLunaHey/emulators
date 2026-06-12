@@ -72,6 +72,13 @@ export class Recompiler {
   // interpreter. Set false to force pure interpretation.
   enabled = true;
 
+  // Live "IRQ pending" getter, wired by the emulator. Block linking
+  // re-samples it at each block boundary so a block that enables/raises
+  // an IRQ hands control back to the interpreter at the same point the
+  // interpreter would take it. Null → no chaining IRQ check (single
+  // blocks only, e.g. in unit tests).
+  irqPending: (() => boolean) | null = null;
+
   // Shared linear memory for all compiled modules. 1 page = 64KB,
   // dwarfs what we use today (68 bytes) but leaves room for future
   // in-memory IWRAM/EWRAM mirroring.
@@ -109,77 +116,91 @@ export class Recompiler {
     };
   }
 
-  // Returns the number of THUMB instructions executed by the JIT block
-  // it dispatched, or 0 if no dispatch happened (interpreter must
-  // handle this PC). Callers MUST advance their own cycle/instruction
-  // counter by the returned value, not by 1 — a compiled block is
-  // typically 5-32 instructions, and treating it as a single cycle
-  // makes runFrame consume the whole frame budget in far fewer
-  // iterations, effectively running ~N× more game code per real-time
-  // VBlank than the interpreter. That's the "JIT runs too fast" bug.
-  tryDispatch(): number {
-    if (!this.enabled) return 0;
-    const s = this.cpu.state;
-    // The interpreter's step() handles halt wake-up and IRQ entry
-    // BEFORE executing an instruction. A JIT block must not run in
-    // either situation — otherwise a fully-jitted wait loop (e.g.
-    // Emerald's `ldrb r0, [VCOUNT]; cmp r0, #n; beq .-4`) starves IRQ
-    // delivery forever and the game soft-locks on a black screen.
-    if (s.halted) return 0;
-    if (this.cpu.irqLine && !(s.cpsr & 0x80)) return 0;
-    const isThumb = (s.cpsr & 0x20) !== 0;
-    const pc = s.r[15] & (isThumb ? ~1 : ~3);
+  // Resolve the runnable block at `pc` for the given mode, or null if the
+  // interpreter must handle it (uncompilable, mode-mismatch, self-modified
+  // RAM, or not yet hot). Lazily compiles once a PC crosses HOT_THRESHOLD.
+  private resolve(pc: number, isThumb: boolean): CompiledBlock | null {
     const cached = this.cache.get(pc);
-    if (cached === null) return 0;              // known-uncompilable
+    if (cached === null) return null;             // known-uncompilable
     if (cached) {
       // The same PC could in principle be entered in the other CPU mode
       // after a remap — never run a mismatched block; drop + recompile.
-      if (cached.thumb !== isThumb) { this.cache.delete(pc); return 0; }
-      // RAM blocks: verify the code bytes haven't changed since
-      // compilation. On mismatch drop the block and fall back to the
-      // interpreter; the hit counter will recompile it if the new
-      // code turns out to be hot too.
+      if (cached.thumb !== isThumb) { this.cache.delete(pc); return null; }
+      // RAM blocks: verify the code bytes haven't changed since compile.
       const snap = cached.snapshot;
       if (snap) {
         const live = cached.liveCode!;
         for (let i = 0; i < snap.length; i++) {
-          if (live[i] !== snap[i]) { this.cache.delete(pc); return 0; }
+          if (live[i] !== snap[i]) { this.cache.delete(pc); return null; }
         }
       }
-      return this.runBlock(cached);
+      return cached;
     }
     const c = (this.hits.get(pc) || 0) + 1;
     this.hits.set(pc, c);
-    if (c < HOT_THRESHOLD) return 0;
+    if (c < HOT_THRESHOLD) return null;
     this.hits.delete(pc);
     const block = this.compile(pc, isThumb);
     this.cache.set(pc, block);
+    return block;
+  }
+
+  // Run as many chained JIT blocks as fit in `budget` instructions,
+  // returning the total executed (0 if nothing dispatched — the
+  // interpreter must handle this PC). Registers + CPSR live in linear
+  // memory for the whole chain and sync to the JS CpuState only at the
+  // boundaries, so a hot loop runs with ONE marshal in/out instead of
+  // one per block — the main win of block linking.
+  //
+  // Callers MUST advance their cycle/instruction counter by the return
+  // value, not by 1: a block is 5-32 instructions, and counting it as a
+  // single cycle makes runFrame consume the frame budget far too fast
+  // ("JIT runs too fast"). `budget` bounds the chain so peripherals step
+  // at the same granularity as the interpreter (preserving IRQ timing).
+  tryDispatch(budget = 1): number {
+    if (!this.enabled) return 0;
+    const s = this.cpu.state;
+    // The interpreter handles halt wake-up + IRQ entry BEFORE executing,
+    // so a block must not run in either case — otherwise a fully-jitted
+    // wait loop starves IRQ delivery and the game soft-locks.
+    if (s.halted) return 0;
+    if (this.cpu.irqLine && !(s.cpsr & 0x80)) return 0;
+    let isThumb = (s.cpsr & 0x20) !== 0;
+    let pc = s.r[15] & (isThumb ? ~1 : ~3);
+    let block = this.resolve(pc, isThumb);
     if (!block) return 0;
-    return this.runBlock(block);
+
+    const mem = this.memU32;
+    const r = s.r;
+    // Marshal the whole register file + CPSR in once; the chain reads and
+    // writes linear memory directly from here on.
+    for (let i = 0; i < 16; i++) mem[i] = r[i];
+    mem[CPSR_OFF >> 2] = s.cpsr >>> 0;
+    const cpsrIdx = CPSR_OFF >> 2;
+
+    let total = 0;
+    for (;;) {
+      total += block.run();
+      if (total >= budget) break;
+      const cpsrNow = mem[cpsrIdx];
+      // Re-sample IRQ at the block boundary (a block may have enabled or
+      // raised one via an IO write): hand back so the interpreter takes
+      // it at exactly the instruction the interpreter would.
+      if (this.irqPending !== null && this.irqPending() && (cpsrNow & 0x80) === 0) break;
+      isThumb = (cpsrNow & 0x20) !== 0;
+      pc = mem[15] & (isThumb ? ~1 : ~3);
+      const next = this.resolve(pc, isThumb);
+      if (!next) break;
+      block = next;
+    }
+
+    for (let i = 0; i < 16; i++) r[i] = mem[i];
+    s.cpsr = mem[cpsrIdx] | 0;
+    this.jitInsns += total;
+    return total;
   }
 
   invalidate(): void { this.cache.clear(); this.hits.clear(); }
-
-  // Push JS-side CpuState into linear memory, run the block, pull state
-  // back. The copy is 17 u32 writes either side (~50ns total) — small
-  // enough that even short blocks come out ahead of the interpreter.
-  private runBlock(block: CompiledBlock): number {
-    const s = this.cpu.state;
-    const mem = this.memU32;
-    const r = s.r;
-    // In: only the registers this block reads (plus PC), and cpsr.
-    // Iterate just the set bits via the classic x & -x lowest-bit trick.
-    let im = block.inMask;
-    while (im !== 0) { const i = 31 - Math.clz32(im & -im); mem[i] = r[i]; im &= im - 1; }
-    mem[CPSR_OFF >> 2] = s.cpsr >>> 0;
-    const n = block.run();
-    // Out: only the registers this block writes (plus PC), and cpsr.
-    let om = block.outMask;
-    while (om !== 0) { const i = 31 - Math.clz32(om & -om); r[i] = mem[i]; om &= om - 1; }
-    s.cpsr = mem[CPSR_OFF >> 2] | 0;
-    this.jitInsns += n;
-    return n;
-  }
 
   private compile(startPc: number, thumb: boolean): CompiledBlock | null {
     const bus = this.cpu.bus;
