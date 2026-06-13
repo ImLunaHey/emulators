@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gba-core (Rust/wasm)</title>
+<style>
+  body { background:#111; color:#ddd; font:14px system-ui, sans-serif; margin:0; display:flex; flex-direction:column; align-items:center; gap:12px; padding:20px; }
+  canvas { image-rendering: pixelated; width:720px; height:480px; background:#000; border:1px solid #333; }
+  .row { display:flex; gap:12px; align-items:center; }
+  .keys { color:#888; font-size:12px; max-width:720px; text-align:center; }
+  code { color:#9cf; }
+</style>
+</head>
+<body>
+  <h2>gba-core — Rust → wasm</h2>
+  <div class="row">
+    <input type="file" id="rom" accept=".gba,.bin" />
+    <span id="status">pick a .gba ROM</span>
+  </div>
+  <canvas id="screen" width="240" height="160"></canvas>
+  <div class="row">
+    <label><input type="checkbox" id="mute" /> mute</label>
+    <label>vol <input type="range" id="vol" min="0" max="1" step="0.05" value="0.5" /></label>
+  </div>
+  <div class="row">
+    <button id="qsave" disabled>Quick Save</button>
+    <button id="qload" disabled>Quick Load</button>
+    <button id="dlstate" disabled>⤓ state file</button>
+    <button id="ulstate" disabled>⤒ state file</button>
+    <input type="file" id="statefile" accept=".gbastate" style="display:none" />
+    <span id="savestatus" style="color:#888;font-size:12px"></span>
+  </div>
+  <div class="keys">
+    Keys: <code>Z</code>=A <code>X</code>=B <code>↵</code>=Start <code>⇧</code>=Select
+    <code>←↑→↓</code>=D-pad <code>A</code>=L <code>S</code>=R
+  </div>
+
+<script type="module">
+import init, { WasmGba } from '../pkg/gba_core.js';
+
+// Keypad bit layout (keypad::Key): A=0 B=1 Select=2 Start=3 Right=4 Left=5 Up=6 Down=7 R=8 L=9
+const KEY = { a:0, b:1, select:2, start:3, right:4, left:5, up:6, down:7, r:8, l:9 };
+const MAP = {
+  KeyZ:'a', KeyX:'b', Enter:'start', ShiftRight:'select', ShiftLeft:'select',
+  ArrowRight:'right', ArrowLeft:'left', ArrowUp:'up', ArrowDown:'down', KeyA:'l', KeyS:'r',
+};
+let keyBits = 0;
+function setBit(name, on) {
+  const b = 1 << KEY[name];
+  keyBits = on ? (keyBits | b) : (keyBits & ~b);
+}
+addEventListener('keydown', e => { const n = MAP[e.code]; if (n) { setBit(n, true); e.preventDefault(); } });
+addEventListener('keyup',   e => { const n = MAP[e.code]; if (n) { setBit(n, false); e.preventDefault(); } });
+
+const status = document.getElementById('status');
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const img = ctx.createImageData(240, 160);
+
+// --- Audio-clocked timing.
+//
+// The GBA emits interleaved-stereo f32 at 32768 Hz; one emulated frame yields
+// ~548 stereo samples, so running frames fast enough to drain 32768 samples/s
+// IS running at the correct ~59.73 fps. We therefore pace emulation off the
+// AudioContext's hardware clock — the only stable real-time reference — rather
+// than requestAnimationFrame (which fires at the *display* refresh rate, so a
+// 120/144 Hz monitor would otherwise run the game 2-2.4x too fast and queue
+// audio ever further ahead). Each tick we run frames only until ~TARGET_LEAD
+// seconds of audio are queued ahead of the play cursor, then present the
+// latest framebuffer. Mute is gain=0 (NOT skipping audio) so pacing holds.
+const GBA_RATE = 32768;
+const TARGET_LEAD = 0.07; // seconds of audio queued ahead (≈ latency)
+const MAX_FRAMES_PER_TICK = 8; // anti-spiral cap (slow machine → underrun, not freeze)
+let audioCtx = null, gain = null, nextTime = 0;
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  gain = audioCtx.createGain();
+  applyVolume();
+  gain.connect(audioCtx.destination);
+}
+function pumpAudio(samples) {
+  if (!audioCtx || samples.length < 2) return;
+  const frames = samples.length >> 1;
+  const buf = audioCtx.createBuffer(2, frames, GBA_RATE);
+  const l = buf.getChannelData(0), r = buf.getChannelData(1);
+  for (let i = 0; i < frames; i++) { l[i] = samples[2 * i]; r[i] = samples[2 * i + 1]; }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gain);
+  const now = audioCtx.currentTime;
+  if (nextTime < now) nextTime = now + 0.02; // re-arm after an underrun
+  src.start(nextTime);
+  nextTime += buf.duration;
+}
+
+const muteBox = document.getElementById('mute');
+const volRange = document.getElementById('vol');
+function applyVolume() { if (gain) gain.gain.value = muteBox.checked ? 0 : parseFloat(volRange.value); }
+volRange.addEventListener('input', applyVolume);
+muteBox.addEventListener('change', applyVolume);
+
+let gba = null;
+let romKey = null;       // localStorage key for this ROM's battery save
+let quickSlot = null;    // in-memory save-state (Quick Save/Load)
+let framesSinceBattery = 0;
+
+await init();
+
+// --- Battery save (cartridge SRAM/Flash/EEPROM) persisted to localStorage,
+// keyed by ROM name+size, base64-encoded. Loaded on ROM open; written back
+// (debounced) whenever the core reports the save chip changed.
+const b64 = {
+  enc: (u8) => btoa(String.fromCharCode(...u8)),
+  dec: (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0)),
+};
+function loadBattery() {
+  if (!romKey) return;
+  const saved = localStorage.getItem(romKey);
+  if (saved) { try { gba.load_save_ram(b64.dec(saved)); } catch {} }
+  gba.clear_save_dirty();
+}
+function persistBattery() {
+  if (!romKey || !gba.save_dirty()) return;
+  const data = gba.save_ram();
+  if (data.length) localStorage.setItem(romKey, b64.enc(data));
+  gba.clear_save_dirty();
+}
+
+const stateBtns = ['qsave', 'qload', 'dlstate', 'ulstate'].map(id => document.getElementById(id));
+const saveStatus = document.getElementById('savestatus');
+
+document.getElementById('rom').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  initAudio();
+  await audioCtx.resume();           // file-pick is a user gesture → unlock audio
+  nextTime = audioCtx.currentTime;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  persistBattery();                  // flush the outgoing game's save first
+  gba = new WasmGba();
+  gba.load_rom(buf);
+  romKey = `gba.sav:${file.name}:${buf.length}`;
+  loadBattery();
+  quickSlot = null;
+  stateBtns.forEach(b => { b.disabled = false; });
+  status.textContent = `running ${file.name} (${buf.length} bytes)`;
+});
+
+// --- Save states (full machine snapshot via the Rust core).
+document.getElementById('qsave').addEventListener('click', () => {
+  if (gba) { quickSlot = gba.save_state(); saveStatus.textContent = `quick-saved (${quickSlot.length} B)`; }
+});
+document.getElementById('qload').addEventListener('click', () => {
+  if (gba && quickSlot) saveStatus.textContent = gba.load_state(quickSlot) ? 'quick-loaded' : 'load failed';
+});
+document.getElementById('dlstate').addEventListener('click', () => {
+  if (!gba) return;
+  const blob = new Blob([gba.save_state()], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (romKey ? romKey.split(':')[1] : 'game') + '.gbastate';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+document.getElementById('ulstate').addEventListener('click', () => document.getElementById('statefile').click());
+document.getElementById('statefile').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (f && gba) {
+    const ok = gba.load_state(new Uint8Array(await f.arrayBuffer()));
+    saveStatus.textContent = ok ? `loaded ${f.name}` : 'load failed (incompatible state)';
+  }
+});
+addEventListener('beforeunload', persistBattery);
+
+function tick() {
+  if (gba && audioCtx) {
+    // Run frames until ~TARGET_LEAD seconds of audio are queued ahead of the
+    // play cursor (audio clock paces emulation → correct speed on any display).
+    let ran = 0;
+    while (nextTime - audioCtx.currentTime < TARGET_LEAD && ran < MAX_FRAMES_PER_TICK) {
+      gba.set_keys(keyBits);
+      gba.run_frame();
+      pumpAudio(gba.drain_audio());
+      ran++;
+    }
+    // Present the latest framebuffer (repeats harmlessly if no frame ran).
+    img.data.set(gba.framebuffer());
+    ctx.putImageData(img, 0, 0);
+    // Persist battery ~once/sec if the save chip changed.
+    if (++framesSinceBattery >= 60) { framesSinceBattery = 0; persistBattery(); }
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
