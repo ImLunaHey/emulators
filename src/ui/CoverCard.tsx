@@ -13,12 +13,14 @@ interface Props {
   rom: RomMeta;
   selectMode: boolean;
   selected: boolean;
+  favorite: boolean;
+  onToggleFavorite: () => void;
   onActivate: () => void;             // cover click → play
   onDetails: () => void;              // title click → details page
   onDelete: (displayName: string) => void;
 }
 
-export function CoverCard({ rom, selectMode, selected, onActivate, onDetails, onDelete }: Props) {
+export function CoverCard({ rom, selectMode, selected, favorite, onToggleFavorite, onActivate, onDetails, onDelete }: Props) {
   const md5Query = useRomMd5(rom.id, rom.md5);
   const metaQuery = useHasheousMeta(md5Query.data);
   const m = metaQuery.data ?? null;
@@ -71,6 +73,16 @@ export function CoverCard({ rom, selectMode, selected, onActivate, onDetails, on
             readOnly
             className="absolute top-1 left-1 w-4 h-4 accent-[#5060a0] pointer-events-none"
           />
+        )}
+        {!selectMode && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleFavorite(); }}
+            className={`absolute top-1 left-1 w-6 h-6 flex items-center justify-center rounded bg-black/60 text-xs transition-opacity ${
+              favorite ? 'text-[var(--color-warn)] opacity-100' : 'text-[#9a9aa6] opacity-0 group-hover:opacity-100 focus:opacity-100 hover:!text-[var(--color-warn)]'
+            }`}
+            title={favorite ? 'Unfavorite' : 'Favorite'}
+            aria-label="Favorite"
+          >{favorite ? '★' : '☆'}</button>
         )}
         {!selectMode && (
           <button

@@ -9,6 +9,7 @@ import { useHasheousMeta } from './hooks/useHasheousMeta';
 import { useRomMutations } from './hooks/useRomMutations';
 import { useCustomCover } from './hooks/useCustomCover';
 import { putCover, deleteCover } from './coverStore';
+import { useFavorites } from './favorites';
 import { useConfirm } from './ConfirmModal';
 import { ErrorBoundary } from './ErrorBoundary';
 
@@ -20,6 +21,7 @@ export function RomDetailsPage() {
   const { data: roms = [], isLoading } = useRomList();
   const { remove } = useRomMutations();
   const confirm = useConfirm();
+  const fav = useFavorites();
 
   const rom = roms.find((r: RomMeta) => r.id === romId) ?? null;
 
@@ -117,7 +119,14 @@ export function RomDetailsPage() {
           </div>
 
           <div className="min-w-0 flex-1">
-            <h1 className="text-lg font-bold leading-tight m-0">{displayName}</h1>
+            <div className="flex items-start gap-2">
+              <h1 className="text-lg font-bold leading-tight m-0 flex-1">{displayName}</h1>
+              <button
+                onClick={() => fav.toggle(rom.id)}
+                className={`btn-icon !text-lg shrink-0 ${fav.has(rom.id) ? '!text-[var(--color-warn)]' : ''}`}
+                title={fav.has(rom.id) ? 'Unfavorite' : 'Favorite'}
+              >{fav.has(rom.id) ? '★' : '☆'}</button>
+            </div>
             <div className="text-xs opacity-50 mt-1">{[rom.code, m?.region, m?.year].filter(Boolean).join(' · ')}</div>
 
             <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 mt-4 text-xs">

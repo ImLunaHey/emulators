@@ -9,6 +9,7 @@ import { ContinueCard } from './ContinueCard';
 import { useRomList } from './hooks/useRomList';
 import { useRomMutations } from './hooks/useRomMutations';
 import { useToast } from './Toast';
+import { useFavorites } from './favorites';
 
 // Pull every .gba member out of a ZIP archive.
 function extractGbaFromZip(zipBytes: Uint8Array): Array<{ filename: string; bytes: Uint8Array }> {
@@ -31,6 +32,7 @@ export function LibraryPage() {
   const { add, remove } = useRomMutations();
   const confirm = useConfirm();
   const toast = useToast();
+  const fav = useFavorites();
 
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -53,12 +55,15 @@ export function LibraryPage() {
           (r.code || '').toLowerCase().includes(q))
       : roms.slice();
     filtered.sort((a: RomMeta, b: RomMeta) => {
+      // Favorites always float to the top, then the chosen order.
+      const fa = fav.has(a.id), fb = fav.has(b.id);
+      if (fa !== fb) return fa ? -1 : 1;
       if (sort === 'name') return (a.title || a.filename).localeCompare(b.title || b.filename);
       if (sort === 'size') return b.size - a.size;
       return (b.addedAt || 0) - (a.addedAt || 0);
     });
     return filtered;
-  }, [roms, query, sort]);
+  }, [roms, query, sort, fav]);
 
   // Most recently opened game (set by the player on load) — surfaced as
   // a "Continue playing" hero when it's still in the library.
@@ -256,6 +261,8 @@ export function LibraryPage() {
                 rom={rom}
                 selectMode={selectMode}
                 selected={selected.has(rom.id)}
+                favorite={fav.has(rom.id)}
+                onToggleFavorite={() => fav.toggle(rom.id)}
                 onActivate={() => selectMode ? toggleSelected(rom.id) : navigate(`/play/${rom.id}`)}
                 onDetails={() => navigate(`/rom/${rom.id}`)}
                 onDelete={(displayName) => onDeleteOne(rom.id, displayName)}
