@@ -8,12 +8,12 @@
     "dev": "vite",
     "dev:portless": "portless gba-recomp vite",
     "build:wasm": "wasm-pack build core --target web --out-dir pkg --release",
-    "build": "npm run build:wasm && tsc && vite build",
+    "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "cargo test --manifest-path core/Cargo.toml",
     "lint": "oxlint src",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "npm run build:wasm && npm run build && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.40.0",

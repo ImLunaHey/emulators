@@ -28,11 +28,10 @@ The browser app talks to it through `src/ui/wasmEmulator.ts`, an adapter that re
 git clone git@github.com:ImLunaHey/gba-recomp.git
 cd gba-recomp
 npm install
-npm run build:wasm   # compile the Rust core → core/pkg (needs Rust + wasm-pack)
 npm run dev
 ```
 
-Building the core needs the [Rust toolchain](https://rustup.rs) (with the `wasm32-unknown-unknown` target) and [`wasm-pack`](https://rustwasm.github.io/wasm-pack/). `npm run build` runs `build:wasm` for you; in dev you build the core once and Vite serves it.
+The compiled wasm core (`core/pkg/`) is committed, so a fresh clone runs and builds without a Rust toolchain. **If you change the Rust core**, rebuild it with `npm run build:wasm` (needs the [Rust toolchain](https://rustup.rs) with the `wasm32-unknown-unknown` target and [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)) and commit the updated `core/pkg/`. `npm run build` / `deploy` consume the committed artifact; `npm run deploy` rebuilds it first.
 
 Open the URL Vite prints. For a stable local URL, `npm run dev:portless` serves `https://gba-recomp.localhost` via [portless](https://www.npmjs.com/package/portless).
 
@@ -107,7 +106,7 @@ core/                  Rust GBA core — a standalone crate, no browser deps
                          implements the memory bus (io.ts routing lives here)
     debug.rs             Introspection surface for the UI debug panel
     wasm.rs              wasm-bindgen surface (WasmGba)
-  pkg/                   wasm-pack output (gitignored; `npm run build:wasm`)
+  pkg/                   wasm-pack output (committed; rebuilt by `npm run build:wasm`)
 
 src/                   React + TypeScript browser app
   ui/                    React UI (LibraryPage, PlayerPage, Screen, Gamepad,
@@ -125,8 +124,8 @@ src/                   React + TypeScript browser app
 ## Build + test
 
 ```bash
-npm run build:wasm  # wasm-pack build core → core/pkg
-npm run build       # build:wasm + tsc + vite build → dist/
+npm run build:wasm  # wasm-pack build core → core/pkg (rebuild after core changes)
+npm run build       # tsc + vite build → dist/ (uses the committed core/pkg)
 npm test            # cargo test (Rust core; 235 vectors)
 npm run lint        # oxlint (UI/TS)
 npm run dev         # Vite dev server
