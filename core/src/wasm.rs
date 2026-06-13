@@ -25,8 +25,24 @@ impl WasmGba {
     }
 
     /// 240×160 RGBA8888 framebuffer (copied into a fresh JS `Uint8Array`).
+    /// Prefer the zero-copy `framebuffer_ptr`/`framebuffer_len` pair on the hot
+    /// present path; this copying variant is kept for callers that want an
+    /// owned buffer.
     pub fn framebuffer(&self) -> Vec<u8> {
         self.inner.framebuffer().to_vec()
+    }
+
+    /// Address of the framebuffer inside wasm linear memory. The host builds a
+    /// `Uint8Array(memory.buffer, ptr, len)` view over it — no per-frame copy.
+    /// Re-read each present: any wasm allocation that grows memory detaches the
+    /// old `memory.buffer`, and a savestate load can re-seat the buffer.
+    pub fn framebuffer_ptr(&self) -> usize {
+        self.inner.framebuffer().as_ptr() as usize
+    }
+
+    /// Length in bytes of the framebuffer view (240×160×4 = 153600).
+    pub fn framebuffer_len(&self) -> usize {
+        self.inner.framebuffer().len()
     }
 
     /// Raw pressed-button bitmask (bit layout per `keypad::Key`).
@@ -104,13 +120,13 @@ impl WasmGba {
     }
     /// Memory-region copies for the palette/tile/sprite/memory debug views.
     pub fn vram(&self) -> Vec<u8> {
-        self.inner.mem.vram.clone()
+        self.inner.mem.vram.to_vec()
     }
     pub fn pram(&self) -> Vec<u8> {
-        self.inner.mem.pram.clone()
+        self.inner.mem.pram.to_vec()
     }
     pub fn oam(&self) -> Vec<u8> {
-        self.inner.mem.oam.clone()
+        self.inner.mem.oam.to_vec()
     }
 
     // ---- SIO trace (LinkPanel's SioTracer) ----

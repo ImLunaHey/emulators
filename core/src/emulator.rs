@@ -213,6 +213,11 @@ impl Gba {
     // ---- the frame loop (ported from emulator.ts runFrame, interpreter-only) ----
     pub fn run_frame(&mut self) {
         self.keypad.tick_turbo();
+        // Take the CPU out once for the whole frame so `self` can serve as its
+        // bus inside the batch loop. Nothing reachable between batches (PPU /
+        // timers / DMA / SIO / cheats) touches `self.cpu`, so a single
+        // take/restore replaces the per-batch swap (~4400 struct copies/frame).
+        let mut cpu = std::mem::take(&mut self.cpu);
         let mut executed: u32 = 0;
         while executed < CYCLES_PER_FRAME {
             let line_remaining = CYC_PER_LINE - self.ppu.cycles_accum as i64;
@@ -226,8 +231,7 @@ impl Gba {
             }
             let batch = batch as u32;
 
-            // --- CPU batch. Take the CPU out so `self` can serve as its bus.
-            let mut cpu = std::mem::take(&mut self.cpu);
+            // --- CPU batch. `cpu` is the frame-scoped local; `self` is its bus.
             let mut i: u32 = 0;
             while i < batch {
                 cpu.irq_line = self.irq.cached_pending;
@@ -244,7 +248,6 @@ impl Gba {
                     break;
                 }
             }
-            self.cpu = cpu;
 
             // --- Advance the rest by the cycles we ran (`i`).
             let tick = Ppu::step(&mut self.ppu, i, &mut self.mem, &mut self.irq);
@@ -272,6 +275,8 @@ impl Gba {
                 break;
             }
         }
+        // Restore the frame-scoped CPU before any post-frame work that reads it.
+        self.cpu = cpu;
 
         // BIOS IntrCheck flag: set bit 0 of *(u16*)0x03007FF8 each VBlank.
         self.mem.iwram[0x7FF8] |= 0x01;

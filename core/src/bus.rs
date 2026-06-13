@@ -63,14 +63,66 @@ fn wr32(b: &mut [u8], off: usize, v: u32) {
     b[off + 3] = ((v >> 24) & 0xFF) as u8;
 }
 
+/// Heap-allocate a zeroed fixed-size region without ever placing `N` bytes on
+/// the stack (`Box::new([0; N])` would, and EWRAM is 256 KB).
+#[inline]
+fn boxed_region<const N: usize>() -> Box<[u8; N]> {
+    vec![0u8; N].into_boxed_slice().try_into().unwrap()
+}
+
+// ---- const-generic, power-of-2-masked accessors for the fixed RAM regions ----
+// Masking against the compile-time `N - 1` (a power of two) at the same site as
+// the index lets LLVM prove the access is in-bounds and drop the bounds check.
+// The redundant `& !1` / `& !3` re-assert alignment so `i + 1` / `i + 3` are
+// also provably in range.
+#[inline]
+fn a_rd8<const N: usize>(a: &[u8; N], addr: u32) -> u32 {
+    a[(addr as usize) & (N - 1)] as u32
+}
+#[inline]
+fn a_rd16<const N: usize>(a: &[u8; N], addr: u32) -> u32 {
+    let i = (addr as usize) & (N - 1) & !1;
+    (a[i] as u32) | ((a[i + 1] as u32) << 8)
+}
+#[inline]
+fn a_rd32<const N: usize>(a: &[u8; N], addr: u32) -> u32 {
+    let i = (addr as usize) & (N - 1) & !3;
+    (a[i] as u32)
+        | ((a[i + 1] as u32) << 8)
+        | ((a[i + 2] as u32) << 16)
+        | ((a[i + 3] as u32) << 24)
+}
+#[inline]
+fn a_wr8<const N: usize>(a: &mut [u8; N], addr: u32, v: u8) {
+    a[(addr as usize) & (N - 1)] = v;
+}
+#[inline]
+fn a_wr16<const N: usize>(a: &mut [u8; N], addr: u32, v: u32) {
+    let i = (addr as usize) & (N - 1) & !1;
+    a[i] = (v & 0xFF) as u8;
+    a[i + 1] = ((v >> 8) & 0xFF) as u8;
+}
+#[inline]
+fn a_wr32<const N: usize>(a: &mut [u8; N], addr: u32, v: u32) {
+    let i = (addr as usize) & (N - 1) & !3;
+    a[i] = (v & 0xFF) as u8;
+    a[i + 1] = ((v >> 8) & 0xFF) as u8;
+    a[i + 2] = ((v >> 16) & 0xFF) as u8;
+    a[i + 3] = ((v >> 24) & 0xFF) as u8;
+}
+
 /// Raw memory regions + ROM. Owns no IO devices (see module docs).
 pub struct Mem {
-    pub bios: Vec<u8>,
-    pub ewram: Vec<u8>,
-    pub iwram: Vec<u8>,
-    pub pram: Vec<u8>,
-    pub vram: Vec<u8>,
-    pub oam: Vec<u8>,
+    // Fixed-size regions live in boxed power-of-2 arrays so the masked accessors
+    // (`a_rd*` / `a_wr*`) compile without bounds checks. VRAM (96 KB) is boxed
+    // too for consistency but is indexed via `vram_off`'s fold, so it keeps the
+    // slice-based helpers. ROM stays a `Vec` (variable cart size).
+    pub bios: Box<[u8; R::BIOS_SIZE]>,
+    pub ewram: Box<[u8; R::EWRAM_SIZE]>,
+    pub iwram: Box<[u8; R::IWRAM_SIZE]>,
+    pub pram: Box<[u8; R::PRAM_SIZE]>,
+    pub vram: Box<[u8; R::VRAM_SIZE]>,
+    pub oam: Box<[u8; R::OAM_SIZE]>,
     pub rom: Vec<u8>,
     /// (size - 1) for power-of-2 ROMs, else 0 (modulo fallback).
     pub rom_mask: u32,
@@ -87,12 +139,12 @@ impl Default for Mem {
 impl Mem {
     pub fn new() -> Self {
         Mem {
-            bios: vec![0; R::BIOS_SIZE],
-            ewram: vec![0; R::EWRAM_SIZE],
-            iwram: vec![0; R::IWRAM_SIZE],
-            pram: vec![0; R::PRAM_SIZE],
-            vram: vec![0; R::VRAM_SIZE],
-            oam: vec![0; R::OAM_SIZE],
+            bios: boxed_region(),
+            ewram: boxed_region(),
+            iwram: boxed_region(),
+            pram: boxed_region(),
+            vram: boxed_region(),
+            oam: boxed_region(),
             rom: Vec::new(),
             rom_mask: 0,
             bios_open_bus: 0xE129_F000,
@@ -144,11 +196,11 @@ impl Mem {
                     0
                 }
             }
-            R::REGION_EWRAM => self.ewram[(addr as usize) & (R::EWRAM_SIZE - 1)] as u32,
-            R::REGION_IWRAM => self.iwram[(addr as usize) & (R::IWRAM_SIZE - 1)] as u32,
-            R::REGION_PRAM => self.pram[(addr as usize) & (R::PRAM_SIZE - 1)] as u32,
+            R::REGION_EWRAM => a_rd8(&self.ewram, addr),
+            R::REGION_IWRAM => a_rd8(&self.iwram, addr),
+            R::REGION_PRAM => a_rd8(&self.pram, addr),
             R::REGION_VRAM => self.vram[self.vram_off(addr)] as u32,
-            R::REGION_OAM => self.oam[(addr as usize) & (R::OAM_SIZE - 1)] as u32,
+            R::REGION_OAM => a_rd8(&self.oam, addr),
             R::REGION_ROM_0..=R::REGION_ROM_5 => {
                 let off = self.rom_off(addr);
                 if off < self.rom.len() {
@@ -167,16 +219,16 @@ impl Mem {
         match region {
             R::REGION_BIOS => {
                 if (addr as usize) < R::BIOS_SIZE {
-                    rd16(&self.bios, addr as usize)
+                    rd16(&self.bios[..], addr as usize)
                 } else {
                     0
                 }
             }
-            R::REGION_EWRAM => rd16(&self.ewram, (addr as usize) & (R::EWRAM_SIZE - 1)),
-            R::REGION_IWRAM => rd16(&self.iwram, (addr as usize) & (R::IWRAM_SIZE - 1)),
-            R::REGION_PRAM => rd16(&self.pram, (addr as usize) & (R::PRAM_SIZE - 1)),
-            R::REGION_VRAM => rd16(&self.vram, self.vram_off(addr)),
-            R::REGION_OAM => rd16(&self.oam, (addr as usize) & (R::OAM_SIZE - 1)),
+            R::REGION_EWRAM => a_rd16(&self.ewram, addr),
+            R::REGION_IWRAM => a_rd16(&self.iwram, addr),
+            R::REGION_PRAM => a_rd16(&self.pram, addr),
+            R::REGION_VRAM => rd16(&self.vram[..], self.vram_off(addr)),
+            R::REGION_OAM => a_rd16(&self.oam, addr),
             R::REGION_ROM_0..=R::REGION_ROM_5 => {
                 let off = self.rom_off(addr);
                 if off + 1 < self.rom.len() {
@@ -195,16 +247,16 @@ impl Mem {
         match region {
             R::REGION_BIOS => {
                 if (addr as usize) < R::BIOS_SIZE {
-                    rd32(&self.bios, addr as usize)
+                    rd32(&self.bios[..], addr as usize)
                 } else {
                     self.bios_open_bus
                 }
             }
-            R::REGION_EWRAM => rd32(&self.ewram, (addr as usize) & (R::EWRAM_SIZE - 1)),
-            R::REGION_IWRAM => rd32(&self.iwram, (addr as usize) & (R::IWRAM_SIZE - 1)),
-            R::REGION_PRAM => rd32(&self.pram, (addr as usize) & (R::PRAM_SIZE - 1)),
-            R::REGION_VRAM => rd32(&self.vram, self.vram_off(addr)),
-            R::REGION_OAM => rd32(&self.oam, (addr as usize) & (R::OAM_SIZE - 1)),
+            R::REGION_EWRAM => a_rd32(&self.ewram, addr),
+            R::REGION_IWRAM => a_rd32(&self.iwram, addr),
+            R::REGION_PRAM => a_rd32(&self.pram, addr),
+            R::REGION_VRAM => rd32(&self.vram[..], self.vram_off(addr)),
+            R::REGION_OAM => a_rd32(&self.oam, addr),
             R::REGION_ROM_0..=R::REGION_ROM_5 => {
                 let off = self.rom_off(addr);
                 if off + 3 < self.rom.len() {
@@ -222,8 +274,8 @@ impl Mem {
         let v = (v & 0xFF) as u8;
         let region = (addr >> 24) & 0xF;
         match region {
-            R::REGION_EWRAM => self.ewram[(addr as usize) & (R::EWRAM_SIZE - 1)] = v,
-            R::REGION_IWRAM => self.iwram[(addr as usize) & (R::IWRAM_SIZE - 1)] = v,
+            R::REGION_EWRAM => a_wr8(&mut self.ewram, addr, v),
+            R::REGION_IWRAM => a_wr8(&mut self.iwram, addr, v),
             R::REGION_PRAM => {
                 // 8-bit writes to PRAM/VRAM/OAM broadcast to a halfword.
                 let off = (addr as usize) & (R::PRAM_SIZE - 2);
@@ -249,14 +301,14 @@ impl Mem {
         let v = v & 0xFFFF;
         let region = (addr >> 24) & 0xF;
         match region {
-            R::REGION_EWRAM => wr16(&mut self.ewram, (addr as usize) & (R::EWRAM_SIZE - 1), v),
-            R::REGION_IWRAM => wr16(&mut self.iwram, (addr as usize) & (R::IWRAM_SIZE - 1), v),
-            R::REGION_PRAM => wr16(&mut self.pram, (addr as usize) & (R::PRAM_SIZE - 1), v),
+            R::REGION_EWRAM => a_wr16(&mut self.ewram, addr, v),
+            R::REGION_IWRAM => a_wr16(&mut self.iwram, addr, v),
+            R::REGION_PRAM => a_wr16(&mut self.pram, addr, v),
             R::REGION_VRAM => {
                 let off = self.vram_off(addr);
-                wr16(&mut self.vram, off, v);
+                wr16(&mut self.vram[..], off, v);
             }
-            R::REGION_OAM => wr16(&mut self.oam, (addr as usize) & (R::OAM_SIZE - 1), v),
+            R::REGION_OAM => a_wr16(&mut self.oam, addr, v),
             _ => {}
         }
     }
@@ -265,14 +317,14 @@ impl Mem {
         let addr = addr & !3;
         let region = (addr >> 24) & 0xF;
         match region {
-            R::REGION_EWRAM => wr32(&mut self.ewram, (addr as usize) & (R::EWRAM_SIZE - 1), v),
-            R::REGION_IWRAM => wr32(&mut self.iwram, (addr as usize) & (R::IWRAM_SIZE - 1), v),
-            R::REGION_PRAM => wr32(&mut self.pram, (addr as usize) & (R::PRAM_SIZE - 1), v),
+            R::REGION_EWRAM => a_wr32(&mut self.ewram, addr, v),
+            R::REGION_IWRAM => a_wr32(&mut self.iwram, addr, v),
+            R::REGION_PRAM => a_wr32(&mut self.pram, addr, v),
             R::REGION_VRAM => {
                 let off = self.vram_off(addr);
-                wr32(&mut self.vram, off, v);
+                wr32(&mut self.vram[..], off, v);
             }
-            R::REGION_OAM => wr32(&mut self.oam, (addr as usize) & (R::OAM_SIZE - 1), v),
+            R::REGION_OAM => a_wr32(&mut self.oam, addr, v),
             _ => {}
         }
     }

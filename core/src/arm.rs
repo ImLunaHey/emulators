@@ -38,7 +38,7 @@ fn sbc_set_flags(s: &mut CpuState, a: u32, b: u32, c_in: u32) -> u32 {
     r
 }
 
-pub fn arm_execute(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+pub fn arm_execute<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let cond = (instr >> 28) & 0xF;
     if cond != 0xE && !cpu.state.check_cond(cond) {
         return;
@@ -358,7 +358,7 @@ fn apply_msr(s: &mut CpuState, is_spsr: bool, instr: u32, val: u32) {
 }
 
 // ---------------------------------------------------------------- single transfer LDR/STR
-fn arm_single_transfer(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+fn arm_single_transfer<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let i_bit = (instr & 0x02000000) != 0;
     let p = (instr & 0x01000000) != 0;
     let u = (instr & 0x00800000) != 0;
@@ -426,7 +426,7 @@ fn arm_single_transfer(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
 }
 
 // ---------------------------------------------------------------- halfword / signed transfer
-fn arm_half_transfer(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+fn arm_half_transfer<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let p = (instr & 0x01000000) != 0;
     let u = (instr & 0x00800000) != 0;
     let i_bit = (instr & 0x00400000) != 0; // immediate offset variant
@@ -556,7 +556,7 @@ fn arm_multiply(cpu: &mut Cpu, instr: u32) {
     }
 }
 
-fn arm_swap(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+fn arm_swap<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let b = (instr & 0x00400000) != 0;
     let rn = ((instr >> 16) & 0xF) as usize;
     let rd = ((instr >> 12) & 0xF) as usize;
@@ -580,7 +580,7 @@ fn arm_swap(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
 }
 
 // ---------------------------------------------------------------- block transfer LDM/STM
-fn arm_block_transfer(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+fn arm_block_transfer<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let p = (instr & 0x01000000) != 0;
     let u = (instr & 0x00800000) != 0;
     let s_bit = (instr & 0x00400000) != 0;

@@ -13,6 +13,10 @@ coverage
 
 # rust core
 core/target
+# rust mobile FFI crate (native libs / xcframework build output)
+core-ffi/target
+core-ffi/build
+core-ffi/Cargo.lock
 **/*.rs.bk
 
 # wrangler files

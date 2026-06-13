@@ -274,7 +274,7 @@ impl Ppu {
             return;
         }
         // Backdrop from PRAM index 0.
-        let backdrop = pram16(&mem.pram, 0) & 0x7FFF;
+        let backdrop = pram16(&mem.pram[..], 0) & 0x7FFF;
         let mode = self.dispcnt & 0x7;
 
         // Reset BG layer outputs (mark transparent).
@@ -375,8 +375,8 @@ impl Ppu {
         let y_eff = ((if mosaic_on { y - (y % mos_bg_v) } else { y }) + vofs) & (map_h - 1);
 
         let layer_hi = ((bg as u32) << 16) | (priority << 18);
-        let vram = &mem.vram;
-        let pram = &mem.pram;
+        let vram: &[u8] = &mem.vram[..];
+        let pram: &[u8] = &mem.pram[..];
 
         for x in 0u32..240 {
             let x_mos = if mosaic_on { x - (x % mos_bg_h) } else { x };
@@ -494,8 +494,8 @@ impl Ppu {
         let ref_y = self.bg_y[ref_idx];
 
         let layer_hi = ((bg as u32) << 16) | (priority << 18);
-        let vram = &mem.vram;
-        let pram = &mem.pram;
+        let vram: &[u8] = &mem.vram[..];
+        let pram: &[u8] = &mem.pram[..];
 
         // Compute starting source coords. Reference is 8.8 fixed-point signed.
         // src_x(0) = refX + 0*pA + y*pB
@@ -563,7 +563,7 @@ impl Ppu {
         if sx < 0 || sx >= 240 || sy < 0 || sy >= 160 {
             return 0x8000;
         }
-        (rd16(&mem.vram, ((sy * 240 + sx) as usize) * 2) & 0x7FFF) | layer_hi
+        (rd16(&mem.vram[..],((sy * 240 + sx) as usize) * 2) & 0x7FFF) | layer_hi
     }
 
     // Mode 4: 240x160 paletted, double-buffered.
@@ -576,7 +576,7 @@ impl Ppu {
         if idx == 0 {
             return 0x8000;
         }
-        (pram16(&mem.pram, idx as usize) & 0x7FFF) | layer_hi
+        (pram16(&mem.pram[..], idx as usize) & 0x7FFF) | layer_hi
     }
 
     // Mode 5: 160x128 BGR555 direct, double-buffered.
@@ -586,7 +586,7 @@ impl Ppu {
         }
         let page: i32 = if self.dispcnt & 0x10 != 0 { 0x5000 } else { 0x0000 };
         // TS indexes vram16 at (page>>>1) + sy*160 + sx → byte offset *2.
-        (rd16(&mem.vram, (((page >> 1) + sy * 160 + sx) as usize) * 2) & 0x7FFF) | layer_hi
+        (rd16(&mem.vram[..],(((page >> 1) + sy * 160 + sx) as usize) * 2) & 0x7FFF) | layer_hi
     }
 
     fn render_bitmap_affine(&mut self, y: u32, mem: &Mem, sampler: u8) {
@@ -635,9 +635,9 @@ impl Ppu {
         const SIZE_H: [[i32; 4]; 3] =
             [[8, 16, 32, 64], [8, 8, 16, 32], [16, 32, 32, 64]];
 
-        let oam = &mem.oam;
-        let vram = &mem.vram;
-        let pram = &mem.pram;
+        let oam: &[u8] = &mem.oam[..];
+        let vram: &[u8] = &mem.vram[..];
+        let pram: &[u8] = &mem.pram[..];
         let obj_mapping_linear = (self.dispcnt & 0x40) != 0;
 
         let y = y as i32;
@@ -1216,7 +1216,7 @@ mod tests {
         fill_tile4bpp_bg(&mut mem, 0, 1);
         mem.vram[0x800] = 0;
         mem.vram[0x801] = 0;
-        put16(&mut mem.pram, 1, 0x7FFF); // BG palette entry 1 = white
+        put16(&mut mem.pram[..], 1, 0x7FFF); // BG palette entry 1 = white
 
         ppu.render_mode_text(0, 0, &mem);
 
@@ -1236,8 +1236,8 @@ mod tests {
             mem.vram[row * 4 + 2] = 0x22;
             mem.vram[row * 4 + 3] = 0x22;
         }
-        put16(&mut mem.pram, 1, 0x7C00); // blue
-        put16(&mut mem.pram, 2, 0x03E0); // green
+        put16(&mut mem.pram[..], 1, 0x7C00); // blue
+        put16(&mut mem.pram[..], 2, 0x03E0); // green
         // Map entry: tile 0, hflip=1 (bit 10 → byte1 bit 2 = 0x04).
         mem.vram[0x800] = 0;
         mem.vram[0x801] = 0x04;
@@ -1254,8 +1254,8 @@ mod tests {
         ppu.bg_hofs[0] = 4;
         fill_tile4bpp_bg(&mut mem, 0, 1);
         fill_tile4bpp_bg(&mut mem, 1, 2);
-        put16(&mut mem.pram, 1, 0x7C00);
-        put16(&mut mem.pram, 2, 0x03E0);
+        put16(&mut mem.pram[..], 1, 0x7C00);
+        put16(&mut mem.pram[..], 2, 0x03E0);
         mem.vram[0x800] = 0;
         mem.vram[0x801] = 0;
         mem.vram[0x802] = 1;
@@ -1276,7 +1276,7 @@ mod tests {
         mem.vram[0x800 + 64] = 5;
         mem.vram[0x800 + 65] = 0;
         fill_tile4bpp_bg(&mut mem, 5, 3);
-        put16(&mut mem.pram, 3, 0x7FFF);
+        put16(&mut mem.pram[..], 3, 0x7FFF);
         ppu.render_mode_text(0, 0, &mem);
         assert_eq!(ppu.bg_line[0][0] & 0x7FFF, 0x7FFF);
     }
@@ -1286,8 +1286,8 @@ mod tests {
         let (mut ppu, mut mem) = fresh();
         ppu.bgcnt[0] = 1 << 8;
         fill_tile4bpp_bg(&mut mem, 0, 1);
-        put16(&mut mem.pram, 1, 0x001F); // bank 0 entry 1 = red
-        put16(&mut mem.pram, 3 * 16 + 1, 0x7C00); // bank 3 entry 1 = blue
+        put16(&mut mem.pram[..], 1, 0x001F); // bank 0 entry 1 = red
+        put16(&mut mem.pram[..], 3 * 16 + 1, 0x7C00); // bank 3 entry 1 = blue
         // Map entry: tile 0, pal bank 3 (high nibble of byte1 = 0x30).
         mem.vram[0x800] = 0;
         mem.vram[0x801] = 0x30;
@@ -1301,7 +1301,7 @@ mod tests {
     fn bitmap4_renders_palette_indexed() {
         let (mut ppu, mut mem) = fresh();
         set_bitmap_identity(&mut ppu);
-        put16(&mut mem.pram, 5, 0x03E0); // green
+        put16(&mut mem.pram[..], 5, 0x03E0); // green
         ppu.dispcnt = 0;
         mem.vram[30 * 240 + 10] = 5;
         ppu.render_mode_bitmap4(30, &mem);
@@ -1312,7 +1312,7 @@ mod tests {
     fn bitmap4_page_select() {
         let (mut ppu, mut mem) = fresh();
         set_bitmap_identity(&mut ppu);
-        put16(&mut mem.pram, 7, 0x7C00); // blue
+        put16(&mut mem.pram[..], 7, 0x7C00); // blue
         ppu.dispcnt = 0x10; // page 1 active
         mem.vram[0xA000 + 50 * 240 + 5] = 7;
         ppu.render_mode_bitmap4(50, &mem);
@@ -1325,7 +1325,7 @@ mod tests {
         let (mut ppu, mut mem) = fresh();
         set_bitmap_identity(&mut ppu);
         ppu.bg_pa[0] = 0x80;
-        put16(&mut mem.pram, 3, 0x7C00);
+        put16(&mut mem.pram[..], 3, 0x7C00);
         mem.vram[30 * 240 + 5] = 3;
         ppu.render_mode_bitmap4(30, &mem);
         assert_eq!(ppu.bg_line[2][10] & 0x7FFF, 0x7C00);
@@ -1360,7 +1360,7 @@ mod tests {
     fn sprite_16x16_contiguous() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..4 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
@@ -1377,7 +1377,7 @@ mod tests {
     fn sprite_32x32_no_gaps() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..16 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
@@ -1392,7 +1392,7 @@ mod tests {
     fn sprite_32x32_8bpp_contiguous() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         // 8bpp: every byte = pixel value 1; 16 tiles = 32 4bpp slots.
         for t in 0..32 {
             let base = 0x10000 + t * 32;
@@ -1411,8 +1411,8 @@ mod tests {
     fn sprite_hflip_mirrors() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7C00); // red (pix 1)
-        put16(&mut mem.pram, 256 + 2, 0x03E0); // green (pix 2)
+        put16(&mut mem.pram[..], 256 + 1, 0x7C00); // red (pix 1)
+        put16(&mut mem.pram[..], 256 + 2, 0x03E0); // green (pix 2)
         // 8x8 tile: left half = 1, right half = 2.
         let base = 0x10000;
         for row in 0..8 {
@@ -1436,15 +1436,15 @@ mod tests {
     fn sprite_affine_identity_matches_nonaffine() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..4 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
         // Identity matrix 0 (pA=pD=0x100).
-        put16(&mut mem.oam, 0 * 4 + 3, 0x0100);
-        put16(&mut mem.oam, 1 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 2 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 3 * 4 + 3, 0x0100);
+        put16(&mut mem.oam[..], 0 * 4 + 3, 0x0100);
+        put16(&mut mem.oam[..], 1 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 2 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 3 * 4 + 3, 0x0100);
         set_oam(&mut mem, 0, 0x0132, 0x400A, 0x0000);
         render_sprites_at(&mut ppu, &mem, 58);
         for x in 10..26 {
@@ -1456,14 +1456,14 @@ mod tests {
     fn sprite_affine_double_size_full() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..4 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
-        put16(&mut mem.oam, 0 * 4 + 3, 0x0100);
-        put16(&mut mem.oam, 1 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 2 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 3 * 4 + 3, 0x0100);
+        put16(&mut mem.oam[..], 0 * 4 + 3, 0x0100);
+        put16(&mut mem.oam[..], 1 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 2 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 3 * 4 + 3, 0x0100);
         set_oam(&mut mem, 0, 0x0332, 0x400A, 0x0000); // double-size affine
         render_sprites_at(&mut ppu, &mem, 66);
         // Center 16 px opaque; corners sample outside → transparent.
@@ -1478,15 +1478,15 @@ mod tests {
     fn sprite_affine_2x_scale() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..4 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
         // pA=pD=0x80 → 2x zoom.
-        put16(&mut mem.oam, 0 * 4 + 3, 0x0080);
-        put16(&mut mem.oam, 1 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 2 * 4 + 3, 0x0000);
-        put16(&mut mem.oam, 3 * 4 + 3, 0x0080);
+        put16(&mut mem.oam[..], 0 * 4 + 3, 0x0080);
+        put16(&mut mem.oam[..], 1 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 2 * 4 + 3, 0x0000);
+        put16(&mut mem.oam[..], 3 * 4 + 3, 0x0080);
         set_oam(&mut mem, 0, 0x0332, 0x400A, 0x0000);
         render_sprites_at(&mut ppu, &mem, 66);
         let mut count = 0;
@@ -1502,7 +1502,7 @@ mod tests {
     fn sprite_64x64() {
         let (mut ppu, mut mem) = fresh();
         ppu.dispcnt = 0x40;
-        put16(&mut mem.pram, 256 + 1, 0x7FFF);
+        put16(&mut mem.pram[..], 256 + 1, 0x7FFF);
         for t in 0..64 {
             fill_tile4bpp_obj(&mut mem, t, 1);
         }
@@ -1568,7 +1568,7 @@ mod tests {
     #[test]
     fn comp_transparent_bg_falls_to_backdrop() {
         let (mut ppu, mut mem) = fresh();
-        put16(&mut mem.pram, 0, WHITE as u16);
+        put16(&mut mem.pram[..], 0, WHITE as u16);
         ppu.composite_scanline(0, WHITE, &mem);
         let (r, g, b) = pixel_at(&ppu, 50, 0);
         assert!(r > 240 && g > 240 && b > 240);
@@ -1667,7 +1667,7 @@ mod tests {
         ppu.win0_v = 160; // y [0,160)
         ppu.win_in = 0x01;
         ppu.win_out = 0x00;
-        put16(&mut mem.pram, 0, WHITE as u16);
+        put16(&mut mem.pram[..], 0, WHITE as u16);
         ppu.composite_scanline(10, WHITE, &mem);
         let inside = pixel_at(&ppu, 75, 10);
         assert!(inside.0 > 240 && inside.1 < 20);
@@ -1686,7 +1686,7 @@ mod tests {
         ppu.win0_v = (50 << 8) | 100; // y [50,100)
         ppu.win_in = 0x01;
         ppu.win_out = 0x00;
-        put16(&mut mem.pram, 0, WHITE as u16);
+        put16(&mut mem.pram[..], 0, WHITE as u16);
         ppu.composite_scanline(75, WHITE, &mem);
         assert!(pixel_at(&ppu, 100, 75).0 > 240);
         ppu.composite_scanline(110, WHITE, &mem);
@@ -1707,7 +1707,7 @@ mod tests {
         ppu.win1_v = 160;
         ppu.win_in = 0x01; // WIN0 allows BG0, WIN1 allows nothing
         ppu.win_out = 0x00;
-        put16(&mut mem.pram, 0, WHITE as u16);
+        put16(&mut mem.pram[..], 0, WHITE as u16);
         ppu.composite_scanline(10, WHITE, &mem);
         // x=45 in both → WIN0 wins, BG0 visible (red).
         let a = pixel_at(&ppu, 45, 10);
@@ -1766,7 +1766,7 @@ mod tests {
             (2 * 240 + 30, 0x7C00),      // (30,2) blue
         ];
         for &(idx, color) in &pixels {
-            put16(&mut g.mem.vram, idx, color as u16);
+            put16(&mut g.mem.vram[..], idx, color as u16);
         }
         g.run_frame();
         let fb = g.framebuffer();
@@ -1799,7 +1799,7 @@ mod tests {
         g.mem.vram[0x800] = 0;
         g.mem.vram[0x801] = 0;
         // BG palette entry 1 = green.
-        put16(&mut g.mem.pram, 1, 0x03E0);
+        put16(&mut g.mem.pram[..], 1, 0x03E0);
         g.run_frame();
         let fb = g.framebuffer();
         let (er, eg, eb) = rgb(0x03E0);

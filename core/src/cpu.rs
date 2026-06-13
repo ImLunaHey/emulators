@@ -70,7 +70,7 @@ impl Cpu {
     // Without this, halted CPUs that get IRQ'd land in zero-filled BIOS and
     // wander off into open bus.
     fn install_bios_stub(&mut self, mem: &mut Mem) {
-        let bios = &mut mem.bios;
+        let bios: &mut [u8] = &mut mem.bios[..];
         let wr32 = |bios: &mut [u8], off: usize, v: u32| {
             bios[off] = (v & 0xFF) as u8;
             bios[off + 1] = ((v >> 8) & 0xFF) as u8;
@@ -128,7 +128,7 @@ impl Cpu {
     // Single dispatch — fetch from r[15] (= next decode addr), temporarily
     // raise r[15] to the architectural visible PC for execute, then advance
     // to the next decode address if execute didn't branch.
-    pub fn step(&mut self, bus: &mut dyn Bus) -> u32 {
+    pub fn step<B: Bus + ?Sized>(&mut self, bus: &mut B) -> u32 {
         if self.state.halted {
             if self.irq_line && (self.state.cpsr & FLAG_I) == 0 {
                 self.state.halted = false;
@@ -173,7 +173,7 @@ impl Cpu {
     // Trigger exception entry — called from arm/thumb dispatch.
     // NOTE(orchestrator): BIOS HLE SWI interception is applied by Gba before
     // this real-exception fallback.
-    pub fn software_interrupt(&mut self, comment: u32, bus: &mut dyn Bus) {
+    pub fn software_interrupt<B: Bus + ?Sized>(&mut self, comment: u32, bus: &mut B) {
         // BIOS HLE first: the orchestrator's `Gba` overrides `try_hle_swi` to
         // service the SWI in high-level emulation. If handled, no real
         // exception is taken (matches TS `if (bios.handleSwi(c)) return`).
@@ -194,7 +194,7 @@ impl Cpu {
     // Take an IRQ exception. r[15] at entry is the next decode address.
     // BIOS uses SUBS PC, LR, #4 to return, so LR = next_decode + 4 lands
     // PC back at next_decode after restore.
-    pub fn take_irq(&mut self, bus: &mut dyn Bus) {
+    pub fn take_irq<B: Bus + ?Sized>(&mut self, bus: &mut B) {
         let _ = bus;
         let ret = self.state.r[15].wrapping_add(4);
         self.state.enter_exception(mode::IRQ, 0x18, ret, false);

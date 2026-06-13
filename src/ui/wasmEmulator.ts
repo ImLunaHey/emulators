@@ -93,6 +93,8 @@ interface WasmCore {
   applyTurbo(mask: number): void;
   /** Shared zeroed framebuffer handed out before the core is ready. */
   readonly zeroFb: Uint8Array;
+  /** Zero-copy view over the wasm framebuffer (zeroFb until ready). */
+  frameView(): Uint8Array;
 }
 
 // ---------------------------------------------------------------- facets
@@ -122,7 +124,7 @@ class WasmPpu {
   // frameDone: plain mailbox flag for the host frame-step paths.
   frameDone = false;
   constructor(private core: WasmCore) {}
-  get frame(): Uint8Array { return this.core.gba ? this.core.gba.framebuffer() : this.core.zeroFb; }
+  get frame(): Uint8Array { return this.core.frameView(); }
   get dispcnt(): number { return this.core.snap().dispcnt ?? 0; }
   get dispstat(): number { return this.core.snap().dispstat ?? 0; }
   get vcount(): number { return this.core.snap().vcount ?? 0; }
@@ -251,6 +253,14 @@ export class WasmEmulator implements WasmCore {
 
   readonly zeroFb = new Uint8Array(FB_LEN);
 
+  // wasm linear memory, captured from `init()`'s output — used to build the
+  // zero-copy framebuffer view. The cached view is rebuilt only when the
+  // backing buffer detaches (memory growth) or the framebuffer pointer moves.
+  private wasmMemory: WebAssembly.Memory | undefined;
+  private _fbView: Uint8Array | undefined;
+  private _fbBuffer: ArrayBufferLike | undefined;
+  private _fbPtr = 0;
+
   // Stashed until ready.
   private _pendingRom: Uint8Array | null = null;
   private _pendingTurbo = 0;
@@ -273,7 +283,10 @@ export class WasmEmulator implements WasmCore {
   readonly io = new WasmIo(this);
 
   constructor() {
-    this.ready = init().then(() => {
+    // `init()` resolves to the wasm InitOutput, which exposes `memory` — we
+    // keep it to build the zero-copy framebuffer view in `frameView()`.
+    this.ready = init().then((out: { memory?: WebAssembly.Memory } | undefined) => {
+      this.wasmMemory = out?.memory;
       this.gba = new WasmGba();
       if (this._pendingRom) {
         this.gba.load_rom(this._pendingRom);
@@ -285,6 +298,26 @@ export class WasmEmulator implements WasmCore {
   }
 
   // ---- WasmCore (facet back-channel) -------------------------------------
+  // Zero-copy framebuffer: a Uint8Array view straight onto the wasm memory
+  // holding the PPU's framebuffer, replacing the per-frame 153 KB copy that
+  // `framebuffer()` did. Rebuild the view only when the backing buffer or the
+  // framebuffer pointer changes (wasm growth detaches the buffer; a savestate
+  // load can re-seat the framebuffer). Falls back to the zeroed buffer until
+  // the core is ready.
+  frameView(): Uint8Array {
+    const g = this.gba;
+    const mem = this.wasmMemory;
+    if (!g || !mem) return this.zeroFb;
+    const api = g as unknown as { framebuffer_ptr(): number };
+    const ptr = api.framebuffer_ptr();
+    const buf = mem.buffer;
+    if (this._fbView && this._fbBuffer === buf && this._fbPtr === ptr) return this._fbView;
+    this._fbView = new Uint8Array(buf, ptr, FB_LEN);
+    this._fbBuffer = buf;
+    this._fbPtr = ptr;
+    return this._fbView;
+  }
+
   snap(): DebugSnap {
     if (!this.gba) return this._snapCache;
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();

@@ -5,18 +5,31 @@ edition = "2021"
 
 # Pure-Rust GBA core, ported 1:1 from the TypeScript core in ../src.
 # Builds as a normal rlib for host-side `cargo test` (the differential
-# harness compares it against the TS oracle); a wasm-bindgen surface is
-# layered on later for the web target.
+# harness compares it against the TS oracle). The web target layers a
+# wasm-bindgen surface on top; the React Native target links the rlib into the
+# C-ABI `ffi/` crate. The core itself stays binding-agnostic.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[dependencies]
-# Web target only — the macro is invoked solely in the target_arch="wasm32"
-# `wasm` module, so host `cargo test` never touches it.
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`, the iOS/Android FFI
+# crate) never pull or compile it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 
 [profile.release]
 opt-level = 3
 lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter (no per-unit
+# boundaries blocking inlining of the now-monomorphized bus accesses).
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
+# landing-pad tables, shrinking the wasm/native binary and trimming the hot
+# paths. (cargo test runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
 
 [dev-dependencies]

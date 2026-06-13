@@ -36,7 +36,7 @@ fn sbc_set_flags(s: &mut CpuState, a: u32, b: u32, c_in: u32) -> u32 {
     r
 }
 
-pub fn thumb_execute(cpu: &mut Cpu, bus: &mut dyn Bus, instr: u32) {
+pub fn thumb_execute<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
     let top = instr >> 13;
 
     match top {

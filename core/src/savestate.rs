@@ -157,11 +157,11 @@ impl crate::emulator::Gba {
 
         // Memory regions — straight byte copies. EWRAM is the biggest at
         // 256 KB; everything else is much smaller.
-        w.section(tag::IWRAM, |s| s.bytes(&self.mem.iwram));
-        w.section(tag::EWRAM, |s| s.bytes(&self.mem.ewram));
-        w.section(tag::VRAM, |s| s.bytes(&self.mem.vram));
-        w.section(tag::PRAM, |s| s.bytes(&self.mem.pram));
-        w.section(tag::OAM, |s| s.bytes(&self.mem.oam));
+        w.section(tag::IWRAM, |s| s.bytes(&self.mem.iwram[..]));
+        w.section(tag::EWRAM, |s| s.bytes(&self.mem.ewram[..]));
+        w.section(tag::VRAM, |s| s.bytes(&self.mem.vram[..]));
+        w.section(tag::PRAM, |s| s.bytes(&self.mem.pram[..]));
+        w.section(tag::OAM, |s| s.bytes(&self.mem.oam[..]));
         w.section(tag::IO, |s| s.bytes(&self.io_raw));
 
         // PPU — registers + the rolling scanline cycle counter so we resume
@@ -337,11 +337,11 @@ impl crate::emulator::Gba {
                 c.cycles = r.u32() as u64;
                 c.irq_line = r.u32() != 0;
             }
-            tag::IWRAM => restore_region(&mut self.mem.iwram, body),
-            tag::EWRAM => restore_region(&mut self.mem.ewram, body),
-            tag::VRAM => restore_region(&mut self.mem.vram, body),
-            tag::PRAM => restore_region(&mut self.mem.pram, body),
-            tag::OAM => restore_region(&mut self.mem.oam, body),
+            tag::IWRAM => restore_region(&mut self.mem.iwram[..], body),
+            tag::EWRAM => restore_region(&mut self.mem.ewram[..], body),
+            tag::VRAM => restore_region(&mut self.mem.vram[..], body),
+            tag::PRAM => restore_region(&mut self.mem.pram[..], body),
+            tag::OAM => restore_region(&mut self.mem.oam[..], body),
             tag::IO => restore_region(&mut self.io_raw, body),
             tag::PPU => {
                 let p = &mut self.ppu;
