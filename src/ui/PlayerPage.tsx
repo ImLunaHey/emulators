@@ -848,6 +848,8 @@ export function PlayerPage() {
       <CheatsPanel
         open={showCheats}
         gameCode={currentRom?.code ?? null}
+        romId={currentRom?.id ?? null}
+        romTitle={currentRom?.title ?? null}
         cheats={cheats}
         onChange={setCheats}
         onClose={() => setShowCheats(false)}

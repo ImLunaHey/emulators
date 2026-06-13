@@ -10,6 +10,7 @@
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "boot": "tsx src/test/boot.ts",
+    "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

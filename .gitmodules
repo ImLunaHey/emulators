@@ -1,0 +1,3 @@
+[submodule "vendor/libretro-database"]
+	path = vendor/libretro-database
+	url = https://github.com/libretro/libretro-database

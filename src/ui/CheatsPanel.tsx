@@ -3,14 +3,23 @@ import type { Cheat } from '../io/cheats';
 import { parseCheat } from '../io/cheats';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Modal } from './Modal';
+import { useRomMd5 } from './hooks/useRomMd5';
+import { useHasheousMeta } from './hooks/useHasheousMeta';
 
 interface Props {
   open: boolean;
   gameCode: string | null;
+  romId?: string | null;
+  romTitle?: string | null;
   cheats: Cheat[];
   onChange: (cheats: Cheat[]) => void;
   onClose: () => void;
 }
+
+interface KnownGame { name: string; cheats: Array<{ name: string; code: string }>; }
+// Cache the bundled libretro index across panel opens (476 KB, one fetch).
+let knownIndexCache: Record<string, KnownGame> | null = null;
+const normalizeName = (s: string) => s.replace(/\([^)]*\)/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 // Cheats are persisted in localStorage keyed by the cart's 4-letter
 // game code so each ROM has its own list. We rehydrate here whenever a
@@ -29,15 +38,62 @@ export function saveCheatsFor(code: string, cheats: Cheat[]): void {
   localStorage.setItem(STORAGE_KEY_PREFIX + code, JSON.stringify(cheats));
 }
 
-export function CheatsPanel({ open, gameCode, cheats, onChange, onClose }: Props) {
+export function CheatsPanel({ open, gameCode, romId, romTitle, cheats, onChange, onClose }: Props) {
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState<Cheat>({ name: '', code: '', enabled: true });
   // Index pending a two-step delete confirm (avoids a nested modal +
   // its Esc-handling clash with this panel's own Esc-to-close).
   const [confirmDel, setConfirmDel] = useState<number | null>(null);
 
-  // Reset the draft / editor whenever the user navigates between games.
-  useEffect(() => { setEditing(null); setConfirmDel(null); }, [gameCode]);
+  // Canonical game name (for matching the libretro cheat DB), via the
+  // same md5 → Hasheous chain the library cards use (cached).
+  const md5Query = useRomMd5(romId ?? null, undefined);
+  const metaQuery = useHasheousMeta(md5Query.data);
+  const gameName = metaQuery.data?.name || romTitle || null;
+
+  // Known-cheats browser (lazy-loaded bundled libretro GBA index).
+  const [showKnown, setShowKnown] = useState(false);
+  const [knownLoading, setKnownLoading] = useState(false);
+  const [known, setKnown] = useState<KnownGame | null>(null);
+
+  // Reset transient UI whenever the user navigates between games.
+  useEffect(() => { setEditing(null); setConfirmDel(null); setShowKnown(false); setKnown(null); }, [gameCode]);
+
+  const loadKnown = async () => {
+    setShowKnown(true);
+    if (known || !gameName) return;
+    setKnownLoading(true);
+    try {
+      if (!knownIndexCache) {
+        const res = await fetch('/cheats-gba.json');
+        knownIndexCache = await res.json();
+      }
+      const idx = knownIndexCache!;
+      const key = normalizeName(gameName);
+      // Exact normalized match, else a containment fallback.
+      let hit = idx[key];
+      if (!hit) {
+        const k = Object.keys(idx).find((kk) => kk.includes(key) || key.includes(kk));
+        if (k) hit = idx[k];
+      }
+      setKnown(hit ?? { name: gameName, cheats: [] });
+    } catch {
+      setKnown({ name: gameName, cheats: [] });
+    } finally {
+      setKnownLoading(false);
+    }
+  };
+  const addKnown = (c: { name: string; code: string }) => {
+    // Skip if an identically-coded cheat already exists.
+    if (cheats.some((x) => x.code === c.code)) return;
+    persist([...cheats, { name: c.name, code: c.code, enabled: false }]);
+  };
+  const addAllKnown = () => {
+    if (!known) return;
+    const existing = new Set(cheats.map((c) => c.code));
+    const fresh = known.cheats.filter((c) => !existing.has(c.code)).map((c) => ({ name: c.name, code: c.code, enabled: false }));
+    if (fresh.length) persist([...cheats, ...fresh]);
+  };
 
   const persist = (next: Cheat[]) => {
     onChange(next);
@@ -129,11 +185,54 @@ export function CheatsPanel({ open, gameCode, cheats, onChange, onClose }: Props
             <div className="flex items-center justify-between mb-2">
               <div className="eyebrow">{cheats.length} cheat{cheats.length === 1 ? '' : 's'}</div>
               <div className="flex gap-2">
+                <button onClick={loadKnown} className="btn btn-primary !text-[10px]">🔎 Known cheats</button>
                 <button onClick={() => importInputRef.current?.click()} className="btn !text-[10px]">Import</button>
                 <button onClick={onExport} disabled={cheats.length === 0} className="btn !text-[10px]">Export</button>
               </div>
             </div>
             <input ref={importInputRef} type="file" accept="application/json,.json" onChange={onImport} className="hidden" />
+
+            {showKnown && (
+              <div className="well p-3 mb-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="eyebrow">
+                    Known cheats {known ? `· ${known.cheats.length}` : ''}
+                  </div>
+                  <div className="flex gap-2">
+                    {known && known.cheats.length > 0 && (
+                      <button onClick={addAllKnown} className="btn !text-[10px]">Add all</button>
+                    )}
+                    <button onClick={() => setShowKnown(false)} className="btn-icon !w-6 !h-6 !text-sm" aria-label="Close known cheats">×</button>
+                  </div>
+                </div>
+                {knownLoading ? (
+                  <div className="text-[11px] opacity-50 py-3 text-center">Loading…</div>
+                ) : !gameName ? (
+                  <div className="text-[11px] opacity-50 py-3 text-center">Couldn’t identify this game.</div>
+                ) : !known || known.cheats.length === 0 ? (
+                  <div className="text-[11px] opacity-50 py-3 text-center">No known cheats for “{gameName}”.</div>
+                ) : (
+                  <ul className="space-y-1 max-h-[220px] overflow-y-auto">
+                    {known.cheats.map((c, i) => {
+                      const added = cheats.some((x) => x.code === c.code);
+                      return (
+                        <li key={i} className="flex items-center gap-2 text-[11px]">
+                          <span className="flex-1 min-w-0 truncate" title={c.name}>{c.name}</span>
+                          <button
+                            onClick={() => addKnown(c)}
+                            disabled={added}
+                            className="btn !text-[10px] !py-0.5 shrink-0"
+                          >{added ? '✓ added' : '+ Add'}</button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                <div className="text-[10px] opacity-40 mt-2 leading-relaxed">
+                  From the libretro cheat database. Some codes may need a master/enable code on.
+                </div>
+              </div>
+            )}
             <ul className="space-y-1 mb-3">
               {cheats.length === 0 ? (
                 <li className="py-6 text-center opacity-50 text-xs">No cheats yet — add one below.</li>
