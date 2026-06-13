@@ -33,6 +33,21 @@ function convertCode(raw: string): string {
   return lines.join('\n');
 }
 
+// Some libretro descriptions are doubly/triply mojibaked (UTF-8 bytes
+// repeatedly mis-decoded as Latin-1), e.g. "PokÃÂ©mon". Undo it by
+// re-interpreting the string's bytes as UTF-8 until it stops changing;
+// the U+FFFD guard means correctly-encoded text is left untouched.
+function fixMojibake(s: string): string {
+  for (let i = 0; i < 4; i++) {
+    if (!/[-ÿ]/.test(s)) break;            // no Latin-1 high chars left
+    let fixed: string;
+    try { fixed = Buffer.from(s, 'latin1').toString('utf8'); } catch { break; }
+    if (fixed === s || fixed.includes('�')) break; // over-decoded → stop
+    s = fixed;
+  }
+  return s;
+}
+
 interface Entry { name: string; cheats: Array<{ name: string; code: string }>; }
 
 if (!existsSync(SRC)) {
@@ -53,14 +68,17 @@ for (const file of readdirSync(SRC)) {
     if (!code) break;
     const desc = text.match(new RegExp(`cheat${i}_desc\\s*=\\s*"([^"]*)"`));
     const conv = convertCode(code[1]);
-    if (conv) cheats.push({ name: desc?.[1]?.trim() || `Cheat ${i}`, code: conv });
+    // Keep only real cheats: hex words + whitespace. Drops note/doc
+    // pseudo-entries (e.g. code "N/A", "Important Note (").
+    if (!/^[0-9A-Fa-f\s]+$/.test(conv) || !/[0-9A-Fa-f]{4,}/.test(conv)) continue;
+    cheats.push({ name: fixMojibake((desc?.[1] || `Cheat ${i}`).trim()), code: conv });
   }
   if (cheats.length === 0) continue;
   const title = file.replace(/\.cht$/, '');
   const key = normalize(title);
   // On collisions (Rev 0/1, region variants) keep the richer set.
   if (!index[key] || index[key].cheats.length < cheats.length) {
-    index[key] = { name: title.replace(/\s*\([^)]*\)/g, '').trim(), cheats };
+    index[key] = { name: fixMojibake(title.replace(/\s*\([^)]*\)/g, '').trim()), cheats };
   }
   total += cheats.length;
 }
