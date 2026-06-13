@@ -9,9 +9,9 @@ interface Props {
   onClose: () => void;
 }
 
-type Tab = 'cpu' | 'mem' | 'palette' | 'tiles' | 'sprites' | 'io' | 'adv';
+type Tab = 'cpu' | 'mem' | 'palette' | 'tiles' | 'sprites' | 'io';
 
-const TABS: Tab[] = ['cpu', 'mem', 'palette', 'tiles', 'sprites', 'io', 'adv'];
+const TABS: Tab[] = ['cpu', 'mem', 'palette', 'tiles', 'sprites', 'io'];
 
 export function DebugPanel({ open, emu, onClose }: Props) {
   const [tab, setTab] = useState<Tab>('cpu');
@@ -35,7 +35,6 @@ export function DebugPanel({ open, emu, onClose }: Props) {
           {tab === 'tiles'   && <TilesView emu={emu} />}
           {tab === 'sprites' && <SpritesView emu={emu} />}
           {tab === 'io'      && <IoView emu={emu} />}
-          {tab === 'adv'     && <AdvancedView emu={emu} />}
         </ErrorBoundary>
       </div>
     </Modal>
@@ -454,60 +453,3 @@ function IoView({ emu }: { emu: Emulator }) {
   );
 }
 
-// Experimental/advanced settings — currently just the THUMB recompiler
-// (JIT) toggle. The JIT translates hot THUMB basic blocks to WASM; it
-// can give a large speedup on register-heavy code but still falls back
-// to the interpreter for unsupported instructions and for ARM blocks.
-// Toggling reruns hot detection from scratch (the block cache is dropped).
-function AdvancedView({ emu }: { emu: Emulator }) {
-  useLiveTick(4);
-  const r = emu.recomp;
-  const total = r.intInsns + r.jitInsns;
-  const pct = total === 0 ? 0 : (r.jitInsns * 100) / total;
-  // useState mirrors enabled flag to drive re-renders on toggle.
-  const [, setBump] = useState(0);
-  const toggle = () => {
-    r.enabled = !r.enabled;
-    if (!r.enabled) r.invalidate();
-    setBump((b) => b + 1);
-  };
-  return (
-    <div className="text-[11px] space-y-4">
-      <div>
-        <div className="text-[10px] uppercase tracking-widest opacity-50 mb-2">Recompiler (THUMB JIT)</div>
-        <label className="flex items-center gap-3 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={r.enabled}
-            onChange={toggle}
-            className="w-4 h-4 accent-[#5060a0]"
-          />
-          <span>Enable JIT</span>
-          <span className="opacity-50 text-[10px]">on by default — uncheck to debug with the pure interpreter</span>
-        </label>
-        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-0.5 font-mono">
-          <div className="flex justify-between"><span className="opacity-50">Interpreted insns</span><span>{r.intInsns.toLocaleString()}</span></div>
-          <div className="flex justify-between"><span className="opacity-50">JIT insns</span><span>{r.jitInsns.toLocaleString()}</span></div>
-          <div className="flex justify-between"><span className="opacity-50">JIT share</span><span>{pct.toFixed(1)}%</span></div>
-          <div className="flex justify-between"><span className="opacity-50">Cached blocks</span><span>{r.cache.size}</span></div>
-          <div className="flex justify-between"><span className="opacity-50">Profiling</span><span>{r.hits.size} hot PCs</span></div>
-        </div>
-        <button
-          onClick={() => { r.invalidate(); setBump((b) => b + 1); }}
-          className="btn-default mt-3 !text-[10px]"
-          disabled={r.cache.size === 0 && r.hits.size === 0}
-        >Clear JIT cache</button>
-      </div>
-      <div className="text-[10px] opacity-50 leading-relaxed">
-        The JIT compiles hot basic blocks to WebAssembly: every THUMB
-        format (1-16, 18, 19) except SWI, and nearly all of ARM:
-        data-processing (all operand forms, conditional, PC-relative),
-        branches (B/BL/BX), loads/stores (LDR/STR, LDRH/STRH/LDRSB/LDRSH),
-        block transfer (LDM/STM), and multiply (incl. 64-bit). Only the
-        registers a block touches are synced across the dispatch
-        boundary. SWI, MRS/MSR and SWP still interpret. If a game
-        misbehaves, turn this off and reload.
-      </div>
-    </div>
-  );
-}

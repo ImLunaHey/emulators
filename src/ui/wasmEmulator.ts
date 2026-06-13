@@ -20,7 +20,6 @@
 // and every debug getter degrades to zero (empty snapshot).
 //
 // Known gaps vs. the pure-TS Emulator:
-//   - `recomp` is a no-op stub: the JIT was dropped from the wasm core.
 //   - The link-cable `transport` defaults to an inert disconnected stub; the
 //     real WebRTC `SignalTransport` is assigned by LinkPanel.connectTo and
 //     driven each frame via `pumpLink()`.
@@ -273,17 +272,6 @@ export class WasmEmulator implements WasmCore {
   readonly bus = new WasmBus(this);
   readonly io = new WasmIo(this);
 
-  // recomp: no-op stub (JIT dropped). `enabled` is settable (AdvancedView
-  // toggles it) but does nothing.
-  readonly recomp = {
-    enabled: false,
-    invalidate(): void {},
-    intInsns: 0,
-    jitInsns: 0,
-    cache: { size: 0 },
-    hits: { size: 0 },
-  };
-
   constructor() {
     this.ready = init().then(() => {
       this.gba = new WasmGba();
@@ -348,8 +336,8 @@ export class WasmEmulator implements WasmCore {
     else this._pendingRom = bytes;
   }
 
-  runFrame(): { interp: number; jit: number; frames: number } {
-    if (!this.gba) return { interp: 0, jit: 0, frames: 0 };
+  runFrame(): { frames: number } {
+    if (!this.gba) return { frames: 0 };
     // Push the JS-side held bitmask; wasm handles turbo/autofire internally.
     this.gba.set_keys(this.keypad.pressed & 0x3ff);
     this.gba.run_frame();
@@ -360,7 +348,7 @@ export class WasmEmulator implements WasmCore {
       this.gba.clear_save_dirty();
       this.save.onChange?.();
     }
-    return { interp: 0, jit: 0, frames: this.gba.frame_count() };
+    return { frames: this.gba.frame_count() };
   }
 
   // ---- save states -------------------------------------------------------

@@ -68,7 +68,6 @@ export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false,
     let blitted = 0;
     let raf = 0;
     let stop = false;
-    let lastR = { interp: 0, jit: 0, frames: 0 };
 
     const loop = (ts: number) => {
       if (stop) return;
@@ -85,7 +84,7 @@ export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false,
       if (accumMs > frameCap) accumMs = frameCap;
       let didFrame = false;
       while (accumMs >= GBA_FRAME_MS) {
-        lastR = emu.runFrame();
+        emu.runFrame();
         accumMs -= GBA_FRAME_MS;
         didFrame = true;
         blitted++;
@@ -103,16 +102,8 @@ export function Screen({ emu, paused, audio, onStats, speed = 1, smooth = false,
         fpsAvg = fpsAvg ? fpsAvg * 0.6 + inst * 0.4 : inst;
         lastStatTs = ts;
         blitted = 0;
-        // Only show JIT share when the recompiler is enabled — otherwise
-        // every frame would read "jit 0%" which is just noise.
-        let jitBit = '';
-        if (emu.recomp.enabled) {
-          const total = lastR.interp + lastR.jit || 1;
-          const jitPct = ((lastR.jit / total) * 100) | 0;
-          jitBit = ` · jit ${jitPct}%`;
-        }
         onStats(
-          `${fpsAvg.toFixed(1)} fps · ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz${jitBit}`,
+          `${fpsAvg.toFixed(1)} fps · ${(280896 * fpsAvg / 1e6).toFixed(2)} MHz`,
         );
       }
     };

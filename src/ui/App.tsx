@@ -19,7 +19,7 @@ import { queryClient, persister } from './queryClient';
 // The Emulator + AudioSink live at the root via useRef so they survive
 // navigation between the two pages — switching from the player back to
 // the library and into a different game doesn't tear down the audio
-// context or the WASM JIT cache.
+// context or the wasm core instance.
 export function App() {
   // Hard-swapped to the Rust/wasm core. WasmEmulator mirrors the Emulator
   // surface the UI uses (lazy async wasm init under the hood); cast keeps the
