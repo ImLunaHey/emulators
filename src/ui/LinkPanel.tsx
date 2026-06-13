@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Emulator } from '../emulator';
-import { SignalTransport } from '../io/sio-signal';
+import { SignalTransport, type LinkBridge } from '../io/sio-signal';
 import { LocalLoopback } from '../io/sio';
 import { Modal } from './Modal';
 
@@ -246,61 +246,44 @@ function IwramWatch({ emu }: { emu: Emulator }) {
   const [on, setOn] = useState(false);
   const [addrHex, setAddrHex] = useState('03002af0');
   const [widthHex, setWidthHex] = useState('10');
-  // We keep the buffer in a ref so dumping doesn't re-render the
-  // panel and risk losing entries.
-  const bufRef = useRef<{ pc: number; addr: number; size: number; val: number; n: number }[]>([]);
-  const detachRef = useRef<(() => void) | null>(null);
-
-  const attach = (watchAddr: number, width: number) => {
-    const bus = emu.bus;
-    const cpu = emu.cpu;
-    const lo = watchAddr;
-    const hi = watchAddr + Math.max(1, width) - 1;
-    const inRange = (a: number, size: number) => {
-      const aLo = a >>> 0;
-      const aHi = (a >>> 0) + size - 1;
-      return aHi >= lo && aLo <= hi;
-    };
-    const log = (pc: number, addr: number, size: number, val: number) => {
-      const last = bufRef.current[bufRef.current.length - 1];
-      if (last && last.pc === pc && last.addr === addr && last.size === size && last.val === val) {
-        last.n++; return;
-      }
-      bufRef.current.push({ pc, addr, size, val, n: 1 });
-      if (bufRef.current.length > 4096) bufRef.current.shift();
-    };
-    const orig8 = bus.write8.bind(bus);
-    const orig16 = bus.write16.bind(bus);
-    const orig32 = bus.write32.bind(bus);
-    bus.write8 = (a, v) => { if (inRange(a, 1)) log(cpu.state.r[15], a, 1, v & 0xFF); orig8(a, v); };
-    bus.write16 = (a, v) => { if (inRange(a, 2)) log(cpu.state.r[15], a, 2, v & 0xFFFF); orig16(a, v); };
-    bus.write32 = (a, v) => { if (inRange(a, 4)) log(cpu.state.r[15], a, 4, v >>> 0); orig32(a, v); };
-    detachRef.current = () => { bus.write8 = orig8; bus.write16 = orig16; bus.write32 = orig32; };
+  // The watch now lives in the wasm core (CPU writes happen inside wasm, so a
+  // JS monkey-patch of bus.write would never see them). The adapter exposes
+  // set/clear/read of a native write-watch; we drive that.
+  const core = emu as unknown as {
+    setWatch(lo: number, hi: number): void;
+    clearWatch(): void;
+    watchLog(): Array<{ pc: number; addr: number; size: number; val: number }>;
   };
 
   const toggle = () => {
     if (on) {
-      detachRef.current?.();
-      detachRef.current = null;
-      bufRef.current.length = 0;
+      core.clearWatch?.();
       setOn(false);
     } else {
       const addr = parseInt(addrHex.trim().replace(/^0x/, ''), 16) >>> 0;
       const width = Math.max(1, parseInt(widthHex.trim().replace(/^0x/, ''), 16) >>> 0);
       if (!Number.isFinite(addr) || !Number.isFinite(width)) return;
-      attach(addr, width);
+      core.setWatch?.(addr, addr + width - 1);
       setOn(true);
     }
   };
 
   const dump = () => {
-    const rows = bufRef.current.map((e) => ({
-      pc: '0x' + (e.pc >>> 0).toString(16),
-      addr: '0x' + e.addr.toString(16).padStart(8, '0'),
-      size: e.size,
-      val: '0x' + e.val.toString(16),
-      n: e.n,
-    }));
+    const entries = core.watchLog?.() ?? [];
+    // Collapse consecutive identical writes into a run-length count, matching
+    // the old monkey-patch dump.
+    const rows: { pc: string; addr: string; size: number; val: string; n: number }[] = [];
+    for (const e of entries) {
+      const last = rows[rows.length - 1];
+      const pc = '0x' + (e.pc >>> 0).toString(16);
+      const addr = '0x' + (e.addr >>> 0).toString(16).padStart(8, '0');
+      const val = '0x' + (e.val >>> 0).toString(16);
+      if (last && last.pc === pc && last.addr === addr && last.size === e.size && last.val === val) {
+        last.n++;
+      } else {
+        rows.push({ pc, addr, size: e.size, val, n: 1 });
+      }
+    }
     if (rows.length === 0) {
       console.log('[iwram-watch] no writes captured at 0x' + addrHex);
       return;
@@ -381,10 +364,18 @@ async function connectTo(emu: Emulator, code: string, isMaster: boolean): Promis
   // Drop any prior transport first — joining a new room while another
   // is live would leak the previous DataChannel + WebSocket.
   await disconnect(emu);
-  const t = new SignalTransport(emu.io.sio);
+  // The transport drives the wasm core through the LinkBridge surface
+  // (linkSetState/linkTakeOutgoing/linkDeliver/linkApplyRemote), which the
+  // WasmEmulator adapter implements. `emu` is a WasmEmulator behind the
+  // `Emulator` type alias, so reach the bridge methods through a cast.
+  const t = new SignalTransport(emu as unknown as LinkBridge);
   // Assign now so isConnected() and the UI panel can already see "this
-  // is the active transport" while we wait for the WS handshake.
-  emu.io.sio.transport = t;
+  // is the active transport" while we wait for the WS handshake. The
+  // adapter's runFrame calls transport.pump?.() each frame. The adapter's
+  // transport slot is `LinkTransportLike` (isMaster/isConnected/pump), which
+  // SignalTransport satisfies; the `Emulator` alias types it as the wider TS
+  // `LinkTransport`, so cast the assignment.
+  emu.io.sio.transport = t as unknown as typeof emu.io.sio.transport;
   await t.connect({ roomId: code, isMaster });
 }
 

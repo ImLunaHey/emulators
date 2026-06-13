@@ -19,7 +19,9 @@ export class Keypad {
   // Keys that autofire while held: the game sees them pressed only on the
   // "on" phase, which tickTurbo() flips once per emulated frame (~30 Hz).
   turboMask = 0;
-  private turboPhase = 0;
+  // Public so the wasm-core adapter's structural keypad object remains
+  // assignable to this `Keypad` type (TS treats a private member as nominal).
+  turboPhase = 0;
 
   press(k: Key) { this.pressed |= 1 << k; }
   release(k: Key) { this.pressed &= ~(1 << k); }

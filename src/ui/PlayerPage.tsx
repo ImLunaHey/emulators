@@ -415,7 +415,9 @@ export function PlayerPage() {
       danger: true,
       onConfirm: () => {
         localStorage.removeItem(saveKeyRef.current);
-        emu.save.data.fill(0xFF);
+        // Write-through erase of the actual save chip (the wasm core); the
+        // localStorage mirror is removed above.
+        (emu.save as { reset?: () => void }).reset?.();
         notify('Save data cleared');
       },
     });

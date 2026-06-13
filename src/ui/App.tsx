@@ -1,7 +1,8 @@
 import { useRef } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
-import { Emulator } from '../emulator';
+import type { Emulator } from '../emulator';
+import { WasmEmulator } from './wasmEmulator';
 import { AudioSink } from './audio';
 import { EmuContext } from './EmuContext';
 import { LibraryPage } from './LibraryPage';
@@ -20,8 +21,11 @@ import { queryClient, persister } from './queryClient';
 // the library and into a different game doesn't tear down the audio
 // context or the WASM JIT cache.
 export function App() {
+  // Hard-swapped to the Rust/wasm core. WasmEmulator mirrors the Emulator
+  // surface the UI uses (lazy async wasm init under the hood); cast keeps the
+  // existing `emu: Emulator`-typed components unchanged.
   const emuRef = useRef<Emulator | null>(null);
-  if (!emuRef.current) emuRef.current = new Emulator();
+  if (!emuRef.current) emuRef.current = new WasmEmulator() as unknown as Emulator;
   const audioRef = useRef<AudioSink | null>(null);
   if (!audioRef.current) audioRef.current = new AudioSink();
 

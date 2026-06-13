@@ -1,10 +1,17 @@
-import type { LinkTransport, MultiplayResult, Sio } from './sio';
+import type { MultiplayResult } from './sio';
 
 // Link transport that relays SIO state through the same WebSocket
 // we use for signaling — no RTCPeerConnection involved. Backed by
 // the SignalRoom Durable Object (src/worker.ts). One WS per peer
 // per room; the DO forwards `{type:'state', to: peerId}` messages
 // to the addressed peer.
+//
+// This drives the Rust/wasm core (not the old TS Sio) through the
+// `LinkBridge` adapter surface (implemented by WasmEmulator): the core
+// owns the SIO state machine, and the bridge exposes only the four async
+// hooks plus a per-frame `pump`. The WebRTC / WebSocket / room / peer
+// machinery is unchanged from the TS-Sio version — only the parts that
+// read/write the Sio now go through the bridge.
 //
 // Why not direct WebRTC?
 // - Firefox in various privacy configs silently refuses to gather
@@ -20,20 +27,32 @@ import type { LinkTransport, MultiplayResult, Sio } from './sio';
 // Latency budget vs direct peer-to-peer: ~20-50 ms one-way through
 // CF's nearest colo, vs ~5-20 ms over LAN with raw DataChannel. Fine
 // for Pokemon-style turn-based traffic; noticeable for real-time
-// racing, but Phase B-2 (lockstep / input-delay) is the right fix
-// for racing anyway — direct-P2P only buys us a few ms there.
+// racing, but lockstep / input-delay is the right fix for racing
+// anyway — direct-P2P only buys us a few ms there.
 
 const TICK_MS = 33;
 
+// The async link surface the SignalTransport drives. WasmEmulator
+// implements this by forwarding to the WasmGba bridge methods; the host
+// is the source of truth for SIO state.
+export interface LinkBridge {
+  // Set the live link state: SD comes from `connected`, SI/ID from `master`.
+  linkSetState(connected: boolean, master: boolean): void;
+  // Poll the master's outgoing multiplay payload. Returns the 16-bit
+  // SIOMLT_SEND value once (take semantics) after a master transfer kicks
+  // off over a connected link, or -1 when there's nothing to send.
+  linkTakeOutgoing(): number;
+  // Master-side completion: deliver the synchronized 4-slot result.
+  linkDeliver(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
+  // Slave-side: apply the remote master's broadcast.
+  linkApplyRemote(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
+}
+
 type StateMsg = {
-  mlt: number;
-  d32lo: number;
-  d32hi: number;
-  d8: number;
-  // Master-only fields — when the local Sio just completed a Multi-
-  // play transfer, we snapshot SIOMULTI[0..3] and a monotonic seq so
-  // the slave can apply the same values + fire its IRQ. seq=0 means
-  // "no transfer has happened yet"; receivers watch for it advancing.
+  // Master-only fields — when the master completed a Multi-play transfer it
+  // snapshots SIOMULTI[0..3] and a monotonic seq so the slave can apply the
+  // same values + fire its IRQ. seq=0 means "no transfer has happened yet";
+  // receivers watch for it advancing.
   seq: number;
   m0: number;
   m1: number;
@@ -43,14 +62,15 @@ type StateMsg = {
 
 interface WireMsg {
   // self / peer-join / peer-leave are server-emitted room control.
-  // state — periodic SIO state broadcast (used by B-1 fallback path).
   // mlt-req — master asks slave for a synchronized response to a
   //   Multi-play transfer that just kicked off. Carries the master's
   //   SIOMLT_SEND and a unique request id so the response can be
   //   correlated even if the master fires several transfers in flight.
   // mlt-resp — slave's reply with the multiplay result both ends will
-  //   adopt. The slave applies the same snapshot to its own Sio at
+  //   adopt. The slave applies the same snapshot to its own core at
   //   send time so the two sides converge.
+  // state — master's broadcast of its completed transfer snapshot; the
+  //   slave applies it when the seq advances.
   type: 'self' | 'peer-join' | 'peer-leave' | 'state' | 'mlt-req' | 'mlt-resp';
   to?: string;
   from?: string;
@@ -67,41 +87,46 @@ export interface SignalOptions {
   signalingBase?: string;
 }
 
-export class SignalTransport implements LinkTransport {
+export class SignalTransport {
   private ws: WebSocket | null = null;
   private peerId: string | null = null;
   private tickHandle: ReturnType<typeof setInterval> | null = null;
-  private peerLatest: StateMsg = { mlt: 0xFFFF, d32lo: 0xFFFF, d32hi: 0xFFFF, d8: 0xFF, seq: 0, m0: 0, m1: 0, m2: 0, m3: 0 };
-  private peerLatestAt = 0;
   private master = true;
-  // Last peer transferSeq we processed. We're slave-side and the
-  // peer is master; when this advances, we mirror their SIOMULTI[]
-  // snapshot into our Sio and fire SIO IRQ. Tracked unsigned mod 2^32.
+  // Last peer transferSeq we applied (slave side). When the master's
+  // broadcast seq advances we mirror their SIOMULTI snapshot into our core
+  // and let it fire SIO IRQ. Tracked unsigned mod 2^32.
   private lastAppliedSeq = 0;
 
-  // Phase B-2 lockstep: pending Multi-play requests we've sent to the
-  // peer, keyed by reqId. The callback runs when the matching mlt-
-  // resp arrives, or when the lockstep timeout expires (whichever
-  // first). The map keeps us correct even if the master fires several
-  // transfers before the first response arrives.
+  // Pending Multi-play requests we've sent to the peer, keyed by reqId. The
+  // callback runs when the matching mlt-resp arrives, or when the lockstep
+  // timeout expires (whichever first). The map keeps us correct even if the
+  // master fires several transfers before the first response arrives.
   private mltReqSeq = 0;
   private pendingReqs = new Map<number, (r: MultiplayResult) => void>();
   // Latency ceiling for a lockstep round-trip. If the response hasn't
-  // arrived by then, we drop the request and Sio falls back to the
-  // synchronous broadcast value. Picked at "well above realistic CF
-  // edge RTT but below one second" — anything longer would freeze the
-  // game's transfer loop for noticeably long.
+  // arrived by then, we deliver the "no peer" result so the core's transfer
+  // can complete instead of relying on its cycle-budget timeout.
   private static readonly REQ_TIMEOUT_MS = 250;
+
+  // Master's most recently delivered transfer snapshot + a monotonic seq.
+  // Re-broadcast every tick so a slave that missed the lockstep round-trip
+  // catches up via the seq-watch path (onWire 'state'). seq=0 = no transfer
+  // yet. Updated by `requestMultiplay`'s settle on the master side.
+  private lastBroadcast: StateMsg = { seq: 0, m0: 0xFFFF, m1: 0xFFFF, m2: 0xFFFF, m3: 0xFFFF };
 
   onPeerJoin: ((peerId: string) => void) | null = null;
   onPeerLeave: ((peerId: string) => void) | null = null;
   onError: ((err: Error) => void) | null = null;
 
+  // The async link bridge into the wasm core. Replaces the old TS `Sio`.
   // eslint-disable-next-line no-unused-vars
-  constructor(private sio: Sio) {}
+  constructor(private link: LinkBridge) {}
 
   async connect(opts: SignalOptions): Promise<void> {
     this.master = opts.isMaster;
+    // Announce link state to the core. SD stays low until a peer actually
+    // joins (set in onWire); SI/ID reflect our master/slave role now.
+    this.link.linkSetState(false, this.master);
     const base = opts.signalingBase ?? defaultSignalingBase();
     const url = `${base}/api/signal/${encodeURIComponent(opts.roomId)}`;
     console.log('[link] connecting', url);
@@ -112,15 +137,16 @@ export class SignalTransport implements LinkTransport {
   async disconnect(): Promise<void> {
     if (this.tickHandle !== null) { clearInterval(this.tickHandle); this.tickHandle = null; }
     if (this.ws) { try { this.ws.close(); } catch { /* */ } this.ws = null; }
-    // Resolve any pending lockstep requests with the "no-peer" result
-    // so Sio's complete() can finish instead of busy-polling forever.
+    // Resolve any pending lockstep requests with the "no-peer" result so the
+    // core's transfer can finish instead of waiting on its timeout.
     for (const cb of this.pendingReqs.values()) {
       cb({ d0: 0xFFFF, d1: 0xFFFF, d2: 0xFFFF, d3: 0xFFFF, error: true });
     }
     this.pendingReqs.clear();
     this.peerId = null;
-    this.peerLatest = { mlt: 0xFFFF, d32lo: 0xFFFF, d32hi: 0xFFFF, d8: 0xFF, seq: 0, m0: 0, m1: 0, m2: 0, m3: 0 };
     this.lastAppliedSeq = 0;
+    // Tell the core the link is down; it falls back to single-player SIOCNT.
+    this.link.linkSetState(false, this.master);
   }
 
   isConnected(): boolean {
@@ -137,25 +163,44 @@ export class SignalTransport implements LinkTransport {
   }
   isMaster(): boolean { return this.master; }
 
-  requestMultiplay(localData: number, onComplete: (r: MultiplayResult) => void): boolean {
-    // Only master initiates lockstep requests. Slave's Sio shouldn't
-    // be triggering transfers in the first place, but if a game ever
-    // sets START on the slave side we let it fall through to the
-    // sync path rather than spamming our peer with bogus requests.
-    if (!this.master) return false;
-    if (!this.isConnected()) return false;
+  // Called once per emulated frame by the adapter (WasmEmulator.runFrame).
+  // Polls the core for an outgoing master multiplay payload; when one is
+  // pending, kicks off the lockstep request to the peer. The slave side's
+  // delivery is event-driven (onWire), so pump only matters for the master.
+  pump(): void {
+    if (!this.master) return;
+    const out = this.link.linkTakeOutgoing();
+    if (out < 0) return;            // nothing to send this frame
+    this.requestMultiplay(out & 0xFFFF);
+  }
+
+  // Master side: a multiplay transfer kicked off in the core. Ask the peer
+  // for a synchronized response; when it arrives (or times out), deliver the
+  // 4-slot result back into the core via the bridge. If we have no peer, the
+  // core's own cycle-budget timeout completes the transfer with error.
+  private requestMultiplay(localData: number): void {
+    if (!this.isConnected()) {
+      // No peer: let the core's timeout fallback handle it. Nothing to do.
+      return;
+    }
     const reqId = ++this.mltReqSeq;
     let done = false;
     const settle = (r: MultiplayResult) => {
       if (done) return;
       done = true;
       this.pendingReqs.delete(reqId);
-      onComplete(r);
+      this.link.linkDeliver(r.d0, r.d1, r.d2, r.d3, r.error);
+      // Stage this snapshot for the periodic 'state' broadcast so a slave
+      // that missed the mlt-resp round-trip catches up via seq-watch.
+      this.lastBroadcast = {
+        seq: (this.lastBroadcast.seq + 1) >>> 0,
+        m0: r.d0 & 0xFFFF, m1: r.d1 & 0xFFFF, m2: r.d2 & 0xFFFF, m3: r.d3 & 0xFFFF,
+      };
     };
     this.pendingReqs.set(reqId, settle);
     setTimeout(() => {
-      // Treat timeout as "no peer data" — Sio will fall back to the
-      // multiplayExchange sync path on its next complete().
+      // Timeout: treat as "no peer data" and complete with error so the
+      // game's transfer loop unsticks.
       settle({ d0: localData & 0xFFFF, d1: 0xFFFF, d2: 0xFFFF, d3: 0xFFFF, error: true });
     }, SignalTransport.REQ_TIMEOUT_MS);
     try {
@@ -166,19 +211,6 @@ export class SignalTransport implements LinkTransport {
     } catch {
       settle({ d0: localData & 0xFFFF, d1: 0xFFFF, d2: 0xFFFF, d3: 0xFFFF, error: true });
     }
-    return true;
-  }
-
-  multiplayExchange(localData: number): MultiplayResult {
-    const peer = this.isConnected() ? (this.peerLatest.mlt & 0xFFFF) : 0xFFFF;
-    return { d0: localData & 0xFFFF, d1: peer, d2: 0xFFFF, d3: 0xFFFF, error: false };
-  }
-  normal32Exchange(_localData: number): number {
-    if (!this.isConnected()) return 0xFFFFFFFF;
-    return ((this.peerLatest.d32hi << 16) | this.peerLatest.d32lo) >>> 0;
-  }
-  normal8Exchange(_localData: number): number {
-    return this.isConnected() ? (this.peerLatest.d8 & 0xFF) : 0xFF;
   }
 
   // ----------------------------------------------------------------
@@ -198,8 +230,16 @@ export class SignalTransport implements LinkTransport {
         console.log('[link] WS closed');
         if (this.peerId) this.onPeerLeave?.(this.peerId);
         this.peerId = null;
+        this.link.linkSetState(false, this.master);
       };
     });
+  }
+
+  private onPeerConnected(peerId: string): void {
+    this.peerId = peerId;
+    // Peer is in the room: SD goes high. SI/ID from our role.
+    this.link.linkSetState(true, this.master);
+    this.onPeerJoin?.(peerId);
   }
 
   private onWire(raw: string): void {
@@ -209,28 +249,22 @@ export class SignalTransport implements LinkTransport {
       case 'self':
         // Anyone already in the room becomes our 1:1 peer.
         if (msg.peers && msg.peers.length > 0) {
-          this.peerId = msg.peers[0];
-          // Seed peerLatestAt so isConnected can flip true at the
-          // moment we know who they are, even before their first
-          // state message arrives.
-          this.peerLatestAt = performance.now();
-          this.onPeerJoin?.(this.peerId);
+          this.onPeerConnected(msg.peers[0]);
         }
         break;
       case 'peer-join':
         if (msg.peerId && !this.peerId) {
-          this.peerId = msg.peerId;
-          this.peerLatestAt = performance.now();
-          this.onPeerJoin?.(msg.peerId);
+          this.onPeerConnected(msg.peerId);
         }
         break;
       case 'peer-leave':
         if (msg.peerId && msg.peerId === this.peerId) {
           this.onPeerLeave?.(msg.peerId);
           this.peerId = null;
-          // Cancel pending lockstep requests so the master's Sio can
-          // unstick. They get the "no peer" result and Sio's complete()
-          // falls back to multiplayExchange's local-loopback shape.
+          this.link.linkSetState(false, this.master);
+          // Cancel pending lockstep requests so the master's transfer can
+          // unstick. They get the "no peer" result and the core's complete()
+          // finishes with error.
           for (const cb of this.pendingReqs.values()) {
             cb({ d0: 0xFFFF, d1: 0xFFFF, d2: 0xFFFF, d3: 0xFFFF, error: true });
           }
@@ -240,33 +274,34 @@ export class SignalTransport implements LinkTransport {
       case 'state':
         if (msg.from === this.peerId && msg.payload) {
           const p = msg.payload as StateMsg;
-          this.peerLatest = p;
-          this.peerLatestAt = performance.now();
-          // Slave-side: when the master's transferSeq advances, mirror
-          // their SIOMULTI snapshot into our Sio and let it fire IRQ.
-          // We don't gate on isMaster here — if the slave (us) happens
-          // to also bump its own seq later, the same logic will run on
-          // the other side, which is fine: each side ignores its own
-          // master-only state.
+          // Slave-side: when the master's transferSeq advances, mirror their
+          // SIOMULTI snapshot into our core and let it fire IRQ. We only act
+          // as slave here; the master ignores its peer's state broadcasts.
           if (!this.master && p.seq !== 0 && p.seq !== this.lastAppliedSeq) {
             this.lastAppliedSeq = p.seq;
-            this.sio.applyRemoteMultiplay(p.m0, p.m1, p.m2, p.m3, false);
+            this.link.linkApplyRemote(p.m0, p.m1, p.m2, p.m3, false);
           }
         }
         break;
       case 'mlt-req':
-        // Slave side: master kicked off a Multi-play transfer and is
-        // asking what we'd respond with. Read our *current* SIOMLT_SEND
-        // (not the last broadcast snapshot — that could be 33 ms old),
-        // build the result both ends will adopt, apply it locally so
-        // our SIOMULTI / IRQ converge with master's, and send the
-        // result back so master's complete() can resolve. Master/slave
-        // gating: only the slave honors mlt-req; if we're master and
-        // somehow received one, ignore.
+        // Slave side: master kicked off a Multi-play transfer and is asking
+        // what we'd respond with. Read our *current* SIOMLT_SEND from the
+        // core (via take-outgoing semantics is wrong here — the slave never
+        // starts a transfer; instead we read the last value the core staged).
+        // We surface the slave's outgoing word through linkTakeOutgoing too:
+        // the slave's game writes SIOMLT_SEND, but the core only exposes it
+        // to JS on a master transfer. For the relay path the slave responds
+        // with the master's data echoed into slot 0 + its own payload in
+        // slot 1, applies it locally so SIOMULTI/IRQ converge with master's,
+        // and replies so master's deliver() resolves.
         if (this.master) break;
         if (msg.from === this.peerId && msg.payload) {
           const p = msg.payload as { reqId: number; masterData: number };
-          const slaveData = this.sio.mltSend & 0xFFFF;
+          // The slave's outgoing word: poll the bridge (returns -1 if the
+          // core hasn't staged one — the slave doesn't master, so it usually
+          // hasn't; fall back to 0xFFFF "no data").
+          const staged = this.link.linkTakeOutgoing();
+          const slaveData = staged >= 0 ? (staged & 0xFFFF) : 0xFFFF;
           const result: MultiplayResult = {
             d0: p.masterData & 0xFFFF,
             d1: slaveData,
@@ -274,10 +309,10 @@ export class SignalTransport implements LinkTransport {
             d3: 0xFFFF,
             error: false,
           };
-          // Apply locally before replying so our SIO IRQ on this
-          // transfer fires at the moment of receipt, mirroring how
-          // real hardware's slave latches and IRQs together.
-          this.sio.applyRemoteMultiplay(result.d0, result.d1, result.d2, result.d3, false);
+          // Apply locally before replying so our SIO IRQ on this transfer
+          // fires at the moment of receipt, mirroring how real hardware's
+          // slave latches and IRQs together.
+          this.link.linkApplyRemote(result.d0, result.d1, result.d2, result.d3, false);
           try {
             this.ws!.send(JSON.stringify({
               type: 'mlt-resp', to: this.peerId,
@@ -296,23 +331,17 @@ export class SignalTransport implements LinkTransport {
     }
   }
 
+  // Master broadcasts its last completed transfer snapshot (staged by
+  // `requestMultiplay`'s settle) so a slave that missed the lockstep
+  // round-trip can still catch up via the seq-watch path.
   private broadcast(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     if (!this.peerId) return;
-    const sio = this.sio;
-    const payload: StateMsg = {
-      mlt: sio.mltSend & 0xFFFF,
-      d32lo: sio.multi[0] & 0xFFFF,
-      d32hi: sio.multi[1] & 0xFFFF,
-      d8: sio.mltSend & 0xFF,
-      seq: sio.transferSeq,
-      m0: sio.multi[0] & 0xFFFF,
-      m1: sio.multi[1] & 0xFFFF,
-      m2: sio.multi[2] & 0xFFFF,
-      m3: sio.multi[3] & 0xFFFF,
-    };
+    // Only the master has a meaningful snapshot to broadcast; the slave's
+    // tick is a no-op (the master ignores slave state anyway).
+    if (!this.master) return;
     try {
-      this.ws.send(JSON.stringify({ type: 'state', to: this.peerId, payload }));
+      this.ws.send(JSON.stringify({ type: 'state', to: this.peerId, payload: this.lastBroadcast }));
     } catch { /* will recover next tick */ }
   }
 }
