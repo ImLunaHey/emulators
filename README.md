@@ -1,8 +1,8 @@
 # gba-recomp
 
-A Game Boy Advance emulator that runs entirely in the browser. Cycle-batched ARM7TDMI interpreter (ARM + THUMB), full PPU (every BG mode, sprites with rotation/scaling, affine, windows, mosaic, blending), DMA, timers, IRQs, PSG + DirectSound audio in stereo, SIO link cable over WebRTC, S-3511A RTC, and autodetected SRAM / Flash / EEPROM saves on an HLE BIOS. On top of the interpreter sits a **WebAssembly recompiler (JIT)**, on by default, that compiles hot basic blocks to WASM. React + Tailwind UI with a ROM library, save states, gamepad/keyboard support, and an installable PWA shell.
+A Game Boy Advance emulator that runs entirely in the browser. Cycle-batched ARM7TDMI interpreter (ARM + THUMB), full PPU (every BG mode, sprites with rotation/scaling, affine, windows, mosaic, blending), DMA, timers, IRQs, PSG + DirectSound audio in stereo, SIO link cable over WebRTC, S-3511A RTC, and autodetected SRAM / Flash / EEPROM saves on an HLE BIOS. The **core is written in Rust and compiled to WebAssembly**; a React + Tailwind UI wraps it with a ROM library, save states, cheats, gamepad/keyboard support, and an installable PWA shell.
 
-No prebuilt BIOS, no off-the-shelf cores — the whole stack is written from scratch in TypeScript.
+No prebuilt BIOS, no off-the-shelf cores — the whole stack is written from scratch.
 
 ## Status
 
@@ -14,19 +14,13 @@ No prebuilt BIOS, no off-the-shelf cores — the whole stack is written from scr
 | Garfield: Search for Pooky | ✓ | ✓ | ✓ | Language select renders |
 | Crash Bandicoot | ✓ | ✓ | ✓ | Title intro + Earth flyby |
 
-The vitest suite gates the CPU, BIOS HLE, PPU compositor + sprites + BG + window mask, DMA channels, timers, IRQ, RTC bit-bang protocol, save back-ends, and LZ77/Huffman decompression. The recompiler is additionally validated by **register-by-register lockstep against the interpreter** across many ROMs — billions of instructions with zero divergence.
+The Rust core ships a **235-vector `cargo test` suite** covering the CPU (ARM + THUMB instruction vectors, IRQ entry/return, banking), the PPU (text/bitmap/affine modes, sprites, the compositor's priority/blend/window logic — plus self-contained **golden-frame** tests), DMA, timers, IRQ, sound (PSG + DirectSound), the save back-ends, the RTC, and save-state round-trips. During the port the core was additionally validated **frame-by-frame** (registers + all RAM) against the original TypeScript interpreter — bit-identical for 120 frames across the test ROMs.
 
-## Recompiler (JIT)
+## Core (Rust → WebAssembly)
 
-A WebAssembly basic-block recompiler runs **on by default**. It tracks hot PCs, and once one crosses a threshold it scans forward emitting WASM until it hits a branch or an unsupported instruction, then instantiates the module once and reuses it. Register + CPSR state lives in shared WASM linear memory so a typical ALU op is a couple of `i32.load`/`store`s rather than import callbacks.
+The emulator core lives in [`core/`](core/) as a standalone Rust crate (`gba-core`) with no DOM or browser dependencies. It's a faithful, instruction-approximate interpreter — every former TS class is a Rust struct, wired together by one `Gba` god-struct that owns all state and runs a frame at a time. `wasm-pack` compiles it to a ~133 KB WebAssembly module (`core/pkg/`), and a thin `wasm-bindgen` surface (`WasmGba`) exposes `load_rom` / `run_frame` / `framebuffer` / `set_keys` / audio / battery saves / save states / cheats / the link-cable bridge / a debug-introspection snapshot.
 
-Coverage:
-
-- **Every THUMB format** (1–16, 18, 19) except `SWI`.
-- **Nearly the entire ARM instruction set** — data-processing (any condition code, all operand-2 forms incl. register-specified shifts), branches (B/BL/BX), loads/stores (LDR/STR + half/byte variants with ARM7TDMI unaligned semantics), block transfer (LDM/STM), and multiply including the 64-bit longs (UMULL/SMULL/UMLAL/SMLAL).
-- Only `SWI`, `MRS`/`MSR`, `SWP`, and empty-register-list LDM/STM fall back to the interpreter.
-
-Blocks compiled out of writable RAM (EWRAM/IWRAM) snapshot their halfwords and are re-validated on every dispatch, so self-modified code (e.g. routines copied onto the IWRAM stack) never runs stale. Toggle the JIT and watch live block/instruction stats in the Debug panel's **Advanced** tab.
+The browser app talks to it through `src/ui/wasmEmulator.ts`, an adapter that re-exposes the surface the React UI expects and forwards everything to the wasm instance.
 
 ## Quick start
 
@@ -34,8 +28,11 @@ Blocks compiled out of writable RAM (EWRAM/IWRAM) snapshot their halfwords and a
 git clone git@github.com:ImLunaHey/gba-recomp.git
 cd gba-recomp
 npm install
+npm run build:wasm   # compile the Rust core → core/pkg (needs Rust + wasm-pack)
 npm run dev
 ```
+
+Building the core needs the [Rust toolchain](https://rustup.rs) (with the `wasm32-unknown-unknown` target) and [`wasm-pack`](https://rustwasm.github.io/wasm-pack/). `npm run build` runs `build:wasm` for you; in dev you build the core once and Vite serves it.
 
 Open the URL Vite prints. For a stable local URL, `npm run dev:portless` serves `https://gba-recomp.localhost` via [portless](https://www.npmjs.com/package/portless).
 
@@ -71,7 +68,7 @@ Input works from on-screen buttons, the keyboard, and hardware gamepads — **mu
 
 In-cart saves are automatic and persist locally, keyed by the game's code. The save back-end is **autodetected** from the ROM's AGB signature — 32 KB SRAM, 64 KB / 128 KB Flash, or 512 B / 8 KB serial EEPROM — defaulting to Flash 128 KB. Export / import the raw `.sav` blob from the player.
 
-Save states are separate: snapshot the full emulator state into numbered **slots**, each with a thumbnail. Quick save / load is on F2 / F4, plus auto-save and auto-resume so you pick up where you left off.
+Save states are separate: snapshot the full emulator state into numbered **slots**, each with a thumbnail. Quick save / load is on F2 / F4, plus auto-save and auto-resume so you pick up where you left off. The snapshot format is a versioned, tagged-section binary blob produced by the Rust core.
 
 ## Settings & extras
 
@@ -87,85 +84,57 @@ Save states are separate: snapshot the full emulator state into numbered **slots
 
 The UI is a themed dark shell with shared modals, toasts, and mobile bottom-sheets.
 
-## Running headless
-
-```bash
-# Boot a ROM for N frames and dump CPU/PPU stats
-npm run boot -- public/firered.gba 60
-
-# Press A every 60 frames (useful for getting past intros)
-PRESS_A_EVERY=60 npm run boot -- public/firered.gba 600
-
-# Dump active OAM after frame N
-DUMP_SPRITE_FRAME=300 npm run boot -- public/firered.gba 0
-```
-
-ROMs aren't shipped — put `.gba` files in `public/` and they'll be reachable. `public/*.gba` is gitignored.
-
 ## Architecture
 
 ```
-src/
-  cpu/            ARM7TDMI interpreter
-    state.ts        16 registers, banked SP/LR per mode, CPSR/SPSR
-    arm.ts          ARM-mode dispatch + decode (32-bit insns)
-    thumb.ts        THUMB-mode dispatch + decode (16-bit insns)
-    shifter.ts      Barrel shifter
-    cpu.ts          Top-level step(), IRQ handling, exception entry,
-                    BIOS stub installation
-  ppu/
-    ppu.ts          Mode dispatch, scanline timing, VBlank/HBlank/VCount IRQs
-    modes_text.ts   Text-mode BG renderer (4bpp and 8bpp)
-    modes_affine.ts Affine BG renderer (mode 1 BG2, mode 2 BG2/3)
-    modes_bitmap.ts Modes 3/4/5 bitmap renderers
-    sprites.ts      OAM scan + sprite render (incl. affine + double-size)
-    composite.ts    Per-pixel BG/OBJ priority + windowing + mosaic + blending
-  io/
-    io.ts           IO port routing
-    irq.ts          IE/IF/IME
-    dma.ts          4 channels (immediate / VBlank / HBlank / special)
-    timers.ts       4 timers with prescalers + count-up cascade
-    sound.ts        PSG channels 1-4 + DirectSound A/B FIFOs, stereo mix
-    sio.ts          Serial IO (normal / multiplayer modes)
-    sio-signal.ts   WebRTC signalling for the link cable
-    cheats.ts       GameShark / Action Replay code engine
-    keypad.ts       KEYINPUT bitmask
-  memory/
-    bus.ts          Region routing (EWRAM/IWRAM/PRAM/VRAM/OAM/ROM/save)
-    flash.ts        Macronix / Atmel Flash chip emulation (64/128 KB)
-    sram.ts         32 KB battery-backed SRAM
-    eeprom.ts       512 B / 8 KB serial EEPROM
-    saveDetect.ts   Save-type autodetect from the AGB signature
-    rtc.ts          Seiko S-3511A RTC bit-bang protocol
-    regions.ts      Memory map constants
-  bios/
-    hle.ts          BIOS SWI high-level emulation
-  recomp/           THUMB+ARM → WASM basic-block recompiler (enabled by
-    compiler.ts       default; SWI/MRS/MSR/SWP fall back to the interpreter)
-    wasm-emit.ts      WASM module builder
-  savestate.ts      Full emulator state snapshot / restore
-  ui/               React + Tailwind UI (LibraryPage, PlayerPage, Screen,
-                    Gamepad, ControllerPanel, RomLibrary, SaveStatesPanel,
-                    SettingsPanel, CheatsPanel, LinkPanel, DebugPanel,
-                    audio sink, gamepad polling)
-  emulator.ts       Composes all the above; runFrame() advances the CPU
-                    one frame's worth of cycles, the PPU/Timer/Sound, and
-                    returns stats
-  worker.ts         Cloudflare Worker entry (serves the built app)
+core/                  Rust GBA core — a standalone crate, no browser deps
+  src/
+    state.rs             ARM7TDMI register file, banking, CPSR/SPSR
+    arm.rs / thumb.rs    ARM (32-bit) + THUMB (16-bit) interpreters
+    shifter.rs           Barrel shifter
+    cpu.rs               step(), IRQ handling, exception entry, BIOS stub
+    bus.rs / regions.rs  Memory map + region routing (Mem)
+    flash.rs / sram.rs / eeprom.rs / save_detect.rs   Save back-ends + autodetect
+    rtc.rs               Seiko S-3511A RTC bit-bang protocol
+    ppu.rs               All BG modes, sprites (affine), windows, mosaic, blending
+    dma.rs / timers.rs / irq.rs   DMA, timers (+ count-up cascade), IE/IF/IME
+    sound.rs             PSG 1-4 + DirectSound A/B FIFOs, stereo mix
+    sio.rs               Serial IO (normal / multiplayer) + async link bridge
+    keypad.rs / cheats.rs
+    bios.rs              BIOS SWI high-level emulation
+    savestate.rs         Full-state snapshot / restore
+    emulator.rs          The `Gba` god-struct: owns everything, runs frames,
+                         implements the memory bus (io.ts routing lives here)
+    debug.rs             Introspection surface for the UI debug panel
+    wasm.rs              wasm-bindgen surface (WasmGba)
+  pkg/                   wasm-pack output (gitignored; `npm run build:wasm`)
+
+src/                   React + TypeScript browser app
+  ui/                    React UI (LibraryPage, PlayerPage, Screen, Gamepad,
+                         ControllerPanel, SaveStatesPanel, SettingsPanel,
+                         CheatsPanel, LinkPanel, DebugPanel, audio sink, …)
+  ui/wasmEmulator.ts     Adapter exposing the wasm core to the UI
+  io/sio-signal.ts       WebRTC link-cable transport (drives the core's SIO)
+  io/keypad.ts           Key enum (button bit layout)
+  io/cheats.ts           Cheat parsing (the engine runs in the core)
+  io/sio.ts              MultiplayResult type + LocalLoopback sentinel
+  emulator.ts            `type Emulator = WasmEmulator` (UI prop type)
+  worker.ts              Cloudflare Worker entry (serves the built app)
 ```
 
 ## Build + test
 
 ```bash
-npm run test        # vitest
-npm run test:watch  # interactive
-npm run lint        # oxlint
-npm run build       # tsc && vite build → dist/
+npm run build:wasm  # wasm-pack build core → core/pkg
+npm run build       # build:wasm + tsc + vite build → dist/
+npm test            # cargo test (Rust core; 235 vectors)
+npm run lint        # oxlint (UI/TS)
+npm run dev         # Vite dev server
 npm run preview     # build, then serve via wrangler dev
 npm run deploy      # build + wrangler deploy (Cloudflare)
 ```
 
-Tests that need a real ROM are **skipped when the ROM file is absent** (ROMs are gitignored), so CI passes without shipping any game.
+ROMs aren't shipped — `public/*.gba` is gitignored.
 
 ## Bugs / requests
 
@@ -173,16 +142,15 @@ Tests that need a real ROM are **skipped when the ROM file is absent** (ROMs are
 
 ## Tech
 
-- TypeScript everywhere
+- **Rust** core compiled to **WebAssembly** via `wasm-bindgen` / `wasm-pack`
 - React 19 + Tailwind 4 for UI, React Router for navigation
 - TanStack Query (with persistence) for cover-art fetching/caching
-- WebAssembly for the recompiler
 - Vite for the dev server + bundler
-- Vitest for tests, Oxlint for lint
+- `cargo test` for the core, Oxlint for the UI
 - Cloudflare Workers + Wrangler for deploy
 - IndexedDB for ROM storage, local persistence for saves + save states
 - Web Audio API for sound, Web Gamepad API for controllers, Pointer events for touch + mouse
 - WebRTC for the link cable
 - PWA (web manifest + service worker) for install + offline shell
 
-The core emulator (`cpu/`, `ppu/`, `io/`, `memory/`, `bios/`, `recomp/`) is pure TypeScript with TypedArrays — no DOM, no browser APIs beyond `WebAssembly`. It can be reused under a different UI shell.
+The core (`core/`) is a dependency-free Rust crate that compiles to WebAssembly and can be reused under a different host — the React app is just one shell over it.
