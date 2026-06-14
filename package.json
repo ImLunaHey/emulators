@@ -9,12 +9,13 @@
     "dev:portless": "portless emulators vite",
     "build:wasm": "wasm-pack build core --target web --out-dir pkg --release",
     "build:wasm:nds": "wasm-pack build core-nds --target web --out-dir pkg --release",
+    "build:wasm:nes": "wasm-pack build core-nes --target web --out-dir pkg --release",
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "cargo test --manifest-path core/Cargo.toml",
     "lint": "oxlint src",
-    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build && wrangler deploy"
+    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.40.0",

@@ -26,6 +26,10 @@ core-nds/target
 core-nds/pkg
 core-ps1/target
 core-ps1/pkg
+core-nes/target
+core-nes/pkg
+core-gbc/target
+core-gbc/pkg
 
 # rust mobile FFI crate (native libs / xcframework build output)
 core-ffi/target
