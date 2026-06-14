@@ -1,0 +1,25 @@
+[package]
+name = "gbc-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Game Boy Color (CGB) core, written from scratch against the
+# hardware spec (Pan Docs, gbdev.io/pandocs). The fourth core in this repo,
+# mirroring the GBA/NDS/PS1 cores' ownership model: one `Gbc` god-struct owns
+# every subsystem and implements the `Bus` trait. This phase lands the
+# LR35902 register/interrupt foundation + memory map + cartridge MBC routing.
+[lib]
+crate-type = ["rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter (no per-unit
+# boundaries blocking inlining of the monomorphized bus accesses).
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
+# landing-pad tables, shrinking the binary and trimming the hot paths. (cargo
+# test runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+[dependencies]
