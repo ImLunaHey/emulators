@@ -15,6 +15,15 @@
 //! paths are `todo!()` until the IO modules land.
 
 use crate::cpu::{Cp15, CpuState};
+use crate::io::dma::{Dma, DmaTiming};
+use crate::io::ds_math::DsMath;
+use crate::io::ipc::Ipc;
+use crate::io::irq::Irq;
+use crate::io::rtc::Rtc;
+use crate::io::sound::Sound;
+use crate::io::spi::Spi;
+use crate::io::timers::Timers;
+use crate::io::touch::TouchDriver;
 use crate::memory::bus7::Resolved as Resolved7;
 use crate::memory::bus9::Resolved as Resolved9;
 use crate::memory::{Bus7, Bus9, SharedMemory, VramRouter};
@@ -49,6 +58,61 @@ pub struct Nds {
 
     /// ARM9 CP15 system-control coprocessor (caches/MPU/TCM config).
     pub cp15: Cp15,
+
+    // ─── IO devices ──────────────────────────────────────────────────────
+    //
+    // The DS has TWO of several blocks (one per core) and a handful shared.
+    // Per-core: IRQ controller, DMA, timers. ARM9-only: the math accelerator.
+    // ARM7-only: SPI bus, RTC, sound. Shared: IPC (one instance both cores
+    // poke) and the touch driver (an HLE helper, ARM9-side memory writer).
+
+    /// ARM9 interrupt controller (IE/IF/IME).
+    pub irq9: Irq,
+    /// ARM7 interrupt controller.
+    pub irq7: Irq,
+
+    /// ARM9 DMA (4 channels, 3-bit timing).
+    pub dma9: Dma,
+    /// ARM7 DMA (4 channels, 2-bit timing).
+    pub dma7: Dma,
+
+    /// ARM9 timers (4).
+    pub timers9: Timers,
+    /// ARM7 timers (4).
+    pub timers7: Timers,
+
+    /// ARM9 math accelerator (divider + sqrt). No ARM7 equivalent.
+    pub ds_math: DsMath,
+
+    /// ARM7 SPI bus (firmware / touchscreen / power-management).
+    pub spi: Spi,
+    /// ARM7 real-time clock.
+    pub rtc: Rtc,
+    /// ARM7 sound chip (16 channels).
+    pub sound: Sound,
+
+    /// Inter-processor communication (IPCSYNC + the two FIFO queues). Single
+    /// instance shared by both cores — the IO dispatch passes each accessing
+    /// core's `is_arm9` perspective.
+    pub ipc: Ipc,
+
+    /// HLE touch driver — writes the cooked NitroSDK touch sample into main RAM
+    /// each VBlank (skips the ARM7 PXI roundtrip we don't model).
+    pub touch: TouchDriver,
+
+    // ─── Misc per-core IO latches the dispatch reads/writes directly ─────
+
+    /// POSTFLG (0x04000300) bit 0 = boot completed. We HLE the handoff → 1.
+    pub postflg9: u32,
+    pub postflg7: u32,
+    /// POWCNT1 (ARM9, 0x04000304). Typical post-BIOS default.
+    pub powcnt1: u32,
+    /// HALTCNT (0x04000301) latch.
+    pub haltcnt7: u32,
+    /// KEYINPUT (0x04000130) — bits LOW = pressed. Default all-up.
+    pub keyinput: u32,
+    /// EXTKEYIN (0x04000136) — X, Y, lid; low = active.
+    pub ext_keyinput: u32,
 }
 
 impl Default for Nds {
@@ -68,6 +132,26 @@ impl Nds {
             state9: CpuState::new(),
             state7: CpuState::new(),
             cp15: Cp15::new(),
+
+            irq9: Irq::new(),
+            irq7: Irq::new(),
+            dma9: Dma::new(true),
+            dma7: Dma::new(false),
+            timers9: Timers::new(),
+            timers7: Timers::new(),
+            ds_math: DsMath::new(),
+            spi: Spi::new(),
+            rtc: Rtc::new(),
+            sound: Sound::new(),
+            ipc: Ipc::new(),
+            touch: TouchDriver::new(),
+
+            postflg9: 1,
+            postflg7: 1,
+            powcnt1: 0x820F,
+            haltcnt7: 0,
+            keyinput: 0x03FF,
+            ext_keyinput: 0x007F,
         };
         // Seed the BIOS IRQ-handler-pointer literal from CP15's reset DTCM
         // placement (matches the TS Cp15 constructor calling it). `cp15`,
@@ -243,28 +327,616 @@ impl Nds {
         );
     }
 
-    // ─── IO / WiFi routing (deferred to the unported subsystems) ─────────
+    // ─── IO register dispatch (the TS `Bus`↔`Io` cycle, resolved here) ───
     //
-    // These are the seams the IO module will fill. Until then any access that
-    // resolves to the IO/WiFi windows lands here.
+    // The two cores see DIFFERENT IO maps (ds-recomp src/io/io.ts gated on
+    // `isArm9`): the math accelerator + GX ports are ARM9-only; the SPI bus,
+    // RTC, and sound chip are ARM7-only; everything else (IRQ, IPC, DMA,
+    // timers, keypad, cart) is shared with per-core register banks. These are
+    // the seams the device wave fills — each `addr`-range arm calls a device
+    // method on `self`. `size` is the access width in bytes (1/2/4); the
+    // device methods are byte-granular and the dispatch composes wider access.
+    //
+    // The PPU register block (DISPCNT/BGxCNT/VRAMCNT/etc.) and the cart block
+    // are NOT in scope for this IO-skeleton wave — those land with the PPU and
+    // cart modules and slot into the match here.
 
-    fn io_read9(&mut self, _addr: u32, _size: u8) -> u32 {
-        todo!("port from ds-recomp src/io/io.ts (ARM9 IO read dispatch)")
+    /// ARM9 IO read dispatch (0x04000000-0x04FFFFFF, region resolved by Bus9).
+    pub fn read_io_arm9(&mut self, addr: u32, size: u8) -> u32 {
+        match size {
+            4 => self.io_read32(addr, true),
+            2 => self.io_read16(addr, true),
+            _ => self.io_read8(addr, true),
+        }
     }
-    fn io_write9(&mut self, _addr: u32, _v: u32, _size: u8) {
-        todo!("port from ds-recomp src/io/io.ts (ARM9 IO write dispatch)")
+    /// ARM9 IO write dispatch.
+    pub fn write_io_arm9(&mut self, addr: u32, size: u8, v: u32) {
+        match size {
+            4 => self.io_write32(addr, v, true),
+            2 => self.io_write16(addr, v, true),
+            _ => self.io_write8(addr, v, true),
+        }
     }
-    fn io_read7(&mut self, _addr: u32, _size: u8) -> u32 {
-        todo!("port from ds-recomp src/io/io.ts (ARM7 IO read dispatch)")
+    /// ARM7 IO read dispatch.
+    pub fn read_io_arm7(&mut self, addr: u32, size: u8) -> u32 {
+        match size {
+            4 => self.io_read32(addr, false),
+            2 => self.io_read16(addr, false),
+            _ => self.io_read8(addr, false),
+        }
     }
-    fn io_write7(&mut self, _addr: u32, _v: u32, _size: u8) {
-        todo!("port from ds-recomp src/io/io.ts (ARM7 IO write dispatch)")
+    /// ARM7 IO write dispatch.
+    pub fn write_io_arm7(&mut self, addr: u32, size: u8, v: u32) {
+        match size {
+            4 => self.io_write32(addr, v, false),
+            2 => self.io_write16(addr, v, false),
+            _ => self.io_write8(addr, v, false),
+        }
     }
+
+    // ─── Width dispatch (ports from ds-recomp io.ts IoBus.read*/write*) ──
+    //
+    // PPU/cart/GX/3D register blocks are NOT routed yet — they land with the
+    // PPU and cart modules (those branches in io.ts touch `this.ppu.*` /
+    // `this.cart.*`, which `Nds` doesn't own this wave). The seam: unmatched
+    // reads return 0, writes are swallowed, exactly like a real DS open-bus IO
+    // port. The blocks we DO own — DMA, math, IPC, IRQ, timers, keypad,
+    // POSTFLG/POWCNT/HALTCNT, VRAMCNT/WRAMCNT, SPI/RTC/sound — are wired.
+
+    #[inline]
+    fn is_dma_addr(addr: u32) -> bool {
+        let lo = addr & 0xFF;
+        (addr & 0x0FFF_FF00) == 0x0400_0000 && (0xB0..0xE0).contains(&lo)
+    }
+    #[inline]
+    fn is_math_addr(addr: u32) -> bool {
+        let m = addr & 0x0FFF_FFFF;
+        (0x0400_0280..0x0400_02C0).contains(&m)
+    }
+
+    fn io_read32(&mut self, addr: u32, is_arm9: bool) -> u32 {
+        let m = addr & 0x0FFF_FFFC;
+        if Self::is_dma_addr(addr) {
+            let dma = if is_arm9 { &self.dma9 } else { &self.dma7 };
+            return dma.read32(addr);
+        }
+        if is_arm9 && Self::is_math_addr(addr) {
+            return self.ds_math.read32(addr & 0x0FFF_FFFF);
+        }
+        // IPC RECV FIFO (atomic word pop) at 0x04100000.
+        if m == 0x0410_0000 {
+            return self
+                .ipc
+                .read_recv(is_arm9, &mut self.irq9, &mut self.irq7);
+        }
+        // Default: compose from two halfwords.
+        let lo = self.io_read16(addr, is_arm9);
+        let hi = self.io_read16(addr.wrapping_add(2), is_arm9);
+        (hi << 16) | lo
+    }
+
+    fn io_read16(&mut self, addr: u32, is_arm9: bool) -> u32 {
+        let m = addr & 0x0FFF_FFFF;
+        if Self::is_dma_addr(addr) {
+            let dma = if is_arm9 { &self.dma9 } else { &self.dma7 };
+            return dma.read16(addr);
+        }
+        if is_arm9 && Self::is_math_addr(addr) {
+            return self.ds_math.read16(addr & 0x0FFF_FFFF);
+        }
+        if m == 0x0400_0180 {
+            return self.ipc.read_sync(is_arm9);
+        }
+        if m == 0x0400_0184 {
+            return self.ipc.read_cnt(is_arm9);
+        }
+        (self.io_read8(addr, is_arm9) | (self.io_read8(addr.wrapping_add(1), is_arm9) << 8)) & 0xFFFF
+    }
+
+    fn io_read8(&mut self, addr: u32, is_arm9: bool) -> u32 {
+        let addr = addr & 0x0FFF_FFFF;
+        if is_arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
+            return self.ds_math.read8(addr);
+        }
+        // ARM7 sound chip occupies 0x04000400..0x040005FF (ARM9 sees GX → 0).
+        if !is_arm9 && (0x0400_0400..0x0400_0600).contains(&addr) {
+            return self.sound.read_byte(addr | 0x0400_0000);
+        }
+        // VRAMCNT_A..G / WRAMCNT / VRAMCNT_H..I and the ARM7 STAT mirror.
+        if !is_arm9 {
+            if addr == 0x0400_0240 {
+                return self.vram.read_vram_stat(&self.vramcnt);
+            }
+            if addr == 0x0400_0241 {
+                return self.mem.wramcnt.bits() & 0xFF;
+            }
+            if (0x0400_0242..0x0400_024A).contains(&addr) {
+                return 0;
+            }
+        } else {
+            if (0x0400_0240..0x0400_0247).contains(&addr) {
+                return self.vramcnt[(addr - 0x0400_0240) as usize] as u32;
+            }
+            if addr == 0x0400_0247 {
+                return self.mem.wramcnt.bits() & 0xFF;
+            }
+            if addr == 0x0400_0248 {
+                return self.vramcnt[7] as u32;
+            }
+            if addr == 0x0400_0249 {
+                return self.vramcnt[8] as u32;
+            }
+        }
+        // Timers (per-core), 0x04000100..0x0400010F.
+        if (0x0400_0100..0x0400_0110).contains(&addr) {
+            let timers = if is_arm9 { &self.timers9 } else { &self.timers7 };
+            return timers.read8(addr - 0x0400_0100);
+        }
+        let irq = if is_arm9 { &self.irq9 } else { &self.irq7 };
+        match addr {
+            0x0400_0130 => self.keyinput & 0xFF,
+            0x0400_0131 => (self.keyinput >> 8) & 0xFF,
+            0x0400_0136 => {
+                // EXTKEYIN: bit 6 LOW = pen down. The touch state lives on the
+                // SPI module's touch latches.
+                let mut v = self.ext_keyinput & 0xFF;
+                if self.spi.touch_x.is_some() && self.spi.touch_y.is_some() {
+                    v &= !0x40;
+                }
+                v
+            }
+            0x0400_0137 => (self.ext_keyinput >> 8) & 0xFF,
+            0x0400_0138 => self.rtc.read() & 0xFF,
+            0x0400_0139 => (self.rtc.read() >> 8) & 0xFF,
+            0x0400_0180 => self.ipc.read_sync(is_arm9) & 0xFF,
+            0x0400_0181 => (self.ipc.read_sync(is_arm9) >> 8) & 0xFF,
+            0x0400_0184 => self.ipc.read_cnt(is_arm9) & 0xFF,
+            0x0400_0185 => (self.ipc.read_cnt(is_arm9) >> 8) & 0xFF,
+            0x0400_0208 => {
+                if irq.ime {
+                    1
+                } else {
+                    0
+                }
+            }
+            0x0400_0209..=0x0400_020B => 0,
+            0x0400_0210 => irq.ie & 0xFF,
+            0x0400_0211 => (irq.ie >> 8) & 0xFF,
+            0x0400_0212 => (irq.ie >> 16) & 0xFF,
+            0x0400_0213 => (irq.ie >> 24) & 0xFF,
+            0x0400_0214 => irq.iflag & 0xFF,
+            0x0400_0215 => (irq.iflag >> 8) & 0xFF,
+            0x0400_0216 => (irq.iflag >> 16) & 0xFF,
+            0x0400_0217 => (irq.iflag >> 24) & 0xFF,
+            0x0400_0300 => {
+                if is_arm9 {
+                    self.postflg9 & 0xFF
+                } else {
+                    self.postflg7 & 0xFF
+                }
+            }
+            0x0400_0304 => self.powcnt1 & 0xFF,
+            0x0400_0305 => (self.powcnt1 >> 8) & 0xFF,
+            0x0400_0306 => (self.powcnt1 >> 16) & 0xFF,
+            0x0400_0307 => (self.powcnt1 >> 24) & 0xFF,
+            // SPI bus (ARM7 only).
+            0x0400_01C0 => {
+                if is_arm9 {
+                    0
+                } else {
+                    self.spi.read_cnt() & 0xFF
+                }
+            }
+            0x0400_01C1 => {
+                if is_arm9 {
+                    0
+                } else {
+                    (self.spi.read_cnt() >> 8) & 0xFF
+                }
+            }
+            0x0400_01C2 => {
+                if is_arm9 {
+                    0
+                } else {
+                    self.spi.read_data() & 0xFF
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn io_write32(&mut self, addr: u32, v: u32, is_arm9: bool) {
+        let m = addr & 0x0FFF_FFFC;
+        if Self::is_dma_addr(addr) {
+            let armed = if is_arm9 {
+                self.dma9.write32(addr, v)
+            } else {
+                self.dma7.write32(addr, v)
+            };
+            if let Some(ch) = armed {
+                self.run_dma_channel(ch, is_arm9);
+            }
+            return;
+        }
+        if is_arm9 && Self::is_math_addr(addr) {
+            self.ds_math.write32(addr & 0x0FFF_FFFF, v);
+            return;
+        }
+        // IPC SEND FIFO at 0x04000188.
+        if m == 0x0400_0188 {
+            self.ipc
+                .write_send(is_arm9, v, &mut self.irq9, &mut self.irq7);
+            return;
+        }
+        self.io_write16(addr, v & 0xFFFF, is_arm9);
+        self.io_write16(addr.wrapping_add(2), (v >> 16) & 0xFFFF, is_arm9);
+    }
+
+    fn io_write16(&mut self, addr: u32, v: u32, is_arm9: bool) {
+        let m = addr & 0x0FFF_FFFF;
+        if Self::is_dma_addr(addr) {
+            let armed = if is_arm9 {
+                self.dma9.write16(addr, v)
+            } else {
+                self.dma7.write16(addr, v)
+            };
+            if let Some(ch) = armed {
+                self.run_dma_channel(ch, is_arm9);
+            }
+            return;
+        }
+        if is_arm9 && Self::is_math_addr(addr) {
+            self.ds_math.write16(addr & 0x0FFF_FFFF, v);
+            return;
+        }
+        if m == 0x0400_0180 {
+            self.ipc
+                .write_sync(is_arm9, v & 0xFFFF, &mut self.irq9, &mut self.irq7);
+            return;
+        }
+        if m == 0x0400_0184 {
+            self.ipc
+                .write_cnt(is_arm9, v & 0xFFFF, &mut self.irq9, &mut self.irq7);
+            return;
+        }
+        self.io_write8(addr, v & 0xFF, is_arm9);
+        self.io_write8(addr.wrapping_add(1), (v >> 8) & 0xFF, is_arm9);
+    }
+
+    fn io_write8(&mut self, addr: u32, v: u32, is_arm9: bool) {
+        let addr = addr & 0x0FFF_FFFF;
+        let v = v & 0xFF;
+        if Self::is_dma_addr(addr | 0x0400_0000) {
+            let armed = if is_arm9 {
+                self.dma9.write8(addr, v)
+            } else {
+                self.dma7.write8(addr, v)
+            };
+            if let Some(ch) = armed {
+                self.run_dma_channel(ch, is_arm9);
+            }
+            return;
+        }
+        if is_arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
+            self.ds_math.write8(addr, v);
+            return;
+        }
+        // ARM7 sound chip.
+        if !is_arm9 && (0x0400_0400..0x0400_0600).contains(&addr) {
+            self.sound.write_byte(addr | 0x0400_0000, v);
+            return;
+        }
+        // VRAMCNT / WRAMCNT (ARM9 writes only; ARM7 writes are dropped).
+        if (0x0400_0240..0x0400_024A).contains(&addr) {
+            if !is_arm9 {
+                return;
+            }
+            if addr < 0x0400_0247 {
+                self.vramcnt[(addr - 0x0400_0240) as usize] = v as u8;
+            } else if addr == 0x0400_0247 {
+                self.mem.wramcnt = crate::memory::WramCnt::from_bits(v & 0x03);
+            } else if addr == 0x0400_0248 {
+                self.vramcnt[7] = v as u8;
+            } else if addr == 0x0400_0249 {
+                self.vramcnt[8] = v as u8;
+            }
+            return;
+        }
+        // Timers (per-core).
+        if (0x0400_0100..0x0400_0110).contains(&addr) {
+            if is_arm9 {
+                self.timers9.write8(addr - 0x0400_0100, v);
+            } else {
+                self.timers7.write8(addr - 0x0400_0100, v);
+            }
+            return;
+        }
+        match addr {
+            // IPCSYNC byte writes — assemble + delegate.
+            0x0400_0180 => {
+                let cur = self.ipc.read_sync(is_arm9);
+                self.ipc.write_sync(
+                    is_arm9,
+                    (cur & 0xFF00) | v,
+                    &mut self.irq9,
+                    &mut self.irq7,
+                );
+            }
+            0x0400_0181 => {
+                let cur = self.ipc.read_sync(is_arm9);
+                self.ipc.write_sync(
+                    is_arm9,
+                    (cur & 0x00FF) | (v << 8),
+                    &mut self.irq9,
+                    &mut self.irq7,
+                );
+            }
+            0x0400_0184 => {
+                let cur = self.ipc.read_cnt(is_arm9);
+                self.ipc
+                    .write_cnt(is_arm9, (cur & 0xFF00) | v, &mut self.irq9, &mut self.irq7);
+            }
+            0x0400_0185 => {
+                let cur = self.ipc.read_cnt(is_arm9);
+                self.ipc.write_cnt(
+                    is_arm9,
+                    (cur & 0x00FF) | (v << 8),
+                    &mut self.irq9,
+                    &mut self.irq7,
+                );
+            }
+            0x0400_0208 => {
+                let irq = if is_arm9 { &mut self.irq9 } else { &mut self.irq7 };
+                irq.set_ime(v & 1);
+            }
+            0x0400_0210..=0x0400_0213 => {
+                let irq = if is_arm9 { &mut self.irq9 } else { &mut self.irq7 };
+                let shift = (addr & 3) * 8;
+                irq.set_ie((irq.ie & !(0xFF << shift)) | (v << shift));
+            }
+            0x0400_0214..=0x0400_0217 => {
+                let irq = if is_arm9 { &mut self.irq9 } else { &mut self.irq7 };
+                let shift = (addr & 3) * 8;
+                irq.ack_if(v << shift);
+            }
+            0x0400_0138 => {
+                let cur = self.rtc.read();
+                self.rtc.write((cur & 0xFF00) | v);
+            }
+            0x0400_0139 => {
+                let cur = self.rtc.read();
+                self.rtc.write((cur & 0x00FF) | (v << 8));
+            }
+            0x0400_0300 => {
+                if is_arm9 {
+                    self.postflg9 = v;
+                } else {
+                    self.postflg7 = v;
+                }
+            }
+            0x0400_0301 => {
+                // HALTCNT — bit 7 = HALT, bit 6 = sleep. Either halts the CPU.
+                // We model the halt directly on the relevant CpuState (the TS
+                // routed through bios.halt(); that side-channel resolves here).
+                self.haltcnt7 = v;
+                if (v & 0x80) != 0 || (v & 0x40) != 0 {
+                    let st = if is_arm9 {
+                        &mut self.state9
+                    } else {
+                        &mut self.state7
+                    };
+                    st.halted = true;
+                }
+            }
+            0x0400_0304 => self.powcnt1 = (self.powcnt1 & !0xFF) | v,
+            0x0400_0305 => self.powcnt1 = (self.powcnt1 & !0xFF00) | (v << 8),
+            0x0400_0306 => self.powcnt1 = (self.powcnt1 & !0xFF_0000) | (v << 16),
+            0x0400_0307 => self.powcnt1 = (self.powcnt1 & !0xFF00_0000) | (v << 24),
+            // SPI bus (ARM7 only).
+            0x0400_01C0 => {
+                if !is_arm9 {
+                    let c = self.spi.read_cnt();
+                    self.spi.write_cnt((c & 0xFF00) | v);
+                }
+            }
+            0x0400_01C1 => {
+                if !is_arm9 {
+                    let c = self.spi.read_cnt();
+                    self.spi.write_cnt((c & 0x00FF) | (v << 8));
+                }
+            }
+            0x0400_01C2 => {
+                if !is_arm9 {
+                    self.spi.write_data(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Bus-accessor seams (named by bus9.rs/bus7.rs) forward to the dispatch.
+    #[inline]
+    fn io_read9(&mut self, addr: u32, size: u8) -> u32 {
+        self.read_io_arm9(addr, size)
+    }
+    #[inline]
+    fn io_write9(&mut self, addr: u32, v: u32, size: u8) {
+        self.write_io_arm9(addr, size, v)
+    }
+    #[inline]
+    fn io_read7(&mut self, addr: u32, size: u8) -> u32 {
+        self.read_io_arm7(addr, size)
+    }
+    #[inline]
+    fn io_write7(&mut self, addr: u32, v: u32, size: u8) {
+        self.write_io_arm7(addr, size, v)
+    }
+
+    // ─── WiFi MMIO (ARM7 0x04800000-0x04807FFF) — minimal no-op stub ─────
+    //
+    // We don't emulate the WiFi link layer (there's no peer). For this wave
+    // reads return 0 and writes are swallowed, which keeps the bus seams
+    // typed; a faithful probe-response stub (chip-ID 0x1440, power-state ready
+    // bit, baseband shadow) lands with the WiFi device port later.
     fn wifi_read7(&mut self, _addr: u32, _size: u8) -> u32 {
-        todo!("port from ds-recomp src/io/wifi.ts (ARM7 WiFi MMIO read)")
+        0
     }
-    fn wifi_write7(&mut self, _addr: u32, _v: u32, _size: u8) {
-        todo!("port from ds-recomp src/io/wifi.ts (ARM7 WiFi MMIO write)")
+    fn wifi_write7(&mut self, _addr: u32, _v: u32, _size: u8) {}
+
+    // ─── DMA orchestration (owns the memory walk the `Dma` struct can't) ─
+    //
+    // `Dma` holds only channel state; the transfer touches `self`'s bus, so it
+    // lives here. The device wave calls these from the dispatch (immediate arm)
+    // and from the PPU timing triggers.
+
+    /// Walk one ARM9 DMA channel's transfer through the ARM9 bus, then run the
+    /// `Dma`'s post-transfer writeback + completion IRQ. The split borrow:
+    /// channel src/dst/count are copied out of `self.dma9` before the loop, the
+    /// loop uses `self.read*/write*_arm9`, then `self.dma9.finish_channel` and
+    /// `self.irq9.raise` apply the tail.
+    pub fn run_dma_channel9(&mut self, channel: usize) {
+        self.run_dma_channel(channel, true);
+    }
+    /// Walk one ARM7 DMA channel through the ARM7 bus (same shape).
+    pub fn run_dma_channel7(&mut self, channel: usize) {
+        self.run_dma_channel(channel, false);
+    }
+
+    /// Walk one DMA channel's transfer through the relevant core's bus, then
+    /// run the `Dma`'s post-transfer writeback + completion IRQ. Ported from
+    /// ds-recomp dma.ts `runChannel`. The split-borrow: channel src/dst/count
+    /// modes are copied out of the `Dma` struct before the loop; the loop uses
+    /// the core's `read*/write*` bus accessors; then `finish_channel` applies
+    /// the writeback and reports whether to raise the completion IRQ.
+    fn run_dma_channel(&mut self, channel: usize, is_arm9: bool) {
+        let (word_count, step, word32, src_mode, dst_mode, mut src, mut dst, irq_bit) = {
+            let dma = if is_arm9 { &self.dma9 } else { &self.dma7 };
+            let c = &dma.channels[channel];
+            (
+                c.word_count(is_arm9),
+                c.step(),
+                c.word32,
+                c.src_mode,
+                c.dst_mode,
+                c.src,
+                c.dst,
+                Dma::channel_irq_bit(channel),
+            )
+        };
+
+        for _ in 0..word_count {
+            if word32 {
+                let v = if is_arm9 {
+                    self.read32_arm9(src & !3)
+                } else {
+                    self.read32_arm7(src & !3)
+                };
+                if is_arm9 {
+                    self.write32_arm9(dst & !3, v);
+                } else {
+                    self.write32_arm7(dst & !3, v);
+                }
+            } else {
+                let v = if is_arm9 {
+                    self.read16_arm9(src & !1)
+                } else {
+                    self.read16_arm7(src & !1)
+                };
+                if is_arm9 {
+                    self.write16_arm9(dst & !1, v);
+                } else {
+                    self.write16_arm7(dst & !1, v);
+                }
+            }
+            // Step source: 0=incr, 1=decr, 2/3=fixed.
+            match src_mode {
+                0 => src = src.wrapping_add(step),
+                1 => src = src.wrapping_sub(step),
+                _ => {}
+            }
+            // Step dest: mode 3 ("incr+reload") walks forward like mode 0, then
+            // snaps back AFTER the transfer (finish_channel handles the snap).
+            match dst_mode {
+                0 | 3 => dst = dst.wrapping_add(step),
+                1 => dst = dst.wrapping_sub(step),
+                _ => {}
+            }
+        }
+
+        let dma = if is_arm9 { &mut self.dma9 } else { &mut self.dma7 };
+        let raise = dma.finish_channel(channel, src, dst);
+        if raise {
+            if is_arm9 {
+                self.irq9.raise(irq_bit);
+            } else {
+                self.irq7.raise(irq_bit);
+            }
+        }
+    }
+
+    /// PPU VBlank trigger: run every armed VBlank-timed channel on both cores
+    /// (ARM9 also re-evaluates GXFIFO-timed channels — see dma.ts).
+    pub fn dma_trigger_vblank(&mut self) {
+        for ch in self.dma9.channels_for_timing(DmaTiming::VBlank).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, true);
+        }
+        // ARM9 re-evaluates GXFIFO-timed channels every frame (our GX drains
+        // synchronously so the "FIFO below half-full" condition always holds).
+        for ch in self.dma9.channels_for_timing(DmaTiming::GxFifo).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, true);
+        }
+        for ch in self.dma7.channels_for_timing(DmaTiming::VBlank).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, false);
+        }
+    }
+    /// PPU HBlank trigger.
+    pub fn dma_trigger_hblank(&mut self) {
+        for ch in self.dma9.channels_for_timing(DmaTiming::HBlank).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, true);
+        }
+        for ch in self.dma7.channels_for_timing(DmaTiming::HBlank).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, false);
+        }
+    }
+    /// Cart "card ready" trigger (ARM9 only).
+    pub fn dma_trigger_card_ready(&mut self) {
+        for ch in self.dma9.channels_for_timing(DmaTiming::CardReady).collect::<Vec<_>>() {
+            self.run_dma_channel(ch, true);
+        }
+    }
+
+    // ─── Touch driver (ARM9-side memory writer) ──────────────────────────
+
+    /// Once-per-VBlank cooked-touch write. Reads the pointer latches off `spi`,
+    /// cooks them via `self.touch.cook(...)`, then writes the struct into main
+    /// RAM via the ARM9 bus and updates `Bus7`'s touch HLE flags.
+    pub fn touch_tick_vblank(&mut self) {
+        // OSTouchPanelStatus struct in main RAM (NitroSDK shared work area).
+        const TOUCH_STRUCT_BASE: u32 = 0x027F_FFA8;
+        const TOUCH_PRESSED_OFFSET: u32 = 0x00;
+        const TOUCH_X_OFFSET: u32 = 0x02;
+        const TOUCH_Y_OFFSET: u32 = 0x04;
+        const TOUCH_FRAME_OFFSET: u32 = 0x06;
+
+        let Some(cooked) =
+            self.touch
+                .cook(self.spi.touch_x, self.spi.touch_y, self.spi.touch_z)
+        else {
+            return;
+        };
+        let pressed = if cooked.pressed { 1 } else { 0 };
+        let sx = cooked.screen_x;
+        let sy = cooked.screen_y;
+
+        self.write8_arm9(TOUCH_STRUCT_BASE + TOUCH_PRESSED_OFFSET, pressed);
+        self.write16_arm9(TOUCH_STRUCT_BASE + TOUCH_X_OFFSET, sx);
+        self.write16_arm9(TOUCH_STRUCT_BASE + TOUCH_Y_OFFSET, sy);
+        self.write8_arm9(TOUCH_STRUCT_BASE + TOUCH_FRAME_OFFSET, cooked.update_frame);
+
+        // Hand the cooked state to Bus7 so ARM7's mid-frame touch-struct
+        // rewrites see the same pressed/coords (see bus7 munge logic).
+        self.bus7.touch_pressed = cooked.pressed;
+        self.bus7.touch_screen_x = sx;
     }
 
     // ─── Frame loop (deferred — needs CPU exec + every subsystem) ────────
@@ -374,5 +1046,345 @@ mod tests {
         nds.cp15_write(0, 9, 1, 0, value);
         assert_eq!(nds.bus9.dtcm_base, 0x0280_0000);
         assert_eq!(nds.bus9.dtcm_virtual_size, 512 << 5);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // IO register dispatch — ported from ds-recomp io_register_routing.test.ts
+    // (the in-scope device branches: DMA, math, IPC, IRQ, keypad, POSTFLG/
+    // POWCNT, VRAMCNT/WRAMCNT, sound isolation, SPI). PPU/cart/GX branches are
+    // out of scope this wave and intentionally not asserted.
+    // ════════════════════════════════════════════════════════════════════
+
+    use crate::io::irq::{IRQ_DMA0, IRQ_TIMER0};
+
+    // ─── KEYINPUT ────────────────────────────────────────────────────────
+    #[test]
+    fn keyinput_reads_and_updates_live() {
+        let mut nds = Nds::new();
+        nds.keyinput = 0x3FF;
+        assert_eq!(nds.read8_arm9(0x0400_0130), 0xFF);
+        assert_eq!(nds.read8_arm9(0x0400_0131), 0x03);
+        nds.keyinput = 0x3FE; // press A (clear bit 0)
+        assert_eq!(nds.read8_arm9(0x0400_0130), 0xFE);
+    }
+
+    // ─── IME / IE / IF byte slices ───────────────────────────────────────
+    #[test]
+    fn ime_round_trips() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0208, 1);
+        assert!(nds.irq9.ime);
+        assert_eq!(nds.read8_arm9(0x0400_0208), 1);
+        nds.write8_arm9(0x0400_0208, 0);
+        assert!(!nds.irq9.ime);
+        assert_eq!(nds.read8_arm9(0x0400_0208), 0);
+    }
+
+    #[test]
+    fn ie_round_trips_byte_by_byte() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0210, 0x11);
+        nds.write8_arm9(0x0400_0211, 0x22);
+        nds.write8_arm9(0x0400_0212, 0x33);
+        nds.write8_arm9(0x0400_0213, 0x44);
+        assert_eq!(nds.irq9.ie, 0x4433_2211);
+        assert_eq!(nds.read8_arm9(0x0400_0210), 0x11);
+        assert_eq!(nds.read8_arm9(0x0400_0213), 0x44);
+    }
+
+    #[test]
+    fn if_acks_by_writing_one_to_clear() {
+        let mut nds = Nds::new();
+        nds.irq9.raise(0xFF);
+        assert_eq!(nds.read8_arm9(0x0400_0214), 0xFF);
+        // Write 0x0F to ack the low 4 bits.
+        nds.write8_arm9(0x0400_0214, 0x0F);
+        assert_eq!(nds.read8_arm9(0x0400_0214), 0xF0);
+        // Second-byte ack slice.
+        nds.irq9.raise(0x00FF_0000);
+        nds.write8_arm9(0x0400_0216, 0xFF);
+        assert_eq!(nds.read8_arm9(0x0400_0216), 0);
+    }
+
+    #[test]
+    fn ie_round_trips_word() {
+        let mut nds = Nds::new();
+        nds.write32_arm9(0x0400_0210, 0xDEAD_BEEF);
+        assert_eq!(nds.irq9.ie, 0xDEAD_BEEF);
+        assert_eq!(nds.read32_arm9(0x0400_0210), 0xDEAD_BEEF);
+    }
+
+    // The two cores have INDEPENDENT IRQ controllers: an ARM9 IE write must
+    // not be visible to ARM7.
+    #[test]
+    fn irq_controllers_are_per_core() {
+        let mut nds = Nds::new();
+        nds.write32_arm9(0x0400_0210, 0xFFFF_FFFF);
+        assert_eq!(nds.irq9.ie, 0xFFFF_FFFF);
+        assert_eq!(nds.irq7.ie, 0);
+        assert_eq!(nds.read32_arm7(0x0400_0210), 0);
+    }
+
+    // ─── POSTFLG / POWCNT1 ───────────────────────────────────────────────
+    #[test]
+    fn postflg_per_core() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0300, 0xAA);
+        assert_eq!(nds.postflg9, 0xAA);
+        assert_eq!(nds.read8_arm9(0x0400_0300), 0xAA);
+        // ARM7 POSTFLG is a separate latch.
+        nds.write8_arm7(0x0400_0300, 0x01);
+        assert_eq!(nds.postflg7, 0x01);
+        assert_eq!(nds.postflg9, 0xAA);
+    }
+
+    #[test]
+    fn powcnt1_round_trips_byte_by_byte() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0304, 0x11);
+        nds.write8_arm9(0x0400_0305, 0x22);
+        nds.write8_arm9(0x0400_0306, 0x33);
+        nds.write8_arm9(0x0400_0307, 0x44);
+        assert_eq!(nds.powcnt1, 0x4433_2211);
+        assert_eq!(nds.read8_arm9(0x0400_0304), 0x11);
+        assert_eq!(nds.read8_arm9(0x0400_0307), 0x44);
+    }
+
+    // ─── VRAMCNT / WRAMCNT ───────────────────────────────────────────────
+    #[test]
+    fn vramcnt_write_arm9_read_back() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0240, 0x81);
+        assert_eq!(nds.vramcnt[0], 0x81);
+        assert_eq!(nds.read8_arm9(0x0400_0240), 0x81);
+    }
+
+    #[test]
+    fn wramcnt_write_masks_to_two_bits() {
+        let mut nds = Nds::new();
+        nds.write8_arm9(0x0400_0247, 0xFF);
+        assert_eq!(nds.mem.wramcnt.bits(), 0x03);
+        assert_eq!(nds.read8_arm9(0x0400_0247), 0x03);
+    }
+
+    #[test]
+    fn arm7_cannot_write_vramcnt() {
+        let mut nds = Nds::new();
+        let before = nds.vramcnt[0];
+        nds.write8_arm7(0x0400_0240, 0x42);
+        assert_eq!(nds.vramcnt[0], before);
+    }
+
+    // ─── ARM7 sound isolation ────────────────────────────────────────────
+    // SOUNDCNT (0x04000500) is ARM7-only; ARM9 reads see GX/open-bus → 0.
+    #[test]
+    fn sound_port_arm7_only() {
+        let mut nds = Nds::new();
+        nds.write8_arm7(0x0400_0500, 0xAA);
+        nds.write8_arm7(0x0400_0501, 0xBB);
+        assert_eq!(nds.read8_arm7(0x0400_0500), 0xAA);
+        assert_eq!(nds.read8_arm7(0x0400_0501), 0xBB);
+        // ARM9 must NOT see the ARM7 sound state.
+        assert_eq!(nds.read8_arm9(0x0400_0500), 0);
+    }
+
+    // ─── DMA register routing ────────────────────────────────────────────
+    #[test]
+    fn dma_sad_routes_through_io() {
+        let mut nds = Nds::new();
+        nds.write32_arm9(0x0400_00B0, 0x0200_0000);
+        assert_eq!(nds.dma9.channels[0].src, 0x0200_0000);
+        assert_eq!(nds.read32_arm9(0x0400_00B0), 0x0200_0000);
+        // Byte write composes too.
+        nds.write8_arm9(0x0400_00B0, 0xEF);
+        assert_eq!(nds.dma9.channels[0].src & 0xFF, 0xEF);
+    }
+
+    // ─── DS Math routing (ARM9 only) ─────────────────────────────────────
+    #[test]
+    fn ds_math_routes_on_arm9_not_arm7() {
+        let mut nds = Nds::new();
+        nds.write32_arm9(0x0400_0290, 0xDEAD_BEEF);
+        assert_eq!(nds.read32_arm9(0x0400_0290), 0xDEAD_BEEF);
+        // ARM7 has no math accelerator — the write is a no-op (open bus).
+        let mut nds7 = Nds::new();
+        nds7.write32_arm7(0x0400_0290, 0xDEAD_BEEF);
+        assert_eq!(nds7.read32_arm9(0x0400_0290), 0);
+    }
+
+    // ─── IPC SEND/RECV FIFO across cores ─────────────────────────────────
+    // ARM9 writes a word to its SEND FIFO (0x04000188); ARM7 pops it from its
+    // RECV FIFO (0x04100000). Mirrors io_register_routing.test.ts.
+    #[test]
+    fn ipc_send_word_received_by_other_core() {
+        let mut nds = Nds::new();
+        nds.ipc.enable9 = true;
+        nds.ipc.enable7 = true;
+        nds.write32_arm9(0x0400_0188, 0xDEAD_BEEF);
+        let got = nds.read32_arm7(0x0410_0000);
+        assert_eq!(got, 0xDEAD_BEEF);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // DMA memory walk — ported from ds-recomp dma.test.ts. The transfer runs
+    // through the Nds bus (main RAM at 0x02000000), exercising the immediate-
+    // enable → run_dma_channel path.
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn encode_cnt(count: u32, word32: bool, src_mode: u32, dst_mode: u32, irq: bool) -> u32 {
+        let mut ctrl = 0x8000u32; // enable
+        ctrl |= dst_mode << 5;
+        ctrl |= src_mode << 7;
+        if word32 {
+            ctrl |= 1 << 10;
+        }
+        if irq {
+            ctrl |= 1 << 14;
+        }
+        (ctrl << 16) | (count & 0xFFFF)
+    }
+
+    #[test]
+    fn dma_immediate_word_copy_and_clears_enable() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        for i in 0..8u32 {
+            nds.write32_arm9(src + i * 4, 0xDEAD_BE00 + i);
+        }
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        // Immediate, word32, enable, count 8 — fires the transfer now.
+        nds.write32_arm9(0x0400_00B8, encode_cnt(8, true, 0, 0, false));
+        for i in 0..8u32 {
+            assert_eq!(nds.read32_arm9(dst + i * 4), 0xDEAD_BE00 + i);
+        }
+        // Enable bit (31) cleared, channel disabled (non-repeat immediate).
+        assert_eq!((nds.read32_arm9(0x0400_00B8) >> 31) & 1, 0);
+        assert!(!nds.dma9.channels[0].enabled);
+    }
+
+    #[test]
+    fn dma_halfword_transfer_moves_count_times_two() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        for i in 0..4u32 {
+            nds.write16_arm9(src + i * 2, 0x1100 + i);
+        }
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        nds.write32_arm9(0x0400_00B8, encode_cnt(4, false, 0, 0, false));
+        for i in 0..4u32 {
+            assert_eq!(nds.read16_arm9(dst + i * 2), 0x1100 + i);
+        }
+        // One past the end untouched.
+        assert_eq!(nds.read16_arm9(dst + 8), 0);
+    }
+
+    #[test]
+    fn dma_src_mode_fixed_reads_same_word() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        nds.write32_arm9(src, 0x5566_7788);
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        // src_mode 2 = fixed.
+        nds.write32_arm9(0x0400_00B8, encode_cnt(4, true, 2, 0, false));
+        for i in 0..4u32 {
+            assert_eq!(nds.read32_arm9(dst + i * 4), 0x5566_7788);
+        }
+    }
+
+    #[test]
+    fn dma_src_mode_decrement_walks_backwards() {
+        let mut nds = Nds::new();
+        let dst = 0x0200_0200;
+        nds.write32_arm9(0x0200_0110, 0xA1);
+        nds.write32_arm9(0x0200_010C, 0xA2);
+        nds.write32_arm9(0x0200_0108, 0xA3);
+        nds.write32_arm9(0x0200_0104, 0xA4);
+        nds.write32_arm9(0x0400_00B0, 0x0200_0110);
+        nds.write32_arm9(0x0400_00B4, dst);
+        nds.write32_arm9(0x0400_00B8, encode_cnt(4, true, 1, 0, false));
+        assert_eq!(nds.read32_arm9(dst), 0xA1);
+        assert_eq!(nds.read32_arm9(dst + 4), 0xA2);
+        assert_eq!(nds.read32_arm9(dst + 8), 0xA3);
+        assert_eq!(nds.read32_arm9(dst + 12), 0xA4);
+    }
+
+    // dst mode 3 = increment+reload: walks forward during the transfer (so all
+    // N words land at consecutive addresses), then the register snaps back.
+    #[test]
+    fn dma_dst_mode3_walks_then_register_reloads() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        for i in 0..4u32 {
+            nds.write32_arm9(src + i * 4, 0xC0DE_0000 + i);
+        }
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        nds.write32_arm9(0x0400_00B8, encode_cnt(4, true, 0, 3, false));
+        // All four words must land at distinct, consecutive destination slots.
+        for i in 0..4u32 {
+            assert_eq!(nds.read32_arm9(dst + i * 4), 0xC0DE_0000 + i);
+        }
+        // Register snapped back to the latched start.
+        assert_eq!(nds.dma9.channels[0].dst, dst);
+    }
+
+    // Completion IRQ: a finished channel with irq_on_done raises IRQ_DMA0 on
+    // the owning core.
+    #[test]
+    fn dma_completion_raises_irq() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        nds.write32_arm9(src, 0x1234_5678);
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        nds.write32_arm9(0x0400_00B8, encode_cnt(1, true, 0, 0, true));
+        assert_ne!(nds.irq9.iflag & IRQ_DMA0, 0);
+    }
+
+    // VBlank-timed channel doesn't fire on arm, but does on the trigger.
+    #[test]
+    fn dma_vblank_timed_runs_on_trigger() {
+        let mut nds = Nds::new();
+        let src = 0x0200_0100;
+        let dst = 0x0200_0200;
+        for i in 0..4u32 {
+            nds.write32_arm9(src + i * 4, 0xBEEF_0000 + i);
+        }
+        nds.write32_arm9(0x0400_00B0, src);
+        nds.write32_arm9(0x0400_00B4, dst);
+        // VBlank timing (1 << 11), word32, enable, count 4.
+        let ctrl = 0x8000 | (1 << 11) | (1 << 10);
+        nds.write32_arm9(0x0400_00B8, (ctrl << 16) | 4);
+        // Not yet transferred.
+        assert_eq!(nds.read32_arm9(dst), 0);
+        nds.dma_trigger_vblank();
+        for i in 0..4u32 {
+            assert_eq!(nds.read32_arm9(dst + i * 4), 0xBEEF_0000 + i);
+        }
+    }
+
+    // ─── Timer overflow → IRQ ────────────────────────────────────────────
+    // A timer at prescale 1, reload 0xFFFF, enabled with IRQ: one tick past
+    // 0xFFFF overflows and raises IRQ_TIMER0.
+    #[test]
+    fn timer_overflow_raises_irq_through_core() {
+        let mut nds = Nds::new();
+        // reload = 0xFFFF.
+        nds.write8_arm9(0x0400_0100, 0xFF);
+        nds.write8_arm9(0x0400_0101, 0xFF);
+        // control: enable (bit 7) + IRQ (bit 6), prescale 0 (= /1).
+        nds.write8_arm9(0x0400_0102, 0xC0);
+        nds.irq9.set_ie(IRQ_TIMER0);
+        // Two cycles: 0xFFFF → 0x0000 (overflow) → reload.
+        nds.timers9.step(2, &mut nds.irq9);
+        assert_ne!(nds.irq9.iflag & IRQ_TIMER0, 0);
     }
 }
