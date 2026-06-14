@@ -27,6 +27,7 @@ use crate::io::touch::TouchDriver;
 use crate::memory::bus7::Resolved as Resolved7;
 use crate::memory::bus9::Resolved as Resolved9;
 use crate::memory::{Bus7, Bus9, SharedMemory, VramRouter};
+use crate::ppu::ppu::Ppu;
 
 /// Which CPU a bus access is for. The two cores see different memory maps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,12 +45,16 @@ pub struct Nds {
     /// ARM7 bus state (touch-struct HLE flags).
     pub bus7: Bus7,
 
-    /// VRAM bank router. Stateless w.r.t. VRAMCNT — those registers live on
-    /// `vramcnt` here for now (they belong to the PPU once it lands).
+    /// VRAM bank router. Stateless w.r.t. VRAMCNT — those registers now live on
+    /// the PPU (`ppu.vramcnt`), which the bus routing reads on every VRAM
+    /// access.
     pub vram: VramRouter,
-    /// VRAMCNT_A..I (bank-control registers). Placeholder owner until the PPU
-    /// module is ported; the bus routing reads these on every VRAM access.
-    pub vramcnt: [u8; 9],
+
+    /// 2D PPU coordinator. Owns VRAMCNT_A..I, both 2D engines (A/B), the
+    /// scanline clock, DISPSTAT/VCOUNT, POWCNT1's graphics bits, and the two
+    /// 256x192 RGBA8888 framebuffers. The bus VRAM router borrows
+    /// `ppu.vramcnt` on every VRAM access.
+    pub ppu: Ppu,
 
     /// ARM9 register file (ARMv5TE). Shares the `CpuState` type with ARM7.
     pub state9: CpuState,
@@ -128,7 +133,7 @@ impl Nds {
             bus9: Bus9::new(),
             bus7: Bus7::new(),
             vram: VramRouter::new(),
-            vramcnt: [0; 9],
+            ppu: Ppu::new(),
             state9: CpuState::new(),
             state7: CpuState::new(),
             cp15: Cp15::new(),
@@ -228,7 +233,7 @@ impl Nds {
     #[inline]
     fn resolve9(&mut self, addr: u32, for_write: bool) -> Resolved9<'_> {
         self.bus9
-            .resolve(addr, for_write, &mut self.mem, &self.vram, &self.vramcnt)
+            .resolve(addr, for_write, &mut self.mem, &self.vram, &self.ppu.vramcnt)
     }
 
     // ─── ARM7 bus accessors ──────────────────────────────────────────────
@@ -301,7 +306,7 @@ impl Nds {
     #[inline]
     fn resolve7(&mut self, addr: u32) -> Resolved7<'_> {
         self.bus7
-            .resolve(addr, &mut self.mem, &self.vram, &self.vramcnt)
+            .resolve(addr, &mut self.mem, &self.vram, &self.ppu.vramcnt)
     }
 
     // ─── CP15 access (ARM9 MCR/MRC) ──────────────────────────────────────
@@ -442,10 +447,17 @@ impl Nds {
         if !is_arm9 && (0x0400_0400..0x0400_0600).contains(&addr) {
             return self.sound.read_byte(addr | 0x0400_0000);
         }
+        // 2D PPU register blocks (ARM9-only). DISPSTAT/VCOUNT are shared, but
+        // the TS only routed them on the ARM9 IO map; ARM7 sees open bus here.
+        if is_arm9 {
+            if let Some(v) = self.ppu_read_reg8(addr) {
+                return v;
+            }
+        }
         // VRAMCNT_A..G / WRAMCNT / VRAMCNT_H..I and the ARM7 STAT mirror.
         if !is_arm9 {
             if addr == 0x0400_0240 {
-                return self.vram.read_vram_stat(&self.vramcnt);
+                return self.vram.read_vram_stat(&self.ppu.vramcnt);
             }
             if addr == 0x0400_0241 {
                 return self.mem.wramcnt.bits() & 0xFF;
@@ -455,16 +467,16 @@ impl Nds {
             }
         } else {
             if (0x0400_0240..0x0400_0247).contains(&addr) {
-                return self.vramcnt[(addr - 0x0400_0240) as usize] as u32;
+                return self.ppu.vramcnt[(addr - 0x0400_0240) as usize] as u32;
             }
             if addr == 0x0400_0247 {
                 return self.mem.wramcnt.bits() & 0xFF;
             }
             if addr == 0x0400_0248 {
-                return self.vramcnt[7] as u32;
+                return self.ppu.vramcnt[7] as u32;
             }
             if addr == 0x0400_0249 {
-                return self.vramcnt[8] as u32;
+                return self.ppu.vramcnt[8] as u32;
             }
         }
         // Timers (per-core), 0x04000100..0x0400010F.
@@ -621,6 +633,12 @@ impl Nds {
             self.ds_math.write8(addr, v);
             return;
         }
+        // 2D PPU register blocks (ARM9-only). POWCNT1 (0x04000304) is handled
+        // below in the shared match so its non-graphics bits stay on the Nds
+        // latch (and are mirrored into the PPU there).
+        if is_arm9 && self.ppu_write_reg8(addr, v) {
+            return;
+        }
         // ARM7 sound chip.
         if !is_arm9 && (0x0400_0400..0x0400_0600).contains(&addr) {
             self.sound.write_byte(addr | 0x0400_0000, v);
@@ -632,13 +650,13 @@ impl Nds {
                 return;
             }
             if addr < 0x0400_0247 {
-                self.vramcnt[(addr - 0x0400_0240) as usize] = v as u8;
+                self.ppu.vramcnt[(addr - 0x0400_0240) as usize] = v as u8;
             } else if addr == 0x0400_0247 {
                 self.mem.wramcnt = crate::memory::WramCnt::from_bits(v & 0x03);
             } else if addr == 0x0400_0248 {
-                self.vramcnt[7] = v as u8;
+                self.ppu.vramcnt[7] = v as u8;
             } else if addr == 0x0400_0249 {
-                self.vramcnt[8] = v as u8;
+                self.ppu.vramcnt[8] = v as u8;
             }
             return;
         }
@@ -728,10 +746,25 @@ impl Nds {
                     st.halted = true;
                 }
             }
-            0x0400_0304 => self.powcnt1 = (self.powcnt1 & !0xFF) | v,
-            0x0400_0305 => self.powcnt1 = (self.powcnt1 & !0xFF00) | (v << 8),
-            0x0400_0306 => self.powcnt1 = (self.powcnt1 & !0xFF_0000) | (v << 16),
-            0x0400_0307 => self.powcnt1 = (self.powcnt1 & !0xFF00_0000) | (v << 24),
+            // POWCNT1: keep the full register on the Nds latch (non-graphics
+            // bits) AND mirror it into the PPU, whose bit 15 (display swap)
+            // selects which engine drives the top vs bottom screen.
+            0x0400_0304 => {
+                self.powcnt1 = (self.powcnt1 & !0xFF) | v;
+                self.ppu.write_powcnt1(self.powcnt1);
+            }
+            0x0400_0305 => {
+                self.powcnt1 = (self.powcnt1 & !0xFF00) | (v << 8);
+                self.ppu.write_powcnt1(self.powcnt1);
+            }
+            0x0400_0306 => {
+                self.powcnt1 = (self.powcnt1 & !0xFF_0000) | (v << 16);
+                self.ppu.write_powcnt1(self.powcnt1);
+            }
+            0x0400_0307 => {
+                self.powcnt1 = (self.powcnt1 & !0xFF00_0000) | (v << 24);
+                self.ppu.write_powcnt1(self.powcnt1);
+            }
             // SPI bus (ARM7 only).
             0x0400_01C0 => {
                 if !is_arm9 {
@@ -770,6 +803,65 @@ impl Nds {
     #[inline]
     fn io_write7(&mut self, addr: u32, v: u32, size: u8) {
         self.write_io_arm7(addr, size, v)
+    }
+
+    // ─── 2D PPU register routing (ARM9 IO map) ────────────────────────────
+    //
+    // The PPU owns DISPCNT/BGxCNT/scroll/affine/WIN/MOSAIC/BLD/master-bright/
+    // DISPCAPCNT (engine A at 0x040000xx, engine B mirror at 0x040010xx) plus
+    // the PPU-global DISPSTAT (0x04000004) and VCOUNT (0x04000006). These
+    // helpers return `Some(byte)` / `true` when the address belongs to a PPU
+    // block so the surrounding dispatch can early-out, mirroring io.ts.
+
+    /// PPU register byte read. `addr` is masked to 0x0FFFFFFF. Returns `None`
+    /// for non-PPU addresses (the caller falls through to other devices).
+    fn ppu_read_reg8(&self, addr: u32) -> Option<u32> {
+        match addr {
+            // DISPSTAT (low/high) and VCOUNT — PPU-global, recomputed live.
+            0x0400_0004 => Some(self.ppu.read_dispstat() & 0xFF),
+            0x0400_0005 => Some((self.ppu.read_dispstat() >> 8) & 0xFF),
+            0x0400_0006 => Some(self.ppu.read_vcount() & 0xFF),
+            0x0400_0007 => Some((self.ppu.read_vcount() >> 8) & 0x01),
+            // Engine A register block (DISPCNT 0..3, then 0x08..0x6F). 0x04..7
+            // are the DISPSTAT/VCOUNT handled above.
+            0x0400_0000..=0x0400_0003 | 0x0400_0008..=0x0400_006F => {
+                Some(self.ppu.read_engine_reg8(false, addr - 0x0400_0000))
+            }
+            // Engine B mirror at 0x04001000..0x0400106F.
+            0x0400_1000..=0x0400_106F => {
+                Some(self.ppu.read_engine_reg8(true, addr - 0x0400_1000))
+            }
+            _ => None,
+        }
+    }
+
+    /// PPU register byte write. Returns `true` when the address belonged to a
+    /// PPU block (and was consumed). POWCNT1 is intentionally NOT handled here
+    /// (the shared match keeps its non-graphics bits on the Nds latch).
+    fn ppu_write_reg8(&mut self, addr: u32, v: u32) -> bool {
+        match addr {
+            0x0400_0004 => {
+                let cur = self.ppu.read_dispstat();
+                self.ppu.write_dispstat((cur & 0xFF00) | v);
+                true
+            }
+            0x0400_0005 => {
+                let cur = self.ppu.read_dispstat();
+                self.ppu.write_dispstat((cur & 0x00FF) | (v << 8));
+                true
+            }
+            // VCOUNT (0x04000006/7) is read-only on hardware — swallow writes.
+            0x0400_0006 | 0x0400_0007 => true,
+            0x0400_0000..=0x0400_0003 | 0x0400_0008..=0x0400_006F => {
+                self.ppu.write_engine_reg8(false, addr - 0x0400_0000, v);
+                true
+            }
+            0x0400_1000..=0x0400_106F => {
+                self.ppu.write_engine_reg8(true, addr - 0x0400_1000, v);
+                true
+            }
+            _ => false,
+        }
     }
 
     // ─── WiFi MMIO (ARM7 0x04800000-0x04807FFF) — minimal no-op stub ─────
@@ -1031,7 +1123,7 @@ mod tests {
     #[test]
     fn vram_lcdc_bank_a_routes() {
         let mut nds = Nds::new();
-        nds.vramcnt[0] = 0x80; // bank A enabled, MST=0 (LCDC)
+        nds.ppu.vramcnt[0] = 0x80; // bank A enabled, MST=0 (LCDC)
         nds.write32_arm9(0x0680_0000, 0xFEED_BEEF);
         assert_eq!(nds.read32_arm9(0x0680_0000), 0xFEED_BEEF);
         assert_eq!(nds.mem.vram[0], 0xEF);
@@ -1150,12 +1242,41 @@ mod tests {
         assert_eq!(nds.read8_arm9(0x0400_0307), 0x44);
     }
 
+    // ─── PPU engine register routing (DISPCNT/BGxCNT/DISPSTAT/VCOUNT) ────
+    #[test]
+    fn dispcnt_and_bg0cnt_route_through_arm9_bus() {
+        let mut nds = Nds::new();
+        // DISPCNT (0x04000000) — write32 lands all four bytes in engine A.
+        nds.write32_arm9(0x0400_0000, 0x0001_0100);
+        assert_eq!(nds.ppu.engine_a.dispcnt, 0x0001_0100);
+        assert_eq!(nds.read32_arm9(0x0400_0000), 0x0001_0100);
+        // BG0CNT (0x04000008) — 16-bit register.
+        nds.write16_arm9(0x0400_0008, 0x0100);
+        assert_eq!(nds.ppu.engine_a.bg.cnt[0], 0x0100);
+        // Engine B mirror (0x04001000) is a separate latch.
+        nds.write32_arm9(0x0400_1000, 0xDEAD_BEEF);
+        assert_eq!(nds.ppu.engine_b.dispcnt, 0xDEAD_BEEF);
+        assert_eq!(nds.ppu.engine_a.dispcnt, 0x0001_0100);
+    }
+
+    #[test]
+    fn dispstat_writable_bits_and_vcount_readonly() {
+        let mut nds = Nds::new();
+        // DISPSTAT enable + target bits (0xFFF8) are writable; status bits aren't.
+        nds.write16_arm9(0x0400_0004, 0xFFF8);
+        assert_eq!(nds.read16_arm9(0x0400_0004) & 0xFFF8, 0xFFF8);
+        // VCOUNT (0x04000006) is read-only — writes are swallowed.
+        nds.ppu.vcount = 42;
+        nds.write16_arm9(0x0400_0006, 0x0123);
+        assert_eq!(nds.read16_arm9(0x0400_0006), 42);
+    }
+
     // ─── VRAMCNT / WRAMCNT ───────────────────────────────────────────────
     #[test]
     fn vramcnt_write_arm9_read_back() {
         let mut nds = Nds::new();
         nds.write8_arm9(0x0400_0240, 0x81);
-        assert_eq!(nds.vramcnt[0], 0x81);
+        assert_eq!(nds.ppu.vramcnt[0], 0x81);
         assert_eq!(nds.read8_arm9(0x0400_0240), 0x81);
     }
 
@@ -1170,9 +1291,9 @@ mod tests {
     #[test]
     fn arm7_cannot_write_vramcnt() {
         let mut nds = Nds::new();
-        let before = nds.vramcnt[0];
+        let before = nds.ppu.vramcnt[0];
         nds.write8_arm7(0x0400_0240, 0x42);
-        assert_eq!(nds.vramcnt[0], before);
+        assert_eq!(nds.ppu.vramcnt[0], before);
     }
 
     // ─── ARM7 sound isolation ────────────────────────────────────────────
