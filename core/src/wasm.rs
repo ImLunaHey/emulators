@@ -106,6 +106,20 @@ impl WasmGba {
         self.inner.set_cheats(codes_newline_joined);
     }
 
+    /// Parse a raw cheat code for the editor's live validation, returning
+    /// `[supported, unsupported, total]` line counts. Uses the exact parser
+    /// the engine applies (`crate::cheats::parse_cheat`), so the UI can never
+    /// disagree with what actually runs — the old TS reimplementation could.
+    pub fn parse_cheat_summary(&self, code: &str) -> Vec<u32> {
+        let lines = crate::cheats::parse_cheat(code);
+        let unsupported = lines
+            .iter()
+            .filter(|l| l.r#type == crate::cheats::LineType::Unsupported)
+            .count() as u32;
+        let total = lines.len() as u32;
+        vec![total - unsupported, unsupported, total]
+    }
+
     // ---- debug / introspection (DebugPanel + LinkPanel) ----
     /// JSON snapshot of CPU/PPU/DMA/timer/IRQ/sound/SIO scalar state.
     pub fn debug_state(&self) -> String {
@@ -187,6 +201,103 @@ impl WasmGba {
     }
     pub fn watch_log(&self) -> String {
         self.inner.take_watch_log()
+    }
+}
+
+/// The Rust-rendered console home screen, shown on boot. The host blits its
+/// framebuffer and feeds it input; `run_frame` returns an action token.
+#[wasm_bindgen]
+pub struct WasmHome {
+    inner: crate::home::Home,
+}
+
+#[wasm_bindgen]
+impl WasmHome {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmHome {
+        console_error_panic_hook_set();
+        WasmHome {
+            inner: crate::home::Home::new(),
+        }
+    }
+
+    /// Set the installed-game list from parallel newline-joined columns:
+    /// ids, titles, system labels, and playable flags ("1"/"0").
+    pub fn set_games(
+        &mut self,
+        ids_newline: &str,
+        titles_newline: &str,
+        systems_newline: &str,
+        playables_newline: &str,
+    ) {
+        self.inner
+            .set_games_from_str(ids_newline, titles_newline, systems_newline, playables_newline);
+    }
+
+    /// Advance one frame with an active-high, GBA-layout button mask. Returns
+    /// the action token: `""` (nothing), `"add"` (open add dialog), or
+    /// `"play:<id>"` (boot that game).
+    pub fn run_frame(&mut self, buttons: u32) -> String {
+        action_token(self.inner.run_frame(buttons))
+    }
+
+    /// Hit-test a pointer tap in launcher pixel space (host maps canvas coords
+    /// → 0..width/0..height). Returns the same action token as `run_frame`.
+    pub fn pointer(&mut self, x: i32, y: i32) -> String {
+        action_token(self.inner.pointer(x, y))
+    }
+
+    /// Attach a 32×32 RGBA icon to a game id (e.g. a decoded NDS banner). Push
+    /// these before `set_games`.
+    pub fn set_icon(&mut self, id: &str, rgba: &[u8]) {
+        self.inner.set_icon(id, rgba);
+    }
+
+    /// RGBA8888 framebuffer as a copy — convenient `putImageData` path for the
+    /// menu (perf is irrelevant here; the zero-copy pair below exists for
+    /// parity with the emulator's hot path).
+    pub fn framebuffer(&self) -> Vec<u8> {
+        self.inner.framebuffer().to_vec()
+    }
+
+    /// Pointer/len into wasm memory for the RGBA8888 framebuffer (zero-copy
+    /// blit, same pattern as `WasmGba::framebuffer_ptr`).
+    pub fn framebuffer_ptr(&self) -> usize {
+        self.inner.framebuffer().as_ptr() as usize
+    }
+    pub fn framebuffer_len(&self) -> usize {
+        self.inner.framebuffer().len()
+    }
+    pub fn width(&self) -> u32 {
+        crate::home::HOME_W as u32
+    }
+    pub fn height(&self) -> u32 {
+        crate::home::HOME_H as u32
+    }
+}
+
+/// Decode an NDS ROM's banner title (English, falling back to Japanese).
+/// Empty string if the ROM has no parseable banner.
+#[wasm_bindgen]
+pub fn nds_title(rom: &[u8]) -> String {
+    crate::nds::parse_banner(rom).map(|b| b.title).unwrap_or_default()
+}
+
+/// Decode an NDS ROM's 32×32 banner icon to RGBA8888 (4096 bytes), or an empty
+/// buffer if there's no parseable banner.
+#[wasm_bindgen]
+pub fn nds_icon_rgba(rom: &[u8]) -> Vec<u8> {
+    crate::nds::parse_banner(rom).map(|b| b.icon_rgba).unwrap_or_default()
+}
+
+/// Encode a launcher action for JS: `""` none, `"add"`, `"play:<id>"`, or
+/// `"soon:<systemLabel>"`.
+fn action_token(a: crate::home::HomeAction) -> String {
+    match a {
+        crate::home::HomeAction::None => String::new(),
+        crate::home::HomeAction::AddGame => "add".to_string(),
+        crate::home::HomeAction::Launch(id) => format!("play:{id}"),
+        crate::home::HomeAction::ComingSoon(label) => format!("soon:{label}"),
     }
 }
 

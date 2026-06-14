@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
 import { Screen } from './Screen';
 import { Gamepad } from './Gamepad';
 import { LogPane } from './LogPane';
@@ -58,13 +57,11 @@ const REWIND_STEP_MS = 50;   // playback tick while rewinding
 const AUTO_SLOT = 99;
 const AUTO_SAVE_MS = 30000;
 
-// /play/:romId — boots the ROM identified by the URL param, then renders
-// the Screen + controls + modal panels. Falls back to / if the ROM
-// can't be loaded.
-export function PlayerPage() {
+// Boots the ROM identified by `romId`, then renders the Screen + controls +
+// modal panels. `onExit` returns to the home launcher (the Home button) and is
+// also the fallback if the ROM can't be loaded.
+export function PlayerPage({ romId, onExit }: { romId: string; onExit: () => void }) {
   const { emu, audio } = useEmu();
-  const navigate = useNavigate();
-  const { romId } = useParams<{ romId: string }>();
 
   const [paused, setPaused] = useState(false);
   const [stats, setStats] = useState('— fps · — Mhz');
@@ -205,8 +202,8 @@ export function PlayerPage() {
   const loadRomById = async (id: string) => {
     const bytes = await getRomBytes(id);
     if (!bytes) {
-      append(`no ROM stored for "${id}" — back to library`);
-      navigate('/', { replace: true });
+      append(`no ROM stored for "${id}" — back to home`);
+      onExit();
       return;
     }
     romBufRef.current = bytes;
@@ -215,7 +212,7 @@ export function PlayerPage() {
     const saveKey = `gba-recomp:save:${code}`;
     saveKeyRef.current = saveKey;
     setHeaderInfo(`${title.trim()} · ${code}`);
-    setCurrentRom({ id, filename: title, title, code, size: bytes.length, addedAt: 0 });
+    setCurrentRom({ id, filename: title, title, code, system: 'gba', size: bytes.length, addedAt: 0 });
     emu.loadRom(bytes);
     try {
       const raw = localStorage.getItem(saveKey);
@@ -260,7 +257,7 @@ export function PlayerPage() {
   // in dev doesn't boot (and toast) twice.
   const bootedRomRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!romId) { navigate('/', { replace: true }); return; }
+    if (!romId) { onExit(); return; }
     if (bootedRomRef.current === romId) return;
     bootedRomRef.current = romId;
     loadRomById(romId);
@@ -648,12 +645,12 @@ export function PlayerPage() {
     <>
       <header className="w-full max-w-[720px] flex flex-wrap gap-2 justify-between items-center px-2">
         <button
-          onClick={() => navigate('/')}
+          onClick={onExit}
           className="flex items-center gap-2 bg-transparent border-0 cursor-pointer group p-0"
-          title="Back to library"
+          title="Home"
         >
-          <span className="grid place-items-center w-7 h-7 rounded-md bg-[var(--color-accent-deep)] text-[var(--color-accent)] text-[11px] font-bold shadow-[inset_0_0_0_1px_rgba(95,208,255,0.25)] group-hover:brightness-125 transition">GB</span>
-          <span className="text-sm tracking-wide opacity-80 group-hover:opacity-100 transition">gba-recomp</span>
+          <span className="grid place-items-center w-7 h-7 rounded-md bg-[var(--color-accent-deep)] text-[var(--color-accent)] text-[11px] font-bold shadow-[inset_0_0_0_1px_rgba(95,208,255,0.25)] group-hover:brightness-125 transition">⌂</span>
+          <span className="text-sm tracking-wide opacity-80 group-hover:opacity-100 transition">Home</span>
         </button>
         <div className="text-xs opacity-60 font-mono truncate">{headerInfo || 'no ROM loaded'}</div>
       </header>
@@ -680,7 +677,7 @@ export function PlayerPage() {
         <Gamepad keypad={emu.keypad} />
 
         <div className="flex gap-2 text-xs items-center w-full max-w-[720px] px-2 flex-wrap">
-          <button onClick={() => navigate('/')} className="btn" title="Library">📂<span className="hidden sm:inline">Library</span></button>
+          <button onClick={onExit} className="btn" title="Home">⌂<span className="hidden sm:inline">Home</span></button>
           <button onClick={() => setPaused((p) => !p)} className="btn btn-primary" disabled={!currentRom} title={paused ? 'Resume' : 'Pause'}>{paused ? '▶' : '❚❚'}<span className="hidden sm:inline">{paused ? 'Resume' : 'Pause'}</span></button>
           {paused && (
             <button onClick={() => stepRef.current?.()} className="btn" disabled={!currentRom} title="Step one frame (.)">⏭<span className="hidden sm:inline">Step</span></button>
@@ -849,6 +846,7 @@ export function PlayerPage() {
       <LinkPanel open={showLink} emu={emu} onClose={() => setShowLink(false)} />
       <CheatsPanel
         open={showCheats}
+        emu={emu}
         gameCode={currentRom?.code ?? null}
         romId={currentRom?.id ?? null}
         romTitle={currentRom?.title ?? null}

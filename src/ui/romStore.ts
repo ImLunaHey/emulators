@@ -10,13 +10,17 @@ const META_KEY = 'gba-recomp:selectedRom';
 export interface RomMeta {
   id: string;             // unique slug derived from filename
   filename: string;
-  title: string;          // ASCII title from header 0xA0..0xAC
-  code: string;           // 4-char game code from header 0xAC..0xB0
+  title: string;          // GBA: ASCII header title; others: filename
+  code: string;           // GBA: 4-char header code; others: ''
+  system: string;         // SystemId ('gba'|'nds'|…) — see systems.ts
   size: number;
   addedAt: number;
   // MD5 of the ROM bytes (32 hex chars). Optional because older library
   // entries may have been added before we started hashing on import.
   md5?: string;
+  // Decoded 32×32 RGBA icon (NDS banner). Absent for systems without an
+  // embedded icon (e.g. GBA).
+  icon?: Uint8Array;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -46,7 +50,8 @@ export async function listRoms(): Promise<RomMeta[]> {
     req.onsuccess = () => {
       // Return only the metadata fields (strip the bytes blob).
       const out: RomMeta[] = (req.result as any[])
-        .map(({ id, filename, title, code, size, addedAt, md5 }) => ({ id, filename, title, code, size, addedAt, md5 }))
+        .map(({ id, filename, title, code, size, addedAt, md5, system, icon }) =>
+          ({ id, filename, title, code, size, addedAt, md5, system: system ?? 'gba', icon }))
         .sort((a, b) => b.addedAt - a.addedAt);
       resolve(out);
     };
@@ -68,18 +73,31 @@ export async function getRomBytes(id: string): Promise<Uint8Array | null> {
   });
 }
 
-export async function addRom(filename: string, bytes: Uint8Array, md5?: string): Promise<RomMeta> {
-  const dec = new TextDecoder('ascii');
-  const title = dec.decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '');
-  const code = dec.decode(bytes.subarray(0xAC, 0xB0));
-  const id = slugify(filename.replace(/\.gba$/i, '')) || code.toLowerCase();
+export async function addRom(
+  filename: string,
+  bytes: Uint8Array,
+  system = 'gba',
+  opts: { title?: string; icon?: Uint8Array; md5?: string } = {},
+): Promise<RomMeta> {
+  const base = filename.replace(/\.[^.]+$/, '');
+  let title = opts.title ?? '';
+  let code = '';
+  // GBA's header layout is known here; other systems' titles are parsed by the
+  // caller (e.g. the NDS banner) and passed in via opts.title.
+  if (system === 'gba') {
+    const dec = new TextDecoder('ascii');
+    const t = dec.decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '').trim();
+    code = dec.decode(bytes.subarray(0xAC, 0xB0));
+    if (!title) title = t;
+  }
+  title = title || base;
+  const id = slugify(base);
   const row = {
-    id, filename,
-    title: title.trim() || filename.replace(/\.gba$/i, ''),
-    code,
+    id, filename, title, code, system,
     size: bytes.length,
     addedAt: Date.now(),
-    md5,
+    icon: opts.icon,
+    md5: opts.md5,
     bytes,
   };
   const db = await openDb();
@@ -89,7 +107,7 @@ export async function addRom(filename: string, bytes: Uint8Array, md5?: string):
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-  return { id: row.id, filename, title: row.title, code, size: bytes.length, addedAt: row.addedAt, md5 };
+  return { id, filename, title, code, system, size: bytes.length, addedAt: row.addedAt, icon: opts.icon, md5: opts.md5 };
 }
 
 // Backfill an existing ROM's md5 (older library entries pre-date the

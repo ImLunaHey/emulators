@@ -33,6 +33,11 @@ pub mod emulator;
 pub mod savestate;
 pub mod debug;
 
+// --- Console home screen / launcher (Rust-rendered, shown on boot).
+pub mod home;
+// --- NDS banner (icon + title) parsing for the launcher; no NDS core yet.
+pub mod nds;
+
 pub use emulator::Gba;
 
 // Web target surface (wasm-bindgen). Gated to wasm32 so host builds/tests

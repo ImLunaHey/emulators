@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Cheat } from '../io/cheats';
-import { parseCheat } from '../io/cheats';
+import type { Emulator } from '../emulator';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Modal } from './Modal';
 import { useRomMd5 } from './hooks/useRomMd5';
@@ -8,6 +8,7 @@ import { useHasheousMeta } from './hooks/useHasheousMeta';
 
 interface Props {
   open: boolean;
+  emu: Emulator;
   gameCode: string | null;
   romId?: string | null;
   romTitle?: string | null;
@@ -38,7 +39,7 @@ export function saveCheatsFor(code: string, cheats: Cheat[]): void {
   localStorage.setItem(STORAGE_KEY_PREFIX + code, JSON.stringify(cheats));
 }
 
-export function CheatsPanel({ open, gameCode, romId, romTitle, cheats, onChange, onClose }: Props) {
+export function CheatsPanel({ open, emu, gameCode, romId, romTitle, cheats, onChange, onClose }: Props) {
   const [editing, setEditing] = useState<number | null>(null);
   const [draft, setDraft] = useState<Cheat>({ name: '', code: '', enabled: true });
   // Index pending a two-step delete confirm (avoids a nested modal +
@@ -162,11 +163,12 @@ export function CheatsPanel({ open, gameCode, romId, romTitle, cheats, onChange,
     }).catch(() => { /* malformed JSON — ignore */ });
   };
 
-  // Parse the current draft so we can warn about syntax problems before
-  // the user saves a code that does nothing.
-  const draftParsed = parseCheat(draft.code);
-  const supportedLines = draftParsed.filter((l) => l.type !== 'unsupported').length;
-  const unsupportedLines = draftParsed.filter((l) => l.type === 'unsupported').length;
+  // Parse the current draft (via the Rust core, the same parser the engine
+  // applies) so we can warn about syntax problems before the user saves a
+  // code that does nothing.
+  const draftSummary = emu.parseCheatSummary(draft.code);
+  const supportedLines = draftSummary.supported;
+  const unsupportedLines = draftSummary.unsupported;
 
   return (
     <Modal
@@ -302,7 +304,7 @@ export function CheatsPanel({ open, gameCode, romId, romTitle, cheats, onChange,
                   <div className="opacity-60">
                     {supportedLines > 0 && <span>✓ {supportedLines} line{supportedLines > 1 ? 's' : ''} parsed</span>}
                     {unsupportedLines > 0 && <span className="text-amber-300 ml-2">⚠ {unsupportedLines} unsupported opcode{unsupportedLines > 1 ? 's' : ''}</span>}
-                    {draftParsed.length === 0 && draft.code.trim() && <span className="text-red-300">malformed code</span>}
+                    {draftSummary.total === 0 && draft.code.trim() && <span className="text-red-300">malformed code</span>}
                   </div>
                   <div className="flex gap-2">
                     <button onClick={cancelEdit} className="btn !text-[10px]">Cancel</button>

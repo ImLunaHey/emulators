@@ -413,4 +413,12 @@ export class WasmEmulator implements WasmCore {
     const codes = this._cheats.filter((c) => c.enabled).map((c) => c.code).join('\n');
     this.gba.set_cheats(codes);
   }
+  /** Validate a raw cheat code through the Rust parser — the same one the
+   *  engine applies — returning line counts for the editor. Replaces the old
+   *  TS reimplementation that could silently drift from what actually runs. */
+  parseCheatSummary(code: string): { supported: number; unsupported: number; total: number } {
+    if (!this.gba) return { supported: 0, unsupported: 0, total: 0 };
+    const [supported, unsupported, total] = this.gba.parse_cheat_summary(code);
+    return { supported, unsupported, total };
+  }
 }

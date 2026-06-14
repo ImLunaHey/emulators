@@ -1,33 +1,29 @@
-import { useRef } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { useRef, useState } from 'react';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
 import type { Emulator } from '../emulator';
 import { WasmEmulator } from './wasmEmulator';
 import { AudioSink } from './audio';
 import { EmuContext } from './EmuContext';
-import { LibraryPage } from './LibraryPage';
+import { HomeScreen } from './HomeScreen';
 import { PlayerPage } from './PlayerPage';
-import { RomDetailsPage } from './RomDetailsPage';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
-// Routes:
-//   /              ROM library
-//   /play/:romId   player view (Screen + controls + modal panels)
-//   *              redirects to library
+// Single-view shell. Boots into the Rust-rendered home launcher (HomeScreen →
+// WasmHome); selecting a game swaps to the player; the player's Home button
+// swaps back. No router — the "route" is one piece of state.
 //
-// The Emulator + AudioSink live at the root via useRef so they survive
-// navigation between the two pages — switching from the player back to
-// the library and into a different game doesn't tear down the audio
-// context or the wasm core instance.
+// The Emulator + AudioSink live at the root via useRef so they survive the
+// home↔player switch (the wasm core instance + audio context aren't torn down).
+// react-query is still mounted because the in-game CheatsPanel uses it for the
+// (host-side) known-cheats metadata lookup.
 export function App() {
-  // Hard-swapped to the Rust/wasm core. WasmEmulator mirrors the Emulator
-  // surface the UI uses (lazy async wasm init under the hood); cast keeps the
-  // existing `emu: Emulator`-typed components unchanged.
   const emuRef = useRef<Emulator | null>(null);
   if (!emuRef.current) emuRef.current = new WasmEmulator() as unknown as Emulator;
   const audioRef = useRef<AudioSink | null>(null);
   if (!audioRef.current) audioRef.current = new AudioSink();
+
+  const [playing, setPlaying] = useState<string | null>(null);
 
   return (
     <PersistQueryClientProvider
@@ -36,14 +32,11 @@ export function App() {
     >
       <EmuContext.Provider value={{ emu: emuRef.current, audio: audioRef.current }}>
         <ToastProvider>
-          <BrowserRouter>
-            <Routes>
-              <Route path="/" element={<LibraryPage />} />
-              <Route path="/rom/:romId" element={<RomDetailsPage />} />
-              <Route path="/play/:romId" element={<PlayerPage />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </BrowserRouter>
+          {playing ? (
+            <PlayerPage romId={playing} onExit={() => setPlaying(null)} />
+          ) : (
+            <HomeScreen onPlay={(id) => setPlaying(id)} />
+          )}
         </ToastProvider>
       </EmuContext.Provider>
     </PersistQueryClientProvider>

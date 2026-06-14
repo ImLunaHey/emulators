@@ -33,3 +33,9 @@ panic = "abort"
 wasm-opt = ['-O3']
 
 [dev-dependencies]
+
+[dependencies]
+# Bitmap font for the Rust-rendered home screen (core/src/home.rs). Pure const
+# glyph data; drop std/unicode so it stays no_std and wasm-lean — we only use
+# `legacy::BASIC_LEGACY` (ASCII 8x8).
+font8x8 = { version = "0.3.1", default-features = false }
