@@ -9,7 +9,15 @@ edition = "2021"
 # every subsystem and implements the `Bus` trait. This phase lands the
 # LR35902 register/interrupt foundation + memory map + cartridge MBC routing.
 [lib]
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
 
 [profile.release]
 opt-level = 3

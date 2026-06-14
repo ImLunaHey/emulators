@@ -36,4 +36,8 @@ pub mod timer;
 // --- Top-level orchestrator.
 pub mod emulator;
 
+// --- wasm-bindgen surface (web target only).
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 pub use emulator::Gbc;
