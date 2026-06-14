@@ -63,12 +63,26 @@ pub struct Cpu {
     /// shadowed. `reg == 0` ⇒ empty.
     pub load: LoadSlot,
 
+    /// Load issued by the instruction *currently* executing. The interpreter
+    /// keeps the carried [`load`] live through execute (so LWL/LWR can merge
+    /// with a load already targeting the same register), parks a freshly-issued
+    /// load here, and promotes it into [`load`] after the carried one retires.
+    pub next_load: LoadSlot,
+
     /// System-control coprocessor (exceptions, status, cause).
     pub cop0: Cop0,
 
     /// Pending hardware-interrupt line (mirrors I_STAT & I_MASK); the CPU
     /// samples it between instructions. Wired by the IRQ subsystem later.
     pub irq_pending: bool,
+
+    /// Destination register the currently-executing instruction wrote (0 if
+    /// none / r0), recorded by [`Cpu::set_reg`]. The interpreter clears this
+    /// before each instruction and reads it afterwards to resolve the R3000A
+    /// load-use hazard: if the load-delay-slot instruction overwrites the
+    /// register a pending load targets, the instruction's write wins and the
+    /// stale load is dropped. Not architectural state — a single-step scratch.
+    pub wrote_reg: u32,
 }
 
 /// The R3000A reset vector: execution begins in the BIOS (KSEG1, uncached).
@@ -92,8 +106,10 @@ impl Cpu {
             in_delay_slot: false,
             branch_taken: false,
             load: LoadSlot::default(),
+            next_load: LoadSlot::default(),
             cop0: Cop0::new(),
             irq_pending: false,
+            wrote_reg: 0,
         }
     }
 
@@ -116,6 +132,12 @@ impl Cpu {
         let i = (index & 0x1F) as usize;
         self.regs[i] = value;
         self.regs[0] = 0; // keep r0 == 0 even after an r0-targeted write
+        // Record the destination for the load-use-hazard check in the step
+        // loop (see `wrote_reg`). r0 writes are no-ops, so leave the tracker
+        // alone for them — a pending load to r0 is already a no-op too.
+        if i != 0 {
+            self.wrote_reg = i as u32;
+        }
     }
 
     /// Queue a load-delay write to `reg` (committed after the next
