@@ -222,9 +222,41 @@ impl Cpu {
 
     // ─── Exceptions ──────────────────────────────────────────────────────
 
-    /// SWI: enter SVC at the software-interrupt vector. BIOS HLE (when the
-    /// orchestrator wires it) gets first refusal before this real-exception
-    /// fallback; the executor itself always takes the architectural path.
+    /// SWI seam consulted by the instruction decoders. BIOS HLE
+    /// (`Nds::bios_swi`) gets first refusal: if it handles the call, the SWI is
+    /// fully serviced in HLE and we skip the architectural vector. Otherwise we
+    /// fall through to the real `software_interrupt` exception entry.
+    pub fn swi(&mut self, nds: &mut Nds, comment: u32) {
+        // Keep `Nds.state*` in sync with the live `Cpu` state for the duration
+        // of the HLE call (the BIOS reads/writes r0..r3 + memory through `Nds`).
+        let is_arm9 = self.is_arm9();
+        let saved = std::mem::replace(
+            if is_arm9 {
+                &mut nds.state9
+            } else {
+                &mut nds.state7
+            },
+            std::mem::replace(&mut self.state, CpuState::new()),
+        );
+        let handled = nds.bios_swi(is_arm9, comment);
+        // Restore the (possibly BIOS-mutated) state back into the live `Cpu`,
+        // and put the foundation owner's slot back.
+        self.state = std::mem::replace(
+            if is_arm9 {
+                &mut nds.state9
+            } else {
+                &mut nds.state7
+            },
+            saved,
+        );
+        if !handled {
+            self.software_interrupt(comment);
+        }
+    }
+
+    /// SWI: enter SVC at the software-interrupt vector. BIOS HLE (`swi` above)
+    /// gets first refusal before this real-exception fallback; the executor
+    /// itself always takes the architectural path here.
     pub fn software_interrupt(&mut self, _comment: u32) {
         let vector = self.exc_vector(0x08);
         let s = &mut self.state;

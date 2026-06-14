@@ -14,6 +14,9 @@
 //! lives here in `Nds` because it needs every device at once; for now those
 //! paths are `todo!()` until the IO modules land.
 
+use crate::bios::hle::BiosHle;
+use crate::bios::nitro_os::NitroOsAssist;
+use crate::cart::cart::{Cart, TransferEvent};
 use crate::cpu::{Cp15, CpuState};
 use crate::io::dma::{Dma, DmaTiming};
 use crate::io::ds_math::DsMath;
@@ -105,6 +108,22 @@ pub struct Nds {
     /// each VBlank (skips the ARM7 PXI roundtrip we don't model).
     pub touch: TouchDriver,
 
+    // ─── Cartridge + BIOS HLE ────────────────────────────────────────────
+
+    /// Game cartridge: ROM image, the ROMCTRL/ROMCMD/ROMDATA command state
+    /// machine, AUXSPI save chip, and KEY1/KEY2 phase tracking. `None` until a
+    /// ROM is mounted via `load_rom` / `hle_boot`.
+    pub cart: Option<Cart>,
+
+    /// Per-core BIOS HLE state (IntrWait latches + sound tables). The CPU
+    /// executor consults `bios_swi` first on a SWI; these hold the wait masks
+    /// the frame loop services.
+    pub bios9: BiosHle,
+    pub bios7: BiosHle,
+
+    /// NitroSDK OS-thread deadlock assist (once-per-frame heuristic wake).
+    pub nitro_os: NitroOsAssist,
+
     // ─── Misc per-core IO latches the dispatch reads/writes directly ─────
 
     /// POSTFLG (0x04000300) bit 0 = boot completed. We HLE the handoff → 1.
@@ -118,6 +137,13 @@ pub struct Nds {
     pub keyinput: u32,
     /// EXTKEYIN (0x04000136) — X, Y, lid; low = active.
     pub ext_keyinput: u32,
+
+    /// EXMEMCNT (0x04000204, ARM9) / EXMEMSTAT (ARM7 read mirror). Bit 11 =
+    /// cart-slot owner: 0 → ARM9 owns the cart bus, 1 → ARM7 owns it. Both
+    /// CPUs' cart IO routes through the same `Cart`, but the slot-owning core
+    /// is the one whose DMA/IRQ the transfer drives, and the non-owner's cart
+    /// register accesses read open-bus. Default 0 = ARM9 owns (boot default).
+    pub exmemcnt: u32,
 }
 
 impl Default for Nds {
@@ -151,12 +177,18 @@ impl Nds {
             ipc: Ipc::new(),
             touch: TouchDriver::new(),
 
+            cart: None,
+            bios9: BiosHle::new(Core::Arm9),
+            bios7: BiosHle::new(Core::Arm7),
+            nitro_os: NitroOsAssist::new(),
+
             postflg9: 1,
             postflg7: 1,
             powcnt1: 0x820F,
             haltcnt7: 0,
             keyinput: 0x03FF,
             ext_keyinput: 0x007F,
+            exmemcnt: 0,
         };
         // Seed the BIOS IRQ-handler-pointer literal from CP15's reset DTCM
         // placement (matches the TS Cp15 constructor calling it). `cp15`,
@@ -414,6 +446,15 @@ impl Nds {
                 .ipc
                 .read_recv(is_arm9, &mut self.irq9, &mut self.irq7);
         }
+        // ROMDATA FIFO at 0x04100010 — 32-bit atomic word pop. Gated on cart
+        // ownership: only the EXMEMCNT-selected core sees the cart.
+        if m == 0x0410_0010 {
+            return self.cart_read_romdata(is_arm9);
+        }
+        // ROMCTRL at 0x040001A4 — live busy/word-ready bits.
+        if m == 0x0400_01A4 {
+            return self.cart_read_romctrl(is_arm9);
+        }
         // Default: compose from two halfwords.
         let lo = self.io_read16(addr, is_arm9);
         let hi = self.io_read16(addr.wrapping_add(2), is_arm9);
@@ -434,6 +475,10 @@ impl Nds {
         }
         if m == 0x0400_0184 {
             return self.ipc.read_cnt(is_arm9);
+        }
+        // AUXSPICNT at 0x040001A0 (cart save-chip SPI control).
+        if m == 0x0400_01A0 {
+            return self.cart_read_auxspicnt(is_arm9);
         }
         (self.io_read8(addr, is_arm9) | (self.io_read8(addr.wrapping_add(1), is_arm9) << 8)) & 0xFFFF
     }
@@ -478,6 +523,12 @@ impl Nds {
             if addr == 0x0400_0249 {
                 return self.ppu.vramcnt[8] as u32;
             }
+        }
+        // Cart registers reachable byte-wise: AUXSPIDATA (0x1A2), ROMCTRL byte
+        // slices (0x1A4..A7), AUXSPICNT byte slices (0x1A0..A1), and the ROMCMD
+        // command latch (0x1A8..AF). All gated on cart slot ownership.
+        if (0x0400_01A0..0x0400_01B0).contains(&addr) {
+            return self.cart_read_reg8(is_arm9, addr);
         }
         // Timers (per-core), 0x04000100..0x0400010F.
         if (0x0400_0100..0x0400_0110).contains(&addr) {
@@ -527,6 +578,10 @@ impl Nds {
                     self.postflg7 & 0xFF
                 }
             }
+            // EXMEMCNT (ARM9) / EXMEMSTAT (ARM7). Both cores read the same
+            // latch; only ARM9 may write it (handled in io_write8).
+            0x0400_0204 => self.exmemcnt & 0xFF,
+            0x0400_0205 => (self.exmemcnt >> 8) & 0xFF,
             0x0400_0304 => self.powcnt1 & 0xFF,
             0x0400_0305 => (self.powcnt1 >> 8) & 0xFF,
             0x0400_0306 => (self.powcnt1 >> 16) & 0xFF,
@@ -580,6 +635,11 @@ impl Nds {
                 .write_send(is_arm9, v, &mut self.irq9, &mut self.irq7);
             return;
         }
+        // ROMCTRL at 0x040001A4 — bit 31 (block-start) kicks off a transfer.
+        if m == 0x0400_01A4 {
+            self.cart_write_romctrl(is_arm9, v);
+            return;
+        }
         self.io_write16(addr, v & 0xFFFF, is_arm9);
         self.io_write16(addr.wrapping_add(2), (v >> 16) & 0xFFFF, is_arm9);
     }
@@ -609,6 +669,11 @@ impl Nds {
         if m == 0x0400_0184 {
             self.ipc
                 .write_cnt(is_arm9, v & 0xFFFF, &mut self.irq9, &mut self.irq7);
+            return;
+        }
+        // AUXSPICNT at 0x040001A0 (cart save-chip SPI control).
+        if m == 0x0400_01A0 {
+            self.cart_write_auxspicnt(is_arm9, v & 0xFFFF);
             return;
         }
         self.io_write8(addr, v & 0xFF, is_arm9);
@@ -658,6 +723,13 @@ impl Nds {
             } else if addr == 0x0400_0249 {
                 self.ppu.vramcnt[8] = v as u8;
             }
+            return;
+        }
+        // Cart registers reachable byte-wise (see io_read8). AUXSPIDATA writes
+        // exchange a save-chip byte; ROMCTRL/AUXSPICNT byte slices recompose
+        // the word; ROMCMD bytes latch into the command buffer.
+        if (0x0400_01A0..0x0400_01B0).contains(&addr) {
+            self.cart_write_reg8(is_arm9, addr, v);
             return;
         }
         // Timers (per-core).
@@ -724,6 +796,23 @@ impl Nds {
             0x0400_0139 => {
                 let cur = self.rtc.read();
                 self.rtc.write((cur & 0x00FF) | (v << 8));
+            }
+            // EXMEMCNT (0x04000204..205). ARM9 owns the full register; ARM7 may
+            // only write bits 0..6 (its own GBA-slot timing) and never bit 11
+            // (cart owner) per GBATEK. We model the cart-owner bit as ARM9-only
+            // and let ARM7 update its low byte.
+            0x0400_0204 => {
+                if is_arm9 {
+                    self.exmemcnt = (self.exmemcnt & !0xFF) | v;
+                } else {
+                    // ARM7 may set its own low-byte timing bits but not bit 11.
+                    self.exmemcnt = (self.exmemcnt & !0x7F) | (v & 0x7F);
+                }
+            }
+            0x0400_0205 => {
+                if is_arm9 {
+                    self.exmemcnt = (self.exmemcnt & !0xFF00) | (v << 8);
+                }
             }
             0x0400_0300 => {
                 if is_arm9 {
@@ -861,6 +950,144 @@ impl Nds {
                 true
             }
             _ => false,
+        }
+    }
+
+    // ─── Cart slot IO routing (ROMCTRL / ROMCMD / ROMDATA / AUXSPI) ──────
+    //
+    // Both ARM9 and ARM7 see the cart registers at the same addresses, but only
+    // the EXMEMCNT-bit-11-selected core OWNS the slot at any moment: the
+    // non-owner reads open bus (0 / 0xFF on ROMDATA) and its writes are dropped.
+    // The owner's accesses drive the single `Cart` state machine; transfer
+    // events route the cart-ready DMA + cart-end IRQ to the owning core. With no
+    // ROM mounted (`cart` is `None`) every cart access is open-bus.
+
+    /// Whether the given core currently owns the cart slot. EXMEMCNT bit 11:
+    /// 0 → ARM9, 1 → ARM7 (TS gated cart-ready DMA + cart-end IRQ on this).
+    #[inline]
+    fn cart_owned_by(&self, is_arm9: bool) -> bool {
+        let arm7_owns = (self.exmemcnt & (1 << 11)) != 0;
+        is_arm9 != arm7_owns
+    }
+
+    /// Apply a `TransferEvent` returned by a cart access: Ready → cart-ready DMA
+    /// on the owning core (ARM9 only has the timing), TransferEnd → IRQ_CART.
+    fn cart_apply_event(&mut self, is_arm9: bool, ev: TransferEvent) {
+        match ev {
+            TransferEvent::None => {}
+            TransferEvent::Ready => {
+                if is_arm9 {
+                    self.dma_trigger_card_ready();
+                }
+            }
+            TransferEvent::TransferEnd => {
+                let irq = if is_arm9 { &mut self.irq9 } else { &mut self.irq7 };
+                irq.raise(crate::io::irq::IRQ_CART);
+            }
+        }
+    }
+
+    fn cart_read_romdata(&mut self, is_arm9: bool) -> u32 {
+        if !self.cart_owned_by(is_arm9) {
+            return 0xFFFF_FFFF;
+        }
+        let Some(cart) = self.cart.as_mut() else {
+            return 0xFFFF_FFFF;
+        };
+        let (word, ev) = cart.read_romdata();
+        self.cart_apply_event(is_arm9, ev);
+        word
+    }
+
+    fn cart_read_romctrl(&mut self, is_arm9: bool) -> u32 {
+        if !self.cart_owned_by(is_arm9) {
+            return 0;
+        }
+        self.cart.as_ref().map_or(0, |c| c.read_romctrl())
+    }
+
+    fn cart_write_romctrl(&mut self, is_arm9: bool, v: u32) {
+        if !self.cart_owned_by(is_arm9) {
+            return;
+        }
+        let Some(cart) = self.cart.as_mut() else {
+            return;
+        };
+        let ev = cart.write_romctrl(v);
+        self.cart_apply_event(is_arm9, ev);
+    }
+
+    fn cart_read_auxspicnt(&mut self, is_arm9: bool) -> u32 {
+        if !self.cart_owned_by(is_arm9) {
+            return 0;
+        }
+        self.cart.as_ref().map_or(0, |c| c.read_auxspicnt())
+    }
+
+    fn cart_write_auxspicnt(&mut self, is_arm9: bool, v: u32) {
+        if !self.cart_owned_by(is_arm9) {
+            return;
+        }
+        if let Some(cart) = self.cart.as_mut() {
+            cart.write_auxspicnt(v);
+        }
+    }
+
+    /// Byte-granular cart register read for 0x040001A0..0x040001AF.
+    fn cart_read_reg8(&mut self, is_arm9: bool, addr: u32) -> u32 {
+        if !self.cart_owned_by(is_arm9) {
+            return 0;
+        }
+        let Some(cart) = self.cart.as_mut() else {
+            return 0;
+        };
+        match addr {
+            // AUXSPICNT byte slices.
+            0x0400_01A0 => cart.read_auxspicnt() & 0xFF,
+            0x0400_01A1 => (cart.read_auxspicnt() >> 8) & 0xFF,
+            // AUXSPIDATA.
+            0x0400_01A2 => cart.read_auxspidata() & 0xFF,
+            // ROMCTRL byte slices.
+            0x0400_01A4..=0x0400_01A7 => (cart.read_romctrl() >> ((addr & 3) * 8)) & 0xFF,
+            // ROMCMD command latch.
+            0x0400_01A8..=0x0400_01AF => cart.read_cmd_byte(addr - 0x0400_01A8) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Byte-granular cart register write for 0x040001A0..0x040001AF.
+    fn cart_write_reg8(&mut self, is_arm9: bool, addr: u32, v: u32) {
+        if !self.cart_owned_by(is_arm9) {
+            return;
+        }
+        // ROMCTRL byte writes recompose the word then re-run write_romctrl so
+        // the block-start side effect fires; pull the current value first.
+        if (0x0400_01A4..=0x0400_01A7).contains(&addr) {
+            let Some(cart) = self.cart.as_mut() else {
+                return;
+            };
+            let shift = (addr & 3) * 8;
+            let cur = cart.read_romctrl();
+            let next = (cur & !(0xFF << shift)) | ((v & 0xFF) << shift);
+            let ev = cart.write_romctrl(next);
+            self.cart_apply_event(is_arm9, ev);
+            return;
+        }
+        let Some(cart) = self.cart.as_mut() else {
+            return;
+        };
+        match addr {
+            0x0400_01A0 => {
+                let cur = cart.read_auxspicnt();
+                cart.write_auxspicnt((cur & 0xFF00) | (v & 0xFF));
+            }
+            0x0400_01A1 => {
+                let cur = cart.read_auxspicnt();
+                cart.write_auxspicnt((cur & 0x00FF) | ((v & 0xFF) << 8));
+            }
+            0x0400_01A2 => cart.write_auxspidata(v & 0xFF),
+            0x0400_01A8..=0x0400_01AF => cart.write_cmd_byte(addr - 0x0400_01A8, (v & 0xFF) as u8),
+            _ => {}
         }
     }
 
@@ -1036,9 +1263,11 @@ impl Nds {
         todo!("port from ds-recomp src/emulator.ts (needs CPU exec + subsystems)")
     }
 
-    /// Load a `.nds` cartridge image (deferred — needs the cart loader).
-    pub fn load_rom(&mut self, _bytes: &[u8]) {
-        todo!("port from ds-recomp src/cart/loader.ts")
+    /// Load a `.nds` cartridge image and HLE-boot it (parse header, copy
+    /// binaries + overlays into RAM, mount the cart, seed BIOS RAM, reset both
+    /// CPUs to their entry points). Forwards to the BIOS HLE boot seam.
+    pub fn load_rom(&mut self, bytes: &[u8]) {
+        self.hle_boot(bytes);
     }
 }
 

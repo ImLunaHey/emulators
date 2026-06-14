@@ -518,7 +518,7 @@ pub fn thumb_execute(cpu: &mut Cpu, nds: &mut Nds, instr: u32) {
             let cond = (instr >> 8) & 0xF;
             if cond == 0xF {
                 // SWI
-                cpu.software_interrupt(instr & 0xFF);
+                cpu.swi(nds, instr & 0xFF);
                 return;
             }
             if cond == 0xE {

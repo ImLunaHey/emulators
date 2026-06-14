@@ -174,7 +174,7 @@ pub fn arm_execute(cpu: &mut Cpu, nds: &mut Nds, instr: u32) {
 
     // SWI.
     if (instr & 0x0F00_0000) == 0x0F00_0000 {
-        cpu.software_interrupt((instr & 0x00FF_FFFF) >> 16);
+        cpu.swi(nds, instr & 0x00FF_FFFF);
         return;
     }
 
