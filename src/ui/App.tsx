@@ -8,6 +8,7 @@ import { HomeScreen } from './HomeScreen';
 import { PlayerPage } from './PlayerPage';
 import { NdsPlayer } from './NdsPlayer';
 import { NesPlayer } from './NesPlayer';
+import { SmsPlayer } from './SmsPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -39,6 +40,8 @@ export function App() {
               <NdsPlayer romId={playing.id} onExit={() => setPlaying(null)} />
             ) : playing.system === 'nes' ? (
               <NesPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'sms' || playing.system === 'gg' ? (
+              <SmsPlayer romId={playing.id} system={playing.system} onExit={() => setPlaying(null)} />
             ) : (
               <PlayerPage romId={playing.id} onExit={() => setPlaying(null)} />
             )
