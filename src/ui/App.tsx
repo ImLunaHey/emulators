@@ -7,6 +7,7 @@ import { EmuContext } from './EmuContext';
 import { HomeScreen } from './HomeScreen';
 import { PlayerPage } from './PlayerPage';
 import { NdsPlayer } from './NdsPlayer';
+import { NesPlayer } from './NesPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -36,6 +37,8 @@ export function App() {
           {playing ? (
             playing.system === 'nds' ? (
               <NdsPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'nes' ? (
+              <NesPlayer romId={playing.id} onExit={() => setPlaying(null)} />
             ) : (
               <PlayerPage romId={playing.id} onExit={() => setPlaying(null)} />
             )
