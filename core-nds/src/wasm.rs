@@ -89,6 +89,11 @@ impl WasmNds {
         self.inner.ppu.frame_count
     }
 
+    /// Interleaved-stereo f32 audio produced since the last call (44.1 kHz).
+    pub fn drain_audio(&mut self) -> Vec<f32> {
+        self.inner.drain_audio()
+    }
+
     // ---- battery save (cartridge AUXSPI backup chip) ----
 
     /// Current save-chip contents (write this to a `.sav`). Empty if no cart is

@@ -118,6 +118,8 @@ pub struct Nds {
     pub rtc: Rtc,
     /// ARM7 sound chip (16 channels).
     pub sound: Sound,
+    /// Per-frame mixed audio (interleaved stereo f32 @ 44.1 kHz), host-drained.
+    audio_buf: Vec<f32>,
 
     /// Inter-processor communication (IPCSYNC + the two FIFO queues). Single
     /// instance shared by both cores — the IO dispatch passes each accessing
@@ -197,6 +199,7 @@ impl Nds {
             spi: Spi::new(),
             rtc: Rtc::new(),
             sound: Sound::new(),
+            audio_buf: Vec::new(),
             ipc: Ipc::new(),
             touch: TouchDriver::new(),
 
@@ -1481,6 +1484,21 @@ impl Nds {
         // frame re-samples the lines from the IRQ controller).
         self.cpu9 = cpu9;
         self.cpu7 = cpu7;
+
+        // Mix one frame of audio (~735 stereo samples @ 44.1 kHz) for the host.
+        const AUDIO_FRAMES: usize = 735;
+        let mut tmp = [0.0f32; AUDIO_FRAMES * 2];
+        self.sound
+            .mix(&mut tmp, AUDIO_FRAMES, 44_100, &self.mem.main_ram[..], &self.mem.arm7_iwram[..]);
+        if self.audio_buf.len() > 44_100 {
+            self.audio_buf.clear(); // host fell behind — drop the backlog
+        }
+        self.audio_buf.extend_from_slice(&tmp);
+    }
+
+    /// Drain mixed audio since the last call (interleaved stereo f32, 44.1 kHz).
+    pub fn drain_audio(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.audio_buf)
     }
 
     /// Rasterize the 3D geometry engine's front display list into a full

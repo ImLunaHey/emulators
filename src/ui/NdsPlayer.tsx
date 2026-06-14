@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import initNds, { WasmNds } from '../../core-nds/pkg/nds_core.js';
 import { getRomBytes } from './romStore';
+import { usePlayerAudio } from './playerAudio';
 
 // NDS player. Drives the Rust DS core (WasmNds) directly: boots the ROM, runs
 // frames, and blits its two 256x192 RGBA screens (stacked). Separate from the
@@ -32,6 +33,7 @@ export function NdsPlayer({ romId, onExit }: { romId: string; onExit: () => void
   const keysRef = useRef(0); // pressed bits (active-high here; inverted for the core)
   const extRef = useRef(0);
   const touchRef = useRef({ pressed: false, x: 0, y: 0 });
+  const audio = usePlayerAudio();
 
   useEffect(() => {
     let alive = true;
@@ -52,6 +54,7 @@ export function NdsPlayer({ romId, onExit }: { romId: string; onExit: () => void
         const t = touchRef.current;
         nds.set_touch(t.pressed, t.x, t.y);
         nds.run_frame();
+        audio.push(nds.drain_audio(), 44100, 2);
         topCtx.putImageData(new ImageData(new Uint8ClampedArray(nds.top_framebuffer()), SCREEN_W, SCREEN_H), 0, 0);
         botCtx.putImageData(new ImageData(new Uint8ClampedArray(nds.bottom_framebuffer()), SCREEN_W, SCREEN_H), 0, 0);
         raf = requestAnimationFrame(loop);

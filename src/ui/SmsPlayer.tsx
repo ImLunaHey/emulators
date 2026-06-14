@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import initSms, { WasmSms } from '../../core-sms/pkg/sms_core.js';
 import { getRomBytes } from './romStore';
+import { usePlayerAudio } from './playerAudio';
 
 // Master System + Game Gear player. One Rust core (WasmSms) handles both —
 // constructed with game_gear=true for .gg (160x144 crop) or false for .sms
@@ -20,6 +21,7 @@ const KEY: Record<string, number> = {
 export function SmsPlayer({ romId, system, onExit }: { romId: string; system: string; onExit: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef(0);
+  const audio = usePlayerAudio();
 
   useEffect(() => {
     let alive = true;
@@ -41,6 +43,7 @@ export function SmsPlayer({ romId, system, onExit }: { romId: string; system: st
         if (!alive || !sms) return;
         sms.set_keys(keysRef.current >>> 0);
         sms.run_frame();
+        audio.push(sms.drain_audio(), 44100, 1);
         ctx.putImageData(new ImageData(new Uint8ClampedArray(sms.framebuffer()), w, h), 0, 0);
         raf = requestAnimationFrame(loop);
       };

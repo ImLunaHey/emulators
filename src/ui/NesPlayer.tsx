@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import initNes, { WasmNes } from '../../core-nes/pkg/nes_core.js';
 import { getRomBytes } from './romStore';
+import { usePlayerAudio } from './playerAudio';
 
 // NES player. Drives the Rust NES core (WasmNes): boots the ROM, runs frames,
 // blits its single 256x240 RGBA screen. Single-screen so it's the simplest
@@ -25,6 +26,7 @@ const KEY: Record<string, number> = {
 export function NesPlayer({ romId, onExit }: { romId: string; onExit: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef(0);
+  const audio = usePlayerAudio();
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -45,6 +47,7 @@ export function NesPlayer({ romId, onExit }: { romId: string; onExit: () => void
         if (!alive || !nes) return;
         nes.set_keys(keysRef.current >>> 0);
         nes.run_frame();
+        audio.push(nes.drain_audio(), 44100, 1);
         ctx.putImageData(new ImageData(new Uint8ClampedArray(nes.framebuffer()), W, H), 0, 0);
         raf = requestAnimationFrame(loop);
       };

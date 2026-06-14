@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import initPsx, { WasmPsx } from '../../core-ps1/pkg/ps1_core.js';
 import { getRomBytes } from './romStore';
 import { getBios, setBios } from './biosStore';
+import { usePlayerAudio } from './playerAudio';
 
 // PlayStation player. The PS1 can't boot real discs without a BIOS ROM, so the
 // player gates on one (stored in IndexedDB). Once present it boots the .bin
@@ -26,6 +27,7 @@ const KEY: Record<string, number> = {
 export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef(0);
+  const audio = usePlayerAudio();
   const [phase, setPhase] = useState<'checking' | 'needbios' | 'ready'>('checking');
 
   useEffect(() => { getBios('ps1').then((b) => setPhase(b ? 'ready' : 'needbios')); }, []);
@@ -48,6 +50,7 @@ export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void
         if (!alive || !psx) return;
         psx.set_keys(keysRef.current >>> 0);
         psx.run_frame();
+        audio.push(psx.drain_audio(), 44100, 2);
         const w = psx.width();
         const h = psx.height();
         const canvas = canvasRef.current!;

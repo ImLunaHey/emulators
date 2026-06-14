@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import initGbc, { WasmGbc } from '../../core-gbc/pkg/gbc_core.js';
 import { getRomBytes } from './romStore';
+import { usePlayerAudio } from './playerAudio';
 
 // Game Boy Color (+ Game Boy) player. One Rust core (WasmGbc) runs both — a
 // DMG (.gb) ROM auto-runs in CGB DMG-compat mode. Single 160x144 screen.
@@ -20,6 +21,7 @@ const KEY: Record<string, number> = {
 export function GbcPlayer({ romId, onExit }: { romId: string; onExit: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef(0);
+  const audio = usePlayerAudio();
 
   useEffect(() => {
     let alive = true;
@@ -41,6 +43,7 @@ export function GbcPlayer({ romId, onExit }: { romId: string; onExit: () => void
         if (!alive || !gbc) return;
         gbc.set_keys(keysRef.current >>> 0);
         gbc.run_frame();
+        audio.push(gbc.drain_audio(), 48000, 2);
         ctx.putImageData(new ImageData(new Uint8ClampedArray(gbc.framebuffer()), w, h), 0, 0);
         raf = requestAnimationFrame(loop);
       };
