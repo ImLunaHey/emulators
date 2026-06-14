@@ -31,6 +31,7 @@ use crate::io::touch::TouchDriver;
 use crate::memory::bus7::Resolved as Resolved7;
 use crate::memory::bus9::Resolved as Resolved9;
 use crate::memory::{Bus7, Bus9, SharedMemory, VramRouter};
+use crate::ppu::gx::Gpu3d;
 use crate::ppu::ppu::Ppu;
 
 /// Which CPU a bus access is for. The two cores see different memory maps.
@@ -59,6 +60,13 @@ pub struct Nds {
     /// 256x192 RGBA8888 framebuffers. The bus VRAM router borrows
     /// `ppu.vramcnt` on every VRAM access.
     pub ppu: Ppu,
+
+    /// 3D geometry engine (the "GX"). ARM9-only. Owns the four matrix stacks,
+    /// the GXFIFO command interpreter, the vertex/polygon assembly, per-vertex
+    /// lighting, the software rasterizer's two BGR555 framebuffers + drawn masks,
+    /// and the 3D control register block (DISP3DCNT/CLEAR_*/FOG_*/EDGE_*). Engine
+    /// A composites its output as BG0 when DISPCNT bit 3 (3D) is set.
+    pub gpu3d: Gpu3d,
 
     /// ARM9 BIOS-facing register file (ARMv5TE). This is the CANONICAL register
     /// file the BIOS HLE, `bios_service_wait`, `nitro_os_tick`, and `hle_boot`
@@ -172,6 +180,7 @@ impl Nds {
             bus7: Bus7::new(),
             vram: VramRouter::new(),
             ppu: Ppu::new(),
+            gpu3d: Gpu3d::new(),
             state9: CpuState::new(),
             state7: CpuState::new(),
             cpu9: Cpu::new(Core::Arm9),
@@ -454,6 +463,11 @@ impl Nds {
         if is_arm9 && Self::is_math_addr(addr) {
             return self.ds_math.read32(addr & 0x0FFF_FFFF);
         }
+        // GXSTAT (0x04000600, ARM9) — geometry engine + FIFO status. Pokemon
+        // D/P/Pt spin on the "FIFO less than half full" bit before each list.
+        if is_arm9 && (addr & 0x0FFF_FFFF) == 0x0400_0600 {
+            return self.gpu3d.read_stat();
+        }
         // IPC RECV FIFO (atomic word pop) at 0x04100000.
         if m == 0x0410_0000 {
             return self
@@ -501,6 +515,17 @@ impl Nds {
         let addr = addr & 0x0FFF_FFFF;
         if is_arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
             return self.ds_math.read8(addr);
+        }
+        // GX 3D control register block (ARM9-only): DISP3DCNT (0x60/0x61),
+        // EDGE_COLOR_TABLE (0x330..0x33F), CLEAR_COLOR/CLEAR_DEPTH (0x350..0x357),
+        // FOG_COLOR/OFFSET/TABLE (0x358..0x37F). GXSTAT (0x600..0x603) byte reads.
+        if is_arm9 {
+            if let Some(b) = self.gpu3d.read_reg8(addr) {
+                return b;
+            }
+            if (0x0400_0600..0x0400_0604).contains(&addr) {
+                return (self.gpu3d.read_stat() >> ((addr & 3) * 8)) & 0xFF;
+            }
         }
         // ARM7 sound chip occupies 0x04000400..0x040005FF (ARM9 sees GX → 0).
         if !is_arm9 && (0x0400_0400..0x0400_0600).contains(&addr) {
@@ -643,6 +668,26 @@ impl Nds {
             self.ds_math.write32(addr & 0x0FFF_FFFF, v);
             return;
         }
+        // GX geometry engine (ARM9-only). GXFIFO at 0x04000400 (32-bit packed
+        // command word), the direct command ports at 0x04000440..0x040005FF
+        // (one parameter each, opcode encoded in the offset), and GXSTAT at
+        // 0x04000600. The command interpreter drains synchronously and may raise
+        // IRQ_GXFIFO, so it borrows the ARM9 IRQ controller.
+        if is_arm9 {
+            let g = addr & 0x0FFF_FFFF;
+            if g == 0x0400_0400 {
+                self.gpu3d.write_fifo(v, &mut self.irq9);
+                return;
+            }
+            if (0x0400_0440..0x0400_0600).contains(&g) {
+                self.gpu3d.write_direct(g & !0x3, v, &mut self.irq9);
+                return;
+            }
+            if g == 0x0400_0600 {
+                self.gpu3d.write_stat(v, &mut self.irq9);
+                return;
+            }
+        }
         // IPC SEND FIFO at 0x04000188.
         if m == 0x0400_0188 {
             self.ipc
@@ -710,6 +755,21 @@ impl Nds {
         }
         if is_arm9 && (0x0400_0280..0x0400_02C0).contains(&addr) {
             self.ds_math.write8(addr, v);
+            return;
+        }
+        // GX 3D control register block (ARM9-only). Routed BEFORE the 2D engine
+        // block because DISP3DCNT (0x60/0x61) overlaps the engine-A register
+        // address window (0x00..0x6F) — the GX register owns those bytes.
+        if is_arm9 && self.gpu3d.write_reg8(addr, v) {
+            return;
+        }
+        // GXSTAT high half (0x602/0x603) — games set the FIFO IRQ mode (bits
+        // 30..31) with a halfword/byte store; compose into the full word.
+        if is_arm9 && (0x0400_0602..0x0400_0604).contains(&addr) {
+            let sh = (addr & 3) * 8;
+            let cur = self.gpu3d.read_stat();
+            self.gpu3d
+                .write_stat((cur & !(0xFF << sh)) | (v << sh), &mut self.irq9);
             return;
         }
         // 2D PPU register blocks (ARM9-only). POWCNT1 (0x04000304) is handled
@@ -1231,6 +1291,22 @@ impl Nds {
             self.run_dma_channel(ch, false);
         }
     }
+    /// GXFIFO DMA trigger (ARM9 only). Fires every channel armed with timing 7
+    /// (geometry-command FIFO). On hardware this asserts when the GXFIFO drops
+    /// below half-full; our GX command interpreter drains synchronously, so the
+    /// condition holds whenever the geometry engine has consumed a batch. The GX
+    /// IO write path calls this after handing a command word to the engine so a
+    /// game's GXFIFO-timed DMA keeps refilling the geometry queue. (The VBlank
+    /// trigger also re-evaluates GxFifo channels as a backstop.)
+    pub fn dma_trigger_gxfifo(&mut self) {
+        for ch in self
+            .dma9
+            .channels_for_timing(DmaTiming::GxFifo)
+            .collect::<Vec<_>>()
+        {
+            self.run_dma_channel(ch, true);
+        }
+    }
     /// Cart "card ready" trigger (ARM9 only).
     pub fn dma_trigger_card_ready(&mut self) {
         for ch in self.dma9.channels_for_timing(DmaTiming::CardReady).collect::<Vec<_>>() {
@@ -1343,6 +1419,18 @@ impl Nds {
                 }
             }
 
+            // Just before the PPU crosses into VBlank (vcount 191 → 192) it
+            // composites the whole frame, including Engine A's BG0-as-3D layer.
+            // Build that 3D layer from the geometry engine's front display list
+            // now (the GXFIFO interpreter already drained the back list and a
+            // SWAP_BUFFERS promoted it), and hand it to Engine A so the next
+            // `ppu.step` render reads it as BG0. We do this exactly once per
+            // frame, on the line before the render, to avoid re-rasterizing the
+            // whole 3D scene 263 times.
+            if self.ppu.vcount + 1 == crate::ppu::ppu::VISIBLE_LINES {
+                self.refresh_3d_layer();
+            }
+
             // Advance the PPU one batch of dots. It raises HBlank/VBlank/VCount
             // IRQs internally and reports which DMA triggers to fire.
             let tick = self.ppu.step(
@@ -1393,6 +1481,38 @@ impl Nds {
         // frame re-samples the lines from the IRQ controller).
         self.cpu9 = cpu9;
         self.cpu7 = cpu7;
+    }
+
+    /// Rasterize the 3D geometry engine's front display list into a full
+    /// 256x192 packed layer and hand it to Engine A as the BG0-in-3D-mode
+    /// source. Called once per frame (just before the PPU's VBlank composite)
+    /// from `run_frame`.
+    ///
+    /// When Engine A's DISPCNT bit 3 (BG0 = 3D) is clear, the 3D layer is not
+    /// composited, so we drop any stale layer (BG0 reverts to its 2D meaning /
+    /// transparent stub). When set, `Gpu3d::render_scanline` rasterizes the
+    /// front scene once (its first call after a SWAP_BUFFERS) and packs each
+    /// scanline into the engine_a `PX_TRANSPARENT` convention; we stitch the
+    /// 192 scanlines into one `SCREEN_W * SCREEN_H` buffer the compositor then
+    /// reads per pixel at BG0CNT's priority.
+    fn refresh_3d_layer(&mut self) {
+        use crate::ppu::ppu::{SCREEN_H, SCREEN_W};
+
+        // BG0-as-3D only exists on Engine A, gated by DISPCNT bit 3.
+        if (self.ppu.engine_a.dispcnt & 0x8) == 0 {
+            self.ppu.engine_a.gx_bg0_layer = None;
+            return;
+        }
+
+        let mut layer = vec![0u32; SCREEN_W * SCREEN_H].into_boxed_slice();
+        for y in 0..SCREEN_H as u32 {
+            let line = self
+                .gpu3d
+                .render_scanline(y, &self.mem, &self.vram, &self.ppu.vramcnt);
+            let row = (y as usize) * SCREEN_W;
+            layer[row..row + SCREEN_W].copy_from_slice(&line[..SCREEN_W]);
+        }
+        self.ppu.engine_a.gx_bg0_layer = Some(layer);
     }
 
     /// The 256x192 RGBA8888 framebuffer for the TOP screen (POWCNT1 bit 15
@@ -2011,6 +2131,131 @@ mod tests {
                 "pixel ({x},{y}) should be backdrop red"
             );
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 3D pipeline integration — submit a single flat triangle through the
+    // GXFIFO at the Nds bus level (writes to 0x04000440+ direct command ports),
+    // drive a full frame, and assert the triangle reaches BOTH the geometry
+    // engine's 3D layer AND the composited top framebuffer as Engine A's BG0.
+    //
+    // This exercises the whole 3D path end-to-end: GXFIFO command interpreter →
+    // matrix/vertex assembly → deferred display list → SWAP_BUFFERS promote →
+    // `run_frame`'s once-per-frame `refresh_3d_layer` rasterize → Engine A BG0
+    // composite (priority from BG0CNT) → BGR555→RGBA framebuffer.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Push one GX command + its parameters through the ARM9 GXFIFO direct
+    /// command ports. The direct port for opcode `op` is
+    /// `0x04000440 + (op - 0x10) * 4`; each parameter word is written there.
+    /// A zero-parameter command is still "issued" by one write to its port.
+    fn gx_cmd(nds: &mut Nds, op: u8, params: &[u32]) {
+        let port = 0x0400_0440 + ((op as u32) - 0x10) * 4;
+        if params.is_empty() {
+            nds.write32_arm9(port, 0);
+        } else {
+            for &p in params {
+                nds.write32_arm9(port, p);
+            }
+        }
+    }
+
+    #[test]
+    fn gxfifo_triangle_reaches_3d_layer_and_top_framebuffer() {
+        let mut nds = Nds::new();
+
+        // ── Engine A: graphics display-mode 1, BG0 = 3D (DISPCNT bit 3),
+        //    BG0 enabled (bit 8). Backdrop = black so the green triangle stands
+        //    out. BG0CNT priority 0. ──────────────────────────────────────────
+        nds.write32_arm9(0x0400_0000, (1 << 16) | (1 << 8) | (1 << 3));
+        nds.write16_arm9(0x0400_0008, 0x0000); // BG0CNT priority 0
+        // Backdrop (engine A PRAM entry 0) = black.
+        nds.mem.pram[0] = 0x00;
+        nds.mem.pram[1] = 0x00;
+
+        // ── Submit one flat green triangle through the GXFIFO. Default matrix
+        //    stacks are identity, so a Q12 vertex maps straight to NDC. The
+        //    triangle's NDC corners spill past the screen edges so the center
+        //    (128, 96) is solidly inside. ─────────────────────────────────────
+        use crate::ppu::gx::FP_ONE;
+        let q = FP_ONE as u32;
+
+        gx_cmd(&mut nds, 0x29, &[0x001F_0000]); // POLYGON_ATTR: alpha 31 (opaque)
+        gx_cmd(&mut nds, 0x20, &[0x03E0]); // COLOR: green (BGR555)
+        gx_cmd(&mut nds, 0x40, &[0]); // BEGIN_VTXS: triangle list
+        // VTX_16: p0 = (X | Y<<16), p1 = Z. Two's-complement 16-bit each.
+        let v16 = |x: i32, y: i32| (x as u32 & 0xFFFF) | ((y as u32 & 0xFFFF) << 16);
+        gx_cmd(&mut nds, 0x23, &[v16(-2 * q as i32, -2 * q as i32), 0]);
+        gx_cmd(&mut nds, 0x23, &[v16(2 * q as i32, -2 * q as i32), 0]);
+        gx_cmd(&mut nds, 0x23, &[v16(0, 3 * q as i32), 0]);
+        gx_cmd(&mut nds, 0x41, &[]); // END_VTXS
+        gx_cmd(&mut nds, 0x50, &[0]); // SWAP_BUFFERS — promote to front list
+
+        // One queued triangle is now in the geometry engine's FRONT list.
+        // (SWAP promoted the back list; `run_frame` rasterizes it.)
+
+        // ── Drive a full frame: run_frame builds the 3D layer just before the
+        //    VBlank composite and Engine A reads it as BG0. ──────────────────
+        nds.run_frame();
+
+        // 1) The geometry engine rasterized the front scene: center pixel drawn.
+        let center3d = 96 * crate::ppu::gx::GX_SCREEN_W + 128;
+        assert_eq!(
+            nds.gpu3d.line().len(),
+            crate::ppu::gx::GX_SCREEN_W,
+            "3D line buffer is one screen wide"
+        );
+
+        // 2) Engine A received a 3D layer (run_frame filled it, DISPCNT bit 3 set).
+        assert!(
+            nds.ppu.engine_a.gx_bg0_layer.is_some(),
+            "run_frame must hand Engine A the 3D BG0 layer when DISPCNT bit 3 is set"
+        );
+        let layer = nds.ppu.engine_a.gx_bg0_layer.as_ref().unwrap();
+        assert_eq!(layer.len(), 256 * 192);
+        // The 3D layer's center pixel is a drawn green texel (bit 15 CLEAR =
+        // opaque in the PX_TRANSPARENT convention; BGR555 green = 0x03E0).
+        assert_eq!(
+            layer[center3d] & 0x8000,
+            0,
+            "3D layer center pixel must be drawn (opaque)"
+        );
+        assert_eq!(layer[center3d] & 0x7FFF, 0x03E0, "3D layer center = green");
+
+        // 3) The composited TOP framebuffer shows the green triangle at center
+        //    (Engine A on top by the POWCNT1 default), and the black backdrop in
+        //    a corner the triangle can't reach.
+        let fb = nds.top_framebuffer();
+        let center = (96 * 256 + 128) * 4;
+        assert_eq!(
+            (fb[center], fb[center + 1], fb[center + 2], fb[center + 3]),
+            (0x00, 0xFF, 0x00, 0xFF),
+            "composited center pixel must be the green 3D triangle"
+        );
+        // A top corner the (downward-pointing) triangle never covers → backdrop.
+        let corner = 0usize;
+        assert_eq!(
+            (fb[corner], fb[corner + 1], fb[corner + 2]),
+            (0x00, 0x00, 0x00),
+            "corner outside the triangle must be the black backdrop"
+        );
+        // Genuinely non-uniform: triangle != backdrop.
+        assert_ne!(&fb[center..center + 3], &fb[corner..corner + 3]);
+    }
+
+    #[test]
+    fn three_d_layer_dropped_when_dispcnt_bit3_clear() {
+        // With BG0-as-3D disabled (DISPCNT bit 3 clear), run_frame must NOT
+        // attach a 3D layer, even if geometry was submitted.
+        let mut nds = Nds::new();
+        nds.write32_arm9(0x0400_0000, 1 << 16); // graphics, BG0 NOT 3D
+        gx_cmd(&mut nds, 0x40, &[0]); // BEGIN_VTXS
+        gx_cmd(&mut nds, 0x50, &[0]); // SWAP_BUFFERS
+        nds.run_frame();
+        assert!(
+            nds.ppu.engine_a.gx_bg0_layer.is_none(),
+            "3D layer must be absent when DISPCNT bit 3 is clear"
+        );
     }
 
     #[test]

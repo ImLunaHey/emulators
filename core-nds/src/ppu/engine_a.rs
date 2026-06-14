@@ -171,6 +171,16 @@ pub struct Engine {
     pub bg_line: [Box<[u32; LINE_W]>; 4],
     /// OBJ packed-pixel line buffer.
     pub obj_line: Box<[u32; LINE_W]>,
+
+    /// 3D-layer source for the BG0-in-3D-mode path (Engine A only). When BG0 is
+    /// the 3D layer (DISPCNT bit 3) this holds the GX engine's packed per-pixel
+    /// output for the whole frame: `SCREEN_W * SCREEN_H` entries in the
+    /// `PX_TRANSPARENT` convention (BGR555 in bits 0..14, bit 15 set where the
+    /// pixel was not drawn). `None` (or absent on Engine B) → BG0 stays
+    /// transparent, exactly as the pre-3D stub did. `Nds` fills this from
+    /// `Gpu3d` once per frame before compositing; the GX rasterizer wave wires
+    /// the actual `Gpu3d::render_scanline` source.
+    pub gx_bg0_layer: Option<Box<[u32]>>,
 }
 
 impl Engine {
@@ -193,6 +203,7 @@ impl Engine {
                 Box::new([PX_TRANSPARENT; LINE_W]),
             ],
             obj_line: Box::new([PX_TRANSPARENT; LINE_W]),
+            gx_bg0_layer: None,
         }
     }
 
@@ -594,12 +605,33 @@ impl Engine {
                 }
             }
 
-            // 3D engine overrides BG0 (Engine A only, DISPCNT bit 3). The GX
-            // geometry engine is DEFERRED — leave BG0 transparent so it simply
-            // doesn't contribute. TODO(gx): copy the 3D rasterizer output here.
+            // 3D engine drives BG0 (Engine A only, DISPCNT bit 3). Copy the GX
+            // engine's packed scanline into BG0's line buffer so the compositor
+            // treats it like any other BG layer (priority from BG0CNT). When no
+            // 3D layer is supplied (`gx_bg0_layer` is `None` — e.g. the GX
+            // rasterizer wave hasn't filled it yet) BG0 stays transparent,
+            // exactly as the pre-3D stub did.
             if is_a && (self.dispcnt & 0x8) != 0 {
-                for px in self.bg_line[0].iter_mut() {
-                    *px = PX_TRANSPARENT;
+                match &self.gx_bg0_layer {
+                    Some(layer) => {
+                        let row = (y as usize) * SCREEN_W;
+                        let pri = (self.bg.cnt[0] & 0x3) << 18; // BG0CNT priority
+                        for x in 0..LINE_W {
+                            let src = layer[row + x];
+                            // Carry the 3D pixel's transparent bit; tag it as
+                            // BG0 (layer 0) at BG0's priority for the compositor.
+                            self.bg_line[0][x] = if (src & PX_TRANSPARENT) != 0 {
+                                PX_TRANSPARENT
+                            } else {
+                                (src & 0x7FFF) | pri
+                            };
+                        }
+                    }
+                    None => {
+                        for px in self.bg_line[0].iter_mut() {
+                            *px = PX_TRANSPARENT;
+                        }
+                    }
                 }
             }
 
