@@ -3,10 +3,10 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "portless": "gba-recomp",
+  "portless": "emulators",
   "scripts": {
     "dev": "vite",
-    "dev:portless": "portless gba-recomp vite",
+    "dev:portless": "portless emulators vite",
     "build:wasm": "wasm-pack build core --target web --out-dir pkg --release",
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",

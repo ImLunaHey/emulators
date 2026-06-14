@@ -13,6 +13,8 @@ coverage
 
 # rust core
 core/target
+# wasm-pack output — built in CI (build:wasm) and locally; no longer committed
+core/pkg
 # rust mobile FFI crate (native libs / xcframework build output)
 core-ffi/target
 core-ffi/build
