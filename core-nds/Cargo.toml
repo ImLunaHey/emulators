@@ -9,11 +9,17 @@ edition = "2021"
 # ARM7), the VRAM bank router, both CPU register files, and CP15. Subsystems
 # (CPU execution, DMA, PPU, cart, BIOS HLE) land later in their own modules.
 #
-# Mirrors ../core/Cargo.toml's structure: a plain rlib for host-side builds.
-# No wasm/wasm-bindgen surface yet — that's layered on at integration time,
-# like the GBA core's `wasm` module.
+# Mirrors ../core/Cargo.toml's structure: a plain rlib for host-side builds
+# (host `cargo test`), plus a cdylib so the web target can layer a wasm-bindgen
+# surface (`src/wasm.rs`) on top — exactly like the GBA core's `wasm` module.
 [lib]
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull or
+# compile it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -24,3 +30,7 @@ codegen-units = 1
 # No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
 # landing-pad tables, shrinking the binary and trimming the hot paths.
 panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']

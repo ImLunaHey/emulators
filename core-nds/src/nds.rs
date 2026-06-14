@@ -17,6 +17,7 @@
 use crate::bios::hle::BiosHle;
 use crate::bios::nitro_os::NitroOsAssist;
 use crate::cart::cart::{Cart, TransferEvent};
+use crate::cpu::exec::Cpu;
 use crate::cpu::{Cp15, CpuState};
 use crate::io::dma::{Dma, DmaTiming};
 use crate::io::ds_math::DsMath;
@@ -59,10 +60,21 @@ pub struct Nds {
     /// `ppu.vramcnt` on every VRAM access.
     pub ppu: Ppu,
 
-    /// ARM9 register file (ARMv5TE). Shares the `CpuState` type with ARM7.
+    /// ARM9 BIOS-facing register file (ARMv5TE). This is the CANONICAL register
+    /// file the BIOS HLE, `bios_service_wait`, `nitro_os_tick`, and `hle_boot`
+    /// read/write. While `run_frame` is actively stepping a core, the live
+    /// register file lives on `cpu9.state`; the frame loop syncs it back into
+    /// `state9` at the boundaries where BIOS code runs (and the SWI seam in
+    /// `Cpu::step` swaps it in/out for the duration of each HLE call).
     pub state9: CpuState,
-    /// ARM7 register file (ARMv4T).
+    /// ARM7 BIOS-facing register file (ARMv4T). Same role as `state9`.
     pub state7: CpuState,
+
+    /// ARM9 executor (ARMv5TE decode + pipeline/IRQ tracking). Owns the live
+    /// register file while `run_frame` is stepping; otherwise mirrors `state9`.
+    pub cpu9: Cpu,
+    /// ARM7 executor (ARMv4T).
+    pub cpu7: Cpu,
 
     /// ARM9 CP15 system-control coprocessor (caches/MPU/TCM config).
     pub cp15: Cp15,
@@ -162,6 +174,8 @@ impl Nds {
             ppu: Ppu::new(),
             state9: CpuState::new(),
             state7: CpuState::new(),
+            cpu9: Cpu::new(Core::Arm9),
+            cpu7: Cpu::new(Core::Arm7),
             cp15: Cp15::new(),
 
             irq9: Irq::new(),
@@ -1258,9 +1272,170 @@ impl Nds {
         self.bus7.touch_screen_x = sx;
     }
 
-    // ─── Frame loop (deferred — needs CPU exec + every subsystem) ────────
+    // ─── Frame loop (ports ds-recomp src/emulator.ts `runFrame`) ─────────
+    //
+    // Timing model (per the TS): the DS dot clock is the master. Each dot the
+    // ARM9 takes 2 instruction steps and the ARM7 takes 1 (a 2:1 ratio), the
+    // PPU advances one dot, and the timer/sound blocks advance 6 bus cycles
+    // (BUS_CYCLES_PER_DOT). We batch a whole scanline at a time (DOTS_PER_LINE)
+    // so the PPU's `step` does its line-boundary bookkeeping in one call and
+    // returns a `PpuTick`; the orchestrator then fires HBlank/VBlank DMA (the
+    // PPU already raised the matching IRQs internally). The HBlank/VBlank IRQ
+    // *enable* bits are checked inside `Ppu::step`, so here we only drive DMA.
+    //
+    // Register-file ownership: `state9`/`state7` are the canonical BIOS-facing
+    // files. We move them into the two `Cpu` executors for the duration of the
+    // frame (so `Cpu::step`'s own `self.state` is live), and sync them back
+    // into `state9`/`state7` around every point where BIOS code runs
+    // (`bios_service_wait` at VBlank, `nitro_os_tick` once per frame, and at
+    // frame end). The SWI seam inside `Cpu::step` independently swaps the live
+    // state into `state9`/`state7` for the duration of each HLE call.
     pub fn run_frame(&mut self) {
-        todo!("port from ds-recomp src/emulator.ts (needs CPU exec + subsystems)")
+        use crate::ppu::ppu::{DOTS_PER_LINE, LINES_PER_FRAME};
+
+        /// Instruction steps per dot, ARM9 (ARM9 runs at ~2x the dot clock).
+        const ARM9_STEPS_PER_DOT: u32 = 2;
+        /// Bus cycles per dot — the rate the timer + sound blocks advance at.
+        const BUS_CYCLES_PER_DOT: u32 = 6;
+        /// How many dots we batch before ticking the PPU/timers/sound. One
+        /// scanline keeps the PPU line bookkeeping atomic per call.
+        const BATCH_DOTS: u32 = DOTS_PER_LINE;
+
+        let total_dots = DOTS_PER_LINE * LINES_PER_FRAME;
+
+        // Take the executors out of `self` so we can borrow `&mut self` for the
+        // bus while stepping; restore them at the end. Move the canonical
+        // register files into the live executors first.
+        let mut cpu9 = std::mem::replace(&mut self.cpu9, Cpu::new(Core::Arm9));
+        let mut cpu7 = std::mem::replace(&mut self.cpu7, Cpu::new(Core::Arm7));
+        cpu9.state = std::mem::take(&mut self.state9);
+        cpu7.state = std::mem::take(&mut self.state7);
+
+        let mut dots_done = 0u32;
+        let mut a7_carry = 0u32;
+
+        while dots_done < total_dots {
+            let batch = BATCH_DOTS.min(total_dots - dots_done);
+
+            for _ in 0..batch {
+                for _ in 0..ARM9_STEPS_PER_DOT {
+                    // Sample the ARM9 IRQ lines fresh before each step (devices
+                    // ticked since the last step may have raised an IRQ).
+                    cpu9.irq_line = self.irq9.pending();
+                    cpu9.wake_line = self.irq9.wake_pending();
+                    // A halted CPU with no wake source can't make progress; skip
+                    // its step (matches the TS guard). `Cpu::step` itself lifts
+                    // halt when a wake/IRQ is present, so we still step then.
+                    if !cpu9.state.halted || cpu9.wake_line {
+                        cpu9.step(self);
+                    }
+
+                    // ARM7 runs at half the ARM9 rate: one ARM7 step per 2 ARM9.
+                    a7_carry += 1;
+                    if a7_carry >= ARM9_STEPS_PER_DOT {
+                        a7_carry -= ARM9_STEPS_PER_DOT;
+                        cpu7.irq_line = self.irq7.pending();
+                        cpu7.wake_line = self.irq7.wake_pending();
+                        if !cpu7.state.halted || cpu7.wake_line {
+                            cpu7.step(self);
+                        }
+                    }
+                }
+            }
+
+            // Advance the PPU one batch of dots. It raises HBlank/VBlank/VCount
+            // IRQs internally and reports which DMA triggers to fire.
+            let tick = self.ppu.step(
+                batch,
+                &mut self.irq9,
+                &mut self.irq7,
+                &self.mem,
+                &self.vram,
+            );
+            if tick.hblank {
+                self.dma_trigger_hblank();
+            }
+            if tick.vblank {
+                self.dma_trigger_vblank();
+                // VBlank housekeeping: refresh the cooked touch struct, then let
+                // both cores' IntrWait latches observe the VBlank IRQ. These read
+                // `state9`/`state7`, so sync the live files in and back out.
+                self.touch_tick_vblank();
+                // Hand the live files to the canonical slots, run the IntrWait
+                // service (which may clear `state*.halted`), then take them back.
+                std::mem::swap(&mut cpu9.state, &mut self.state9);
+                std::mem::swap(&mut cpu7.state, &mut self.state7);
+                self.bios_service_wait(true);
+                self.bios_service_wait(false);
+                std::mem::swap(&mut cpu9.state, &mut self.state9);
+                std::mem::swap(&mut cpu7.state, &mut self.state7);
+            }
+
+            // Timers + sound advance in bus cycles (both cores' timer blocks tick
+            // at the same bus clock; the prescalers divide further).
+            let bus_cycles = batch * BUS_CYCLES_PER_DOT;
+            self.timers9.step(bus_cycles, &mut self.irq9);
+            self.timers7.step(bus_cycles, &mut self.irq7);
+            self.sound.step(bus_cycles);
+
+            dots_done += batch;
+        }
+
+        // Move the live register files back into the canonical slots before the
+        // once-per-frame NitroSDK deadlock assist (it reads `state9`). The
+        // executors return to their resting state (their `state` is overwritten
+        // from `state9`/`state7` at the start of the next `run_frame`).
+        self.state9 = std::mem::take(&mut cpu9.state);
+        self.state7 = std::mem::take(&mut cpu7.state);
+        self.nitro_os_tick();
+
+        // Restore the executors (the assist may have raised an IRQ; the next
+        // frame re-samples the lines from the IRQ controller).
+        self.cpu9 = cpu9;
+        self.cpu7 = cpu7;
+    }
+
+    /// The 256x192 RGBA8888 framebuffer for the TOP screen (POWCNT1 bit 15
+    /// selects which 2D engine drives it). Stable until the next `run_frame`.
+    pub fn top_framebuffer(&self) -> &[u8] {
+        self.ppu.top_framebuffer()
+    }
+    /// The 256x192 RGBA8888 framebuffer for the BOTTOM screen.
+    pub fn bottom_framebuffer(&self) -> &[u8] {
+        self.ppu.bottom_framebuffer()
+    }
+
+    // ─── Input API ───────────────────────────────────────────────────────
+
+    /// Set the button state. Both masks are ACTIVE-LOW (a 0 bit = pressed),
+    /// matching the hardware registers the games poll.
+    ///
+    /// - `keyinput` → KEYINPUT (0x04000130), low 10 bits:
+    ///   A, B, Select, Start, Right, Left, Up, Down, R, L.
+    /// - `ext_keyinput` → EXTKEYIN (0x04000136): bit 0 = X, bit 1 = Y
+    ///   (bits 3/6/7 are debug/pen/hinge and left to the IO defaults).
+    pub fn set_keys(&mut self, keyinput: u32, ext_keyinput: u32) {
+        self.keyinput = keyinput & 0x03FF;
+        // Preserve the IO-managed high bits (pen-down bit 6, hinge bit 7) and
+        // only let X/Y (bits 0..1) through from the caller.
+        self.ext_keyinput = (self.ext_keyinput & !0x0003) | (ext_keyinput & 0x0003);
+    }
+
+    /// Set the touchscreen pointer. `pressed` gates the SPI touch latches the
+    /// HLE touch tick cooks into the OS shared-work struct each VBlank. When
+    /// pressed, `x`/`y` are bottom-screen coordinates (0..255 / 0..191); when
+    /// released the latches are cleared so EXTKEYIN reads "pen up".
+    pub fn set_touch(&mut self, pressed: bool, x: u16, y: u16) {
+        if pressed {
+            self.spi.touch_x = Some(x as u32);
+            self.spi.touch_y = Some(y as u32);
+            // Pressure latch above the cook threshold (PRESSURE_THRESHOLD).
+            self.spi.touch_z = 0x800;
+        } else {
+            self.spi.touch_x = None;
+            self.spi.touch_y = None;
+            self.spi.touch_z = 0;
+        }
     }
 
     /// Load a `.nds` cartridge image and HLE-boot it (parse header, copy
@@ -1736,5 +1911,128 @@ mod tests {
         // Two cycles: 0xFFFF → 0x0000 (overflow) → reload.
         nds.timers9.step(2, &mut nds.irq9);
         assert_ne!(nds.irq9.iflag & IRQ_TIMER0, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // run_frame smoke test — the lockstep frame loop end-to-end.
+    //
+    // A synthetic cart whose ARM9 program writes DISPCNT = display-mode 1
+    // (graphics, all BGs off → pure backdrop) and a red backdrop into engine-A
+    // PRAM, then busy-loops. After load_rom + a few run_frame calls the top
+    // framebuffer must show the red backdrop everywhere, proving both CPUs +
+    // PPU + timers advanced in lockstep without panicking.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Assemble a minimal valid .nds header + two ARM binaries (mirrors the
+    /// hle.rs test `synth_cart`).
+    fn smoke_synth_cart(arm9: &[u8], arm9_ram: u32, arm7: &[u8], arm7_ram: u32) -> Vec<u8> {
+        let arm9_off = 0x4000usize;
+        let arm7_off = 0x8000usize;
+        let total = (arm9_off + arm9.len()).max(arm7_off + arm7.len()).max(0x200);
+        let mut rom = vec![0u8; total];
+        rom[0x00..0x0B].copy_from_slice(b"SMOKEBOOT\0\0");
+        rom[0x0C..0x10].copy_from_slice(b"ZZZE");
+        rom[0x10..0x12].copy_from_slice(b"01");
+        let w32 = |rom: &mut [u8], off: usize, v: u32| {
+            rom[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        w32(&mut rom, 0x020, arm9_off as u32);
+        w32(&mut rom, 0x024, arm9_ram); // ARM9 entry
+        w32(&mut rom, 0x028, arm9_ram);
+        w32(&mut rom, 0x02C, arm9.len() as u32);
+        w32(&mut rom, 0x030, arm7_off as u32);
+        w32(&mut rom, 0x034, arm7_ram); // ARM7 entry
+        w32(&mut rom, 0x038, arm7_ram);
+        w32(&mut rom, 0x03C, arm7.len() as u32);
+        rom[arm9_off..arm9_off + arm9.len()].copy_from_slice(arm9);
+        rom[arm7_off..arm7_off + arm7.len()].copy_from_slice(arm7);
+        rom
+    }
+
+    #[test]
+    fn run_frame_renders_backdrop_from_a_loaded_cart() {
+        // ── ARM9 program (little-endian ARM words) ───────────────────────────
+        //   MOV  r0, #0x04000000   ; DISPCNT (engine A)
+        //   MOV  r1, #0x00010000   ; display-mode 1 (graphics), all BGs off
+        //   STR  r1, [r0]
+        //   MOV  r0, #0x05000000   ; PRAM (engine A palette)
+        //   MOV  r1, #0x0000001F   ; BGR555 red (backdrop = palette entry 0)
+        //   STRH r1, [r0]
+        //   B    .                 ; busy-loop forever
+        let arm9_words: [u32; 7] = [
+            0xE3A0_0404, // MOV r0,#0x04000000
+            0xE3A0_1801, // MOV r1,#0x00010000
+            0xE580_1000, // STR r1,[r0]
+            0xE3A0_0405, // MOV r0,#0x05000000
+            0xE3A0_101F, // MOV r1,#0x0000001F
+            0xE1C0_10B0, // STRH r1,[r0]
+            0xEAFF_FFFE, // B . (self)
+        ];
+        let mut arm9_bytes = Vec::new();
+        for w in arm9_words {
+            arm9_bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        // ARM7 program: just busy-loop (B .) so its core has something to step.
+        let arm7_bytes = 0xEAFF_FFFEu32.to_le_bytes().to_vec();
+
+        let rom = smoke_synth_cart(&arm9_bytes, 0x0200_0000, &arm7_bytes, 0x0380_0000);
+
+        let mut nds = Nds::new();
+        nds.load_rom(&rom);
+
+        // Both cores booted to their entry points in SYS/ARM mode.
+        assert_eq!(nds.state9.r[15], 0x0200_0000);
+        assert_eq!(nds.state7.r[15], 0x0380_0000);
+
+        // Run a handful of frames — must not panic and must complete frames.
+        let start_frames = nds.ppu.frame_count;
+        for _ in 0..3 {
+            nds.run_frame();
+        }
+        assert!(
+            nds.ppu.frame_count > start_frames,
+            "run_frame should advance the PPU frame counter"
+        );
+
+        // DISPCNT was programmed by the ARM9 code through the bus.
+        assert_eq!(nds.ppu.engine_a.dispcnt & 0x0003_0000, 0x0001_0000);
+
+        // The top framebuffer (POWCNT1 default 0x820F → engine A on top) shows
+        // the red backdrop the program wrote: BGR555 0x001F → RGBA (255,0,0,255).
+        let fb = nds.top_framebuffer();
+        assert_eq!(fb.len(), 256 * 192 * 4);
+        assert_eq!(fb[3], 0xFF, "framebuffer must be opaque (rendered)");
+        // Sample a few pixels — all backdrop red.
+        for &(x, y) in &[(0usize, 0usize), (128, 96), (255, 191)] {
+            let o = (y * 256 + x) * 4;
+            assert_eq!(
+                (fb[o], fb[o + 1], fb[o + 2], fb[o + 3]),
+                (0xFF, 0, 0, 0xFF),
+                "pixel ({x},{y}) should be backdrop red"
+            );
+        }
+    }
+
+    #[test]
+    fn input_api_sets_keypad_and_touch() {
+        let mut nds = Nds::new();
+        // Press A (bit 0) + Start (bit 3): active-low → clear those bits.
+        nds.set_keys(0x03FF & !0b1001, 0x0003 & !0b01); // also press X (ext bit 0)
+        assert_eq!(nds.read8_arm9(0x0400_0130) & 0b1001, 0);
+        // EXTKEYIN bit 0 (X) cleared = pressed.
+        assert_eq!(nds.read8_arm9(0x0400_0136) & 0x01, 0);
+
+        // Touch: pressed feeds the SPI latches the VBlank cook reads.
+        nds.set_touch(true, 100, 80);
+        assert_eq!(nds.spi.touch_x, Some(100));
+        assert_eq!(nds.spi.touch_y, Some(80));
+        assert!(nds.spi.touch_z > crate::io::touch::PRESSURE_THRESHOLD);
+        // Pen-down reflected in EXTKEYIN bit 6 (active-low).
+        assert_eq!(nds.read8_arm9(0x0400_0136) & 0x40, 0);
+
+        // Release clears the latches.
+        nds.set_touch(false, 0, 0);
+        assert_eq!(nds.spi.touch_x, None);
+        assert_ne!(nds.read8_arm9(0x0400_0136) & 0x40, 0, "pen up");
     }
 }

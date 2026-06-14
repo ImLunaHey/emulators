@@ -26,6 +26,11 @@ pub mod cart;
 pub mod io;
 pub mod ppu;
 
+// --- wasm-bindgen surface for the web host (`WasmNds`). Gated to wasm32 so the
+// macro never runs during host `cargo test`, mirroring the GBA core's `wasm`.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 // Re-exports so callers can `use nds_core::{Nds, ...}` flatly, like the GBA
 // core's `pub use emulator::Gba`.
 pub use cpu::state;

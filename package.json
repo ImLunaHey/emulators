@@ -8,6 +8,7 @@
     "dev": "vite",
     "dev:portless": "portless emulators vite",
     "build:wasm": "wasm-pack build core --target web --out-dir pkg --release",
+    "build:wasm:nds": "wasm-pack build core-nds --target web --out-dir pkg --release",
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "gen:cheats": "tsx scripts/gen-cheats.ts",
