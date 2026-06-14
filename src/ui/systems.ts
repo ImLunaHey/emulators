@@ -25,7 +25,7 @@ export const SYSTEM_LABEL: Record<SystemId, string> = {
 };
 
 // Systems with a working core. Everything else is addable but "coming soon".
-export const PLAYABLE: ReadonlySet<SystemId> = new Set<SystemId>(['gba']);
+export const PLAYABLE: ReadonlySet<SystemId> = new Set<SystemId>(['gba', 'nds']);
 
 /** Detect a system from a filename's extension, or null if unrecognized. */
 export function detectSystem(filename: string): SystemId | null {

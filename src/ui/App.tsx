@@ -6,6 +6,7 @@ import { AudioSink } from './audio';
 import { EmuContext } from './EmuContext';
 import { HomeScreen } from './HomeScreen';
 import { PlayerPage } from './PlayerPage';
+import { NdsPlayer } from './NdsPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -23,7 +24,7 @@ export function App() {
   const audioRef = useRef<AudioSink | null>(null);
   if (!audioRef.current) audioRef.current = new AudioSink();
 
-  const [playing, setPlaying] = useState<string | null>(null);
+  const [playing, setPlaying] = useState<{ id: string; system: string } | null>(null);
 
   return (
     <PersistQueryClientProvider
@@ -33,9 +34,13 @@ export function App() {
       <EmuContext.Provider value={{ emu: emuRef.current, audio: audioRef.current }}>
         <ToastProvider>
           {playing ? (
-            <PlayerPage romId={playing} onExit={() => setPlaying(null)} />
+            playing.system === 'nds' ? (
+              <NdsPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : (
+              <PlayerPage romId={playing.id} onExit={() => setPlaying(null)} />
+            )
           ) : (
-            <HomeScreen onPlay={(id) => setPlaying(id)} />
+            <HomeScreen onPlay={(id, system) => setPlaying({ id, system })} />
           )}
         </ToastProvider>
       </EmuContext.Provider>

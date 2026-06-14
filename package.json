@@ -14,7 +14,7 @@
     "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "cargo test --manifest-path core/Cargo.toml",
     "lint": "oxlint src",
-    "deploy": "npm run build:wasm && npm run build && wrangler deploy"
+    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.40.0",

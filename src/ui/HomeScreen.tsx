@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { WasmHome } from '../../core/pkg/gba_core.js';
 import { useEmu } from './EmuContext';
-import { listRoms } from './romStore';
+import { listRoms, type RomMeta } from './romStore';
 import { ingestFiles } from './romIngest';
 import { systemLabel, isPlayable, ACCEPT } from './systems';
 import { useToast } from './Toast';
@@ -19,18 +19,24 @@ const K_LEFT = 1 << 5;
 const K_UP = 1 << 6;
 const K_DOWN = 1 << 7;
 
-export function HomeScreen({ onPlay }: { onPlay: (romId: string) => void }) {
+export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string) => void }) {
   const { emu } = useEmu();
   const toast = useToast();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const homeRef = useRef<WasmHome | null>(null);
   const keysRef = useRef(0);
+  const romsRef = useRef<RomMeta[]>([]);
   const [ready, setReady] = useState(false);
+
+  // Route a launcher "play:<id>" to App with the game's system so it picks the
+  // right core (GBA vs NDS).
+  const play = (id: string) => onPlay(id, romsRef.current.find((r) => r.id === id)?.system ?? 'gba');
 
   // Push the installed-game list into the launcher (id + display title).
   const refresh = async () => {
     const roms = await listRoms();
+    romsRef.current = roms;
     const home = homeRef.current;
     if (!home) return;
     // Push embedded icons (NDS banners) first — they're keyed by id and read
@@ -82,7 +88,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string) => void }) {
         const action = home.run_frame(mask);
         ctx.putImageData(new ImageData(new Uint8ClampedArray(home.framebuffer()), w, h), 0, 0);
         if (action.startsWith('play:')) {
-          onPlay(action.slice(5));
+          play(action.slice(5));
           return; // stop the loop; App unmounts us
         }
         if (action === 'add') fileRef.current?.click();
@@ -118,7 +124,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string) => void }) {
     const x = Math.floor(((e.clientX - rect.left) / rect.width) * home.width());
     const y = Math.floor(((e.clientY - rect.top) / rect.height) * home.height());
     const action = home.pointer(x, y);
-    if (action.startsWith('play:')) onPlay(action.slice(5));
+    if (action.startsWith('play:')) play(action.slice(5));
     else if (action === 'add') fileRef.current?.click();
     else if (action.startsWith('soon:')) toast.info(`${action.slice(5)} — coming soon`);
   };
