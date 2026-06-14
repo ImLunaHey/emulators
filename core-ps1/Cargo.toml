@@ -1,0 +1,29 @@
+[package]
+name = "ps1-core"
+version = "0.0.0"
+edition = "2021"
+
+# From-scratch PlayStation 1 (PSX) core, built from nocash's psx-spx hardware
+# spec. Sibling of the GBA (`../core`) and NDS cores. This phase lands the
+# MIPS R3000A register/exception foundation + the memory map + bus only — no
+# instruction execution or sub-device behavior yet (those are todo!() seams).
+#
+# rlib-only for now (host-side `cargo check`/`cargo test`); the wasm-bindgen
+# and C-ABI FFI surfaces layer on later, mirroring the GBA core.
+[lib]
+crate-type = ["rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter (no per-unit
+# boundaries blocking inlining of the now-monomorphized bus accesses).
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
+# landing-pad tables, shrinking the binary and trimming the hot paths. (cargo
+# test runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+[dev-dependencies]
+
+[dependencies]

@@ -3,28 +3,30 @@ dist
 .vite
 .DS_Store
 *.log
-public/*.gba
-public/*.sav
-*.gba
-*.sav
-# ROMs / disc images — never commit commercial dumps (PS1 .bin/.cue, etc.)
-*.bin
-*.cue
-public/*.bin
-public/*.cue
-*.nds
 _*.png
 tsconfig.tsbuildinfo
 coverage
 
-# rust core
+# ROM / disc-image dumps — never commit commercial dumps
+*.gba
+*.sav
+*.bin
+*.cue
+*.nds
+public/*.gba
+public/*.sav
+public/*.bin
+public/*.cue
+
+# rust cores (build artifacts; wasm-pack output built in CI + locally, not committed)
 core/target
-# second core (Nintendo DS) build artifacts
-core-nds/target
-# wasm-pack output — built in CI (build:wasm / build:wasm:nds) and locally; no
-# longer committed
 core/pkg
+core-api/target
+core-nds/target
 core-nds/pkg
+core-ps1/target
+core-ps1/pkg
+
 # rust mobile FFI crate (native libs / xcframework build output)
 core-ffi/target
 core-ffi/build
