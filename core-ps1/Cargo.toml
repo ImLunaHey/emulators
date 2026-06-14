@@ -8,10 +8,15 @@ edition = "2021"
 # MIPS R3000A register/exception foundation + the memory map + bus only — no
 # instruction execution or sub-device behavior yet (those are todo!() seams).
 #
-# rlib-only for now (host-side `cargo check`/`cargo test`); the wasm-bindgen
-# and C-ABI FFI surfaces layer on later, mirroring the GBA core.
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface (`src/wasm.rs`) on top, exactly like the GBA core.
 [lib]
-crate-type = ["rlib"]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -23,6 +28,10 @@ codegen-units = 1
 # landing-pad tables, shrinking the binary and trimming the hot paths. (cargo
 # test runs the dev profile, so #[should_panic] still works.)
 panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
 
 [dev-dependencies]
 

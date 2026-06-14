@@ -214,7 +214,7 @@ impl Cpu {
             0x0F => self.op_lui(i),
             0x10 => self.exec_cop0(i),
             0x11 => self.cop_unusable(1), // COP1 (FPU) — absent on the PSX.
-            0x12 => self.exec_cop2(i),    // COP2 / GTE seam.
+            0x12 => self.exec_cop2(i, bus), // COP2 / GTE seam.
             0x13 => self.cop_unusable(3), // COP3 — absent.
             0x20 => self.op_lb(i, bus),
             0x21 => self.op_lh(i, bus),
@@ -724,7 +724,7 @@ impl Cpu {
     // handling lands in the `gte` subsystem; here we decode the COP2 ops so the
     // CPU stream stays in sync and the seam is explicit. MFC2/CFC2 still honour
     // the load delay; data ops are no-ops until the GTE struct exists.
-    fn exec_cop2(&mut self, i: Instr) {
+    fn exec_cop2(&mut self, i: Instr, bus: &mut impl Bus) {
         // COP2 is only usable if SR.CU2 is set, otherwise a coprocessor-unusable
         // exception fires (the BIOS sets CU2 before issuing GTE ops).
         if self.cop0.sr & cop0::SR_CU2 == 0 {
@@ -732,19 +732,28 @@ impl Cpu {
             return;
         }
         match i.cop_op() {
-            // MFC2 / CFC2: read GTE data/control register into rt (load-delayed).
-            0x00 | 0x02 => self.issue_load(i.rt(), 0), // GTE read stub
-            // MTC2 / CTC2: write rt into a GTE register — no-op stub.
-            0x04 | 0x06 => {}
-            // COP2 command (bit 25 set): a GTE operation — no-op stub.
-            op if op & 0x10 != 0 => {}
+            // MFC2: read a GTE *data* register into rt (load-delayed).
+            0x00 => {
+                let v = bus.gte_read(i.rd(), false);
+                self.issue_load(i.rt(), v);
+            }
+            // CFC2: read a GTE *control* register into rt (load-delayed).
+            0x02 => {
+                let v = bus.gte_read(i.rd(), true);
+                self.issue_load(i.rt(), v);
+            }
+            // MTC2: write rt into a GTE data register.
+            0x04 => bus.gte_write(i.rd(), false, self.reg(i.rt())),
+            // CTC2: write rt into a GTE control register.
+            0x06 => bus.gte_write(i.rd(), true, self.reg(i.rt())),
+            // COP2 command (bit 25 set): run a GTE geometry operation.
+            op if op & 0x10 != 0 => bus.gte_command(i.0 & 0x01FF_FFFF),
             _ => {}
         }
     }
 
     fn exec_lwc2(&mut self, i: Instr, bus: &mut impl Bus) {
-        // LWC2: load a word into a GTE register. Stubbed: perform the bus read
-        // (for side-effect fidelity) but drop the value until the GTE lands.
+        // LWC2: load a word from memory into a GTE *data* register.
         if self.cop0.sr & cop0::SR_CU2 == 0 {
             self.cop_unusable(2);
             return;
@@ -755,12 +764,12 @@ impl Cpu {
             self.raise_exception(Exception::AddressErrorLoad);
             return;
         }
-        let _ = bus.read32(addr);
+        let v = bus.read32(addr);
+        bus.gte_write(i.rt(), false, v);
     }
 
     fn exec_swc2(&mut self, i: Instr, bus: &mut impl Bus) {
-        // SWC2: store a GTE register to memory. Stubbed: write zero until the
-        // GTE provides the source register.
+        // SWC2: store a GTE *data* register to memory.
         if self.cop0.sr & cop0::SR_CU2 == 0 {
             self.cop_unusable(2);
             return;
@@ -771,7 +780,8 @@ impl Cpu {
             self.raise_exception(Exception::AddressErrorStore);
             return;
         }
-        bus.write32(addr, 0);
+        let v = bus.gte_read(i.rt(), false);
+        bus.write32(addr, v);
     }
 
     /// Raise a coprocessor-unusable exception, recording the offending COPn in

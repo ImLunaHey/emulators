@@ -31,6 +31,22 @@ pub trait Bus {
     fn fetch32(&mut self, addr: u32) -> u32 {
         self.read32(addr)
     }
+
+    // ---- COP2 / GTE seam ----
+    // The GTE is the COP2 coprocessor; it lives on the same god-struct as the
+    // bus ([`crate::psx::Psx`]) but the CPU reaches it through these hooks so
+    // the executor never needs a direct `&mut Gte`. The default impls are
+    // no-ops (MFC2/CFC2 read 0) so a bare bus used in CPU unit tests stays
+    // GTE-free; `Psx` overrides them to drive the real engine.
+
+    /// MFC2 (`ctrl == false`) / CFC2 (`ctrl == true`): read a GTE register.
+    fn gte_read(&mut self, _reg: u32, _ctrl: bool) -> u32 {
+        0
+    }
+    /// MTC2 (`ctrl == false`) / CTC2 (`ctrl == true`): write a GTE register.
+    fn gte_write(&mut self, _reg: u32, _ctrl: bool, _v: u32) {}
+    /// Execute a GTE command (the 25-bit COP2 command word).
+    fn gte_command(&mut self, _command: u32) {}
 }
 
 /// A classified physical-address region. Closed enum + exhaustive match, per

@@ -30,6 +30,8 @@ core-nes/target
 core-nes/pkg
 core-gbc/target
 core-gbc/pkg
+core-sms/target
+core-sms/pkg
 
 # rust mobile FFI crate (native libs / xcframework build output)
 core-ffi/target

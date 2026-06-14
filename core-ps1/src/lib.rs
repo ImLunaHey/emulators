@@ -21,6 +21,11 @@ pub mod regions;
 // --- Top-level orchestrator (the god-struct + Bus impl).
 pub mod psx;
 
+// --- Web target: the wasm-bindgen surface (`WasmPsx`). wasm32-only so host
+// `cargo test` never invokes the macro, mirroring the GBA core.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 // --- Subsystem seams (one file per future agent; empty TODO stubs for now).
 pub mod bios;
 pub mod cdrom;
