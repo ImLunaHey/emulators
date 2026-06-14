@@ -1,0 +1,26 @@
+[package]
+name = "nds-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Nintendo DS core — the second emulator core in this workspace,
+# ported from the TypeScript core in ../../ds-recomp/src. This crate is the
+# memory + CPU-state FOUNDATION only: it owns shared RAM, both buses (ARM9 +
+# ARM7), the VRAM bank router, both CPU register files, and CP15. Subsystems
+# (CPU execution, DMA, PPU, cart, BIOS HLE) land later in their own modules.
+#
+# Mirrors ../core/Cargo.toml's structure: a plain rlib for host-side builds.
+# No wasm/wasm-bindgen surface yet — that's layered on at integration time,
+# like the GBA core's `wasm` module.
+[lib]
+crate-type = ["rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter (no per-unit
+# boundaries blocking inlining of the now-monomorphized bus accesses).
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
+# landing-pad tables, shrinking the binary and trimming the hot paths.
+panic = "abort"
