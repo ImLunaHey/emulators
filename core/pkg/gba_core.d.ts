@@ -17,8 +17,22 @@ export class WasmGba {
     frame_count(): number;
     /**
      * 240×160 RGBA8888 framebuffer (copied into a fresh JS `Uint8Array`).
+     * Prefer the zero-copy `framebuffer_ptr`/`framebuffer_len` pair on the hot
+     * present path; this copying variant is kept for callers that want an
+     * owned buffer.
      */
     framebuffer(): Uint8Array;
+    /**
+     * Length in bytes of the framebuffer view (240×160×4 = 153600).
+     */
+    framebuffer_len(): number;
+    /**
+     * Address of the framebuffer inside wasm linear memory. The host builds a
+     * `Uint8Array(memory.buffer, ptr, len)` view over it — no per-frame copy.
+     * Re-read each present: any wasm allocation that grows memory detaches the
+     * old `memory.buffer`, and a savestate load can re-seat the buffer.
+     */
+    framebuffer_ptr(): number;
     load_rom(bytes: Uint8Array): void;
     /**
      * Load a `.sav` into the save chip (call right after `load_rom`).
@@ -112,6 +126,8 @@ export interface InitOutput {
     readonly wasmgba_drain_audio: (a: number) => [number, number];
     readonly wasmgba_frame_count: (a: number) => number;
     readonly wasmgba_framebuffer: (a: number) => [number, number];
+    readonly wasmgba_framebuffer_len: (a: number) => number;
+    readonly wasmgba_framebuffer_ptr: (a: number) => number;
     readonly wasmgba_load_rom: (a: number, b: number, c: number) => void;
     readonly wasmgba_load_save_ram: (a: number, b: number, c: number) => void;
     readonly wasmgba_load_state: (a: number, b: number, c: number) => number;

@@ -52,6 +52,9 @@ export class WasmGba {
     }
     /**
      * 240×160 RGBA8888 framebuffer (copied into a fresh JS `Uint8Array`).
+     * Prefer the zero-copy `framebuffer_ptr`/`framebuffer_len` pair on the hot
+     * present path; this copying variant is kept for callers that want an
+     * owned buffer.
      * @returns {Uint8Array}
      */
     framebuffer() {
@@ -59,6 +62,25 @@ export class WasmGba {
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
+    }
+    /**
+     * Length in bytes of the framebuffer view (240×160×4 = 153600).
+     * @returns {number}
+     */
+    framebuffer_len() {
+        const ret = wasm.wasmgba_framebuffer_len(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Address of the framebuffer inside wasm linear memory. The host builds a
+     * `Uint8Array(memory.buffer, ptr, len)` view over it — no per-frame copy.
+     * Re-read each present: any wasm allocation that grows memory detaches the
+     * old `memory.buffer`, and a savestate load can re-seat the buffer.
+     * @returns {number}
+     */
+    framebuffer_ptr() {
+        const ret = wasm.wasmgba_framebuffer_ptr(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * @param {Uint8Array} bytes
