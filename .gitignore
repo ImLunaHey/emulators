@@ -7,6 +7,12 @@ public/*.gba
 public/*.sav
 *.gba
 *.sav
+# ROMs / disc images — never commit commercial dumps (PS1 .bin/.cue, etc.)
+*.bin
+*.cue
+public/*.bin
+public/*.cue
+*.nds
 _*.png
 tsconfig.tsbuildinfo
 coverage
