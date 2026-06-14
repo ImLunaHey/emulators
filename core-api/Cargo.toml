@@ -1,0 +1,18 @@
+[package]
+name = "core-api"
+version = "0.0.0"
+edition = "2021"
+
+# The shared contract every emulator core AND the launcher implement
+# (FrameSource / EmulatorCore / VideoLayout / Input / System). This is the
+# stable seam the host shell and every core agree on.
+#
+# Standalone and dependency-free on purpose: it must never pull in anything
+# platform-specific (no wasm, no std::fs, no rendering), because both the
+# wasm web target and the native FFI target depend on it. Not yet wired into
+# `core/` — the GBA core will implement these traits after the TNDA IRQ bug is
+# closed; until then this crate just pins the design so the monorepo can grow
+# around a fixed boundary.
+
+[lib]
+name = "core_api"
