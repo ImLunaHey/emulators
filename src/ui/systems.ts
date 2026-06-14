@@ -4,7 +4,7 @@
 // `detect_system`; for now detection is by file extension.
 
 export type SystemId =
-  | 'gba' | 'nds' | 'gb' | 'gbc' | 'nes' | 'snes' | 'n64' | 'gg' | 'sms' | 'genesis';
+  | 'gba' | 'nds' | 'gb' | 'gbc' | 'nes' | 'snes' | 'n64' | 'gg' | 'sms' | 'genesis' | 'ps1';
 
 const EXT_TO_SYSTEM: Record<string, SystemId> = {
   gba: 'gba',
@@ -17,11 +17,15 @@ const EXT_TO_SYSTEM: Record<string, SystemId> = {
   gg: 'gg',
   sms: 'sms',
   md: 'genesis', gen: 'genesis', smd: 'genesis',
+  // PS1 disc images. .bin/.cue come in a pair (the .cue indexes the .bin); the
+  // .bin holds the data. (.bin is genericish — Genesis uses .md/.gen here, so
+  // mapping it to PS1 is fine for this catalog.)
+  cue: 'ps1', bin: 'ps1', img: 'ps1', iso: 'ps1', pbp: 'ps1',
 };
 
 export const SYSTEM_LABEL: Record<SystemId, string> = {
   gba: 'GBA', nds: 'NDS', gb: 'GB', gbc: 'GBC', nes: 'NES',
-  snes: 'SNES', n64: 'N64', gg: 'GG', sms: 'SMS', genesis: 'GEN',
+  snes: 'SNES', n64: 'N64', gg: 'GG', sms: 'SMS', genesis: 'GEN', ps1: 'PS1',
 };
 
 // Systems with a working core. Everything else is addable but "coming soon".
