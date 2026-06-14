@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { WasmHome } from '../../core/pkg/gba_core.js';
 import { useEmu } from './EmuContext';
-import { listRoms, type RomMeta } from './romStore';
+import { listRoms, deleteRom, type RomMeta } from './romStore';
 import { ingestFiles } from './romIngest';
 import { systemLabel, isPlayable, ACCEPT } from './systems';
+import { usePersistedBool } from './usePersistedState';
 import { useToast } from './Toast';
 
 // The console home launcher — the home screen is *rendered by the Rust core*
@@ -14,6 +15,8 @@ import { useToast } from './Toast';
 
 // Active-high, GBA-layout button bits the Rust home screen reads.
 const K_A = 1 << 0;
+const K_B = 1 << 1;
+const K_SELECT = 1 << 2;
 const K_RIGHT = 1 << 4;
 const K_LEFT = 1 << 5;
 const K_UP = 1 << 6;
@@ -28,6 +31,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
   const keysRef = useRef(0);
   const romsRef = useRef<RomMeta[]>([]);
   const [ready, setReady] = useState(false);
+  const [crisp, setCrisp] = usePersistedBool('settings:crispPixels', true);
 
   // Route a launcher "play:<id>" to App with the game's system so it picks the
   // right core (GBA vs NDS).
@@ -56,6 +60,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
     const map: Record<string, number> = {
       ArrowRight: K_RIGHT, ArrowLeft: K_LEFT, ArrowUp: K_UP, ArrowDown: K_DOWN,
       Enter: K_A, ' ': K_A, z: K_A, Z: K_A,
+      Tab: K_SELECT, x: K_B, X: K_B,
     };
     const down = (e: KeyboardEvent) => { const b = map[e.key]; if (b) { e.preventDefault(); keysRef.current |= b; } };
     const up = (e: KeyboardEvent) => { const b = map[e.key]; if (b) keysRef.current &= ~b; };
@@ -72,6 +77,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
       if (!alive) return;
       const home = new WasmHome();
       homeRef.current = home;
+      home.set_crisp(crisp);
       await refresh();
       setReady(true);
 
@@ -91,8 +97,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
           play(action.slice(5));
           return; // stop the loop; App unmounts us
         }
-        if (action === 'add') fileRef.current?.click();
-        else if (action.startsWith('soon:')) toast.info(`${action.slice(5)} — coming soon`);
+        handleAction(action);
         raf = requestAnimationFrame(loop);
       };
       raf = requestAnimationFrame(loop);
@@ -125,8 +130,23 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
     const y = Math.floor(((e.clientY - rect.top) / rect.height) * home.height());
     const action = home.pointer(x, y);
     if (action.startsWith('play:')) play(action.slice(5));
-    else if (action === 'add') fileRef.current?.click();
+    else handleAction(action);
+  };
+
+  // Non-play launcher actions (add / coming-soon toast / Rust settings).
+  const handleAction = (action: string) => {
+    if (action === 'add') fileRef.current?.click();
     else if (action.startsWith('soon:')) toast.info(`${action.slice(5)} — coming soon`);
+    else if (action === 'crisp:1') setCrisp(true);
+    else if (action === 'crisp:0') setCrisp(false);
+    else if (action === 'clearall') clearAllGames();
+  };
+
+  const clearAllGames = async () => {
+    const roms = await listRoms();
+    for (const r of roms) await deleteRom(r.id);
+    await refresh();
+    toast.info(`Removed ${roms.length} game${roms.length === 1 ? '' : 's'}`);
   };
 
   // On-screen control: hold a button to set its bit (Rust edge-detects it).
@@ -149,7 +169,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
         ref={canvasRef}
         onPointerDown={onCanvasPointer}
         className="w-full max-w-[960px] aspect-[3/2] rounded-lg shadow-lg cursor-pointer touch-none"
-        style={{ imageRendering: 'pixelated' }}
+        style={{ imageRendering: crisp ? 'pixelated' : 'auto' }}
       />
       {!ready && <div className="absolute text-xs opacity-50">loading…</div>}
 

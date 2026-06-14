@@ -253,6 +253,11 @@ impl WasmHome {
         self.inner.set_icon(id, rgba);
     }
 
+    /// Push the persisted display setting so the settings toggle reflects it.
+    pub fn set_crisp(&mut self, crisp: bool) {
+        self.inner.set_crisp(crisp);
+    }
+
     /// RGBA8888 framebuffer as a copy — convenient `putImageData` path for the
     /// menu (perf is irrelevant here; the zero-copy pair below exists for
     /// parity with the emulator's hot path).
@@ -298,6 +303,14 @@ fn action_token(a: crate::home::HomeAction) -> String {
         crate::home::HomeAction::AddGame => "add".to_string(),
         crate::home::HomeAction::Launch(id) => format!("play:{id}"),
         crate::home::HomeAction::ComingSoon(label) => format!("soon:{label}"),
+        crate::home::HomeAction::SetCrisp(v) => {
+            if v {
+                "crisp:1".to_string()
+            } else {
+                "crisp:0".to_string()
+            }
+        }
+        crate::home::HomeAction::ClearAll => "clearall".to_string(),
     }
 }
 

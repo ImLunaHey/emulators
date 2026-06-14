@@ -20,11 +20,16 @@ pub const HOME_H: usize = 320;
 
 // Active-high button bits — the SAME layout the host feeds the GBA core.
 const KEY_A: u32 = 1 << 0;
+const KEY_B: u32 = 1 << 1;
+const KEY_SELECT: u32 = 1 << 2;
 const KEY_START: u32 = 1 << 3;
 const KEY_RIGHT: u32 = 1 << 4;
 const KEY_LEFT: u32 = 1 << 5;
 const KEY_UP: u32 = 1 << 6;
 const KEY_DOWN: u32 = 1 << 7;
+
+// Settings rows: crisp-pixels toggle, clear-library, back.
+const SETTINGS_ROWS: usize = 3;
 
 // Palette (0xRRGGBB).
 const BG_TOP: u32 = 0xBC_D6_F2; // light blue gradient, top…
@@ -72,6 +77,17 @@ pub enum HomeAction {
     /// A game whose system has no core yet — host shows "coming soon".
     /// Carries the system label.
     ComingSoon(String),
+    /// Display setting toggled — host applies + persists the new crisp value.
+    SetCrisp(bool),
+    /// Clear all installed games — host deletes them from storage.
+    ClearAll,
+}
+
+/// Which screen the launcher is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Grid,
+    Settings,
 }
 
 pub struct Home {
@@ -82,6 +98,11 @@ pub struct Home {
     /// Per-game-id 32×32 RGBA icons (e.g. decoded NDS banners). Kept separate
     /// from `entries` so they survive `set_games` and are pushed independently.
     icons: HashMap<String, Vec<u8>>,
+    // Settings.
+    view: View,
+    crisp: bool,
+    set_sel: usize,
+    confirm_clear: bool,
 }
 
 impl Default for Home {
@@ -98,6 +119,10 @@ impl Home {
             fb: vec![0; HOME_W * HOME_H * 4],
             prev_buttons: 0,
             icons: HashMap::new(),
+            view: View::Grid,
+            crisp: true,
+            set_sel: 0,
+            confirm_clear: false,
         };
         h.render();
         h
@@ -109,6 +134,18 @@ impl Home {
         if rgba.len() == ICON_SIZE * ICON_SIZE * 4 {
             self.icons.insert(id.to_string(), rgba.to_vec());
         }
+    }
+
+    /// Host pushes the persisted display setting so the toggle reflects it.
+    pub fn set_crisp(&mut self, crisp: bool) {
+        self.crisp = crisp;
+        self.render();
+    }
+
+    fn open_settings(&mut self) {
+        self.view = View::Settings;
+        self.set_sel = 0;
+        self.confirm_clear = false;
     }
 
     /// Replace the game list from parallel newline-joined columns: `id`,
@@ -156,8 +193,16 @@ impl Home {
     pub fn run_frame(&mut self, buttons: u32) -> HomeAction {
         let pressed = buttons & !self.prev_buttons;
         self.prev_buttons = buttons;
-        let n = self.tile_count();
+        let action = match self.view {
+            View::Grid => self.run_grid(pressed),
+            View::Settings => self.run_settings(pressed),
+        };
+        self.render();
+        action
+    }
 
+    fn run_grid(&mut self, pressed: u32) -> HomeAction {
+        let n = self.tile_count();
         if pressed & KEY_RIGHT != 0 && self.selected + 1 < n {
             self.selected += 1;
         }
@@ -170,28 +215,103 @@ impl Home {
         if pressed & KEY_UP != 0 {
             self.selected = self.selected.saturating_sub(COLS);
         }
-
-        let mut action = HomeAction::None;
-        if pressed & (KEY_A | KEY_START) != 0 {
-            action = self.activate(self.selected);
+        if pressed & KEY_SELECT != 0 {
+            self.open_settings();
+            return HomeAction::None;
         }
+        if pressed & (KEY_A | KEY_START) != 0 {
+            return self.activate(self.selected);
+        }
+        HomeAction::None
+    }
+
+    fn run_settings(&mut self, pressed: u32) -> HomeAction {
+        if pressed & (KEY_SELECT | KEY_B) != 0 {
+            self.view = View::Grid;
+            self.confirm_clear = false;
+            return HomeAction::None;
+        }
+        if pressed & KEY_DOWN != 0 && self.set_sel + 1 < SETTINGS_ROWS {
+            self.set_sel += 1;
+            self.confirm_clear = false;
+        }
+        if pressed & KEY_UP != 0 {
+            self.set_sel = self.set_sel.saturating_sub(1);
+            self.confirm_clear = false;
+        }
+        if pressed & (KEY_A | KEY_START) != 0 {
+            return self.activate_setting(self.set_sel);
+        }
+        HomeAction::None
+    }
+
+    fn activate_setting(&mut self, row: usize) -> HomeAction {
+        match row {
+            0 => {
+                self.crisp = !self.crisp;
+                HomeAction::SetCrisp(self.crisp)
+            }
+            1 => {
+                if self.confirm_clear {
+                    self.confirm_clear = false;
+                    HomeAction::ClearAll
+                } else {
+                    self.confirm_clear = true;
+                    HomeAction::None
+                }
+            }
+            _ => {
+                self.view = View::Grid;
+                HomeAction::None
+            }
+        }
+    }
+
+    /// Hit-test a pointer tap (in launcher pixel space).
+    pub fn pointer(&mut self, x: i32, y: i32) -> HomeAction {
+        let action = match self.view {
+            View::Grid => self.pointer_grid(x, y),
+            View::Settings => self.pointer_settings(x, y),
+        };
         self.render();
         action
     }
 
-    /// Hit-test a pointer tap (in launcher pixel space): select the tile under
-    /// it and activate it (tap-to-launch / tap-the-+-to-add).
-    pub fn pointer(&mut self, x: i32, y: i32) -> HomeAction {
+    fn pointer_grid(&mut self, x: i32, y: i32) -> HomeAction {
+        // The "SET" button lives in the top-right of the top bar.
+        if y < TOPBAR && x > HOME_W as i32 - 64 {
+            self.open_settings();
+            return HomeAction::None;
+        }
         for i in 0..self.tile_count() {
             let (tx, ty, tw, th) = self.tile_rect(i);
             if x >= tx && x < tx + tw && y >= ty && y < ty + th + LABEL_H {
                 self.selected = i;
-                let a = self.activate(i);
-                self.render();
-                return a;
+                return self.activate(i);
             }
         }
         HomeAction::None
+    }
+
+    fn pointer_settings(&mut self, x: i32, y: i32) -> HomeAction {
+        for row in 0..SETTINGS_ROWS {
+            let (rx, ry, rw, rh) = self.setting_row_rect(row);
+            if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
+                if row != self.set_sel {
+                    self.confirm_clear = false;
+                }
+                self.set_sel = row;
+                return self.activate_setting(row);
+            }
+        }
+        HomeAction::None
+    }
+
+    fn setting_row_rect(&self, row: usize) -> (i32, i32, i32, i32) {
+        let w = HOME_W as i32 - 2 * MARGIN_X;
+        let h = 40;
+        let y = GRID_TOP + 8 + row as i32 * (h + 10);
+        (MARGIN_X, y, w, h)
     }
 
     fn activate(&self, i: usize) -> HomeAction {
@@ -215,11 +335,19 @@ impl Home {
     // ---- rendering -------------------------------------------------------
 
     fn render(&mut self) {
+        match self.view {
+            View::Grid => self.render_grid(),
+            View::Settings => self.render_settings(),
+        }
+    }
+
+    fn render_grid(&mut self) {
         self.vgradient(BG_TOP, BG_BOT);
 
-        // Top bar.
+        // Top bar (with the SET button top-right).
         self.fill_rect(0, 0, HOME_W as i32, TOPBAR, BAR_BG);
         self.text(12, 8, 2, BAR_TEXT, "EMULATORS");
+        self.text(HOME_W as i32 - 52, 8, 2, CURSOR, "SET");
 
         let n = self.tile_count();
         let add_idx = self.entries.len();
@@ -278,6 +406,37 @@ impl Home {
         };
         self.label_color(12, by + 10, 28, &name, BAR_TEXT, 2);
         self.text(HOME_W as i32 - 96, by + 10, 2, CURSOR, "A OPEN");
+    }
+
+    fn render_settings(&mut self) {
+        self.vgradient(BG_TOP, BG_BOT);
+        self.fill_rect(0, 0, HOME_W as i32, TOPBAR, BAR_BG);
+        self.text(12, 8, 2, BAR_TEXT, "SETTINGS");
+
+        let rows: [(&str, String); SETTINGS_ROWS] = [
+            ("Crisp pixels", if self.crisp { "ON".to_string() } else { "OFF".to_string() }),
+            ("Clear all games", if self.confirm_clear { "Press again".to_string() } else { String::new() }),
+            ("Back", String::new()),
+        ];
+        for row in 0..SETTINGS_ROWS {
+            let label = rows[row].0;
+            let value = rows[row].1.clone();
+            let (rx, ry, rw, rh) = self.setting_row_rect(row);
+            if row == self.set_sel {
+                self.round_rect(rx - 3, ry - 3, rw + 6, rh + 6, 13, CURSOR);
+            }
+            self.round_rect(rx, ry, rw, rh, 10, 0xEE_F2_F8);
+            self.text(rx + 14, ry + (rh - 16) / 2, 2, LABEL, label);
+            if !value.is_empty() {
+                let vw = value.len() as i32 * 16;
+                self.text(rx + rw - 14 - vw, ry + (rh - 16) / 2, 2, 0x2E_6A_A8, &value);
+            }
+        }
+
+        let by = HOME_H as i32 - BOTBAR;
+        self.fill_rect(0, by, HOME_W as i32, BOTBAR, BAR_BG);
+        self.text(12, by + 10, 2, CURSOR, "A SELECT");
+        self.text(HOME_W as i32 - 112, by + 10, 2, BAR_TEXT, "B BACK");
     }
 
     fn vgradient(&mut self, top: u32, bot: u32) {
@@ -480,6 +639,22 @@ mod tests {
         let add = h.entries.len();
         let (x, y, w, _) = h.tile_rect(add);
         assert!(matches!(h.pointer(x + w / 2, y + 4), HomeAction::AddGame));
+    }
+
+    #[test]
+    fn settings_toggle_and_clear() {
+        let mut h = Home::new();
+        h.set_games_from_str("a", "Alpha", "GBA", "1");
+        h.run_frame(KEY_SELECT); // open settings
+        // Row 0 = crisp toggle (starts ON → OFF).
+        match h.run_frame(KEY_A) {
+            HomeAction::SetCrisp(v) => assert!(!v),
+            _ => panic!("expected SetCrisp"),
+        }
+        h.run_frame(KEY_DOWN); // → "Clear all games"
+        assert!(matches!(h.run_frame(KEY_A), HomeAction::None)); // arms confirm
+        h.run_frame(0); // release
+        assert!(matches!(h.run_frame(KEY_A), HomeAction::ClearAll)); // confirms
     }
 
     #[test]
