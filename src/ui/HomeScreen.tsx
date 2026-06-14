@@ -133,6 +133,15 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
     else handleAction(action);
   };
 
+  // Mouse wheel scrolls the game grid.
+  const onCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    const home = homeRef.current;
+    const canvas = canvasRef.current;
+    if (!home || !canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    home.scroll_by(Math.round((e.deltaY / rect.height) * home.height()));
+  };
+
   // Non-play launcher actions (add / coming-soon toast / Rust settings).
   const handleAction = (action: string) => {
     if (action === 'add') fileRef.current?.click();
@@ -168,6 +177,7 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
       <canvas
         ref={canvasRef}
         onPointerDown={onCanvasPointer}
+        onWheel={onCanvasWheel}
         className="w-full max-w-[960px] aspect-[3/2] rounded-lg shadow-lg cursor-pointer touch-none"
         style={{ imageRendering: crisp ? 'pixelated' : 'auto' }}
       />

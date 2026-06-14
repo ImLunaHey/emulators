@@ -53,6 +53,7 @@ const RADIUS: i32 = 14;
 const GRID_TOP: i32 = 42;
 const LABEL_H: i32 = 14;
 const ROW_GAP: i32 = 6;
+const ROW_H: i32 = TILE + LABEL_H + ROW_GAP; // full grid row pitch (icon + label + gap)
 
 // App-icon colors, cycled by a cheap title hash.
 const PALETTE: [u32; 8] = [
@@ -98,6 +99,8 @@ pub struct Home {
     /// Per-game-id 32×32 RGBA icons (e.g. decoded NDS banners). Kept separate
     /// from `entries` so they survive `set_games` and are pushed independently.
     icons: HashMap<String, Vec<u8>>,
+    // Vertical scroll offset of the grid (pixels of content scrolled above the viewport).
+    scroll: i32,
     // Settings.
     view: View,
     crisp: bool,
@@ -119,6 +122,7 @@ impl Home {
             fb: vec![0; HOME_W * HOME_H * 4],
             prev_buttons: 0,
             icons: HashMap::new(),
+            scroll: 0,
             view: View::Grid,
             crisp: true,
             set_sel: 0,
@@ -173,6 +177,7 @@ impl Home {
         if self.selected > max {
             self.selected = max;
         }
+        self.clamp_scroll();
         self.render();
     }
 
@@ -180,13 +185,47 @@ impl Home {
         self.entries.len() + 1 // games + the trailing "+" tile
     }
 
-    /// Top-left + size of tile `i`'s icon square.
+    /// Top-left + size of tile `i`'s icon square (screen-space, scroll applied).
     fn tile_rect(&self, i: usize) -> (i32, i32, i32, i32) {
         let col = (i % COLS) as i32;
         let row = (i / COLS) as i32;
         let x = MARGIN_X + col * (TILE + GAP);
-        let y = GRID_TOP + row * (TILE + LABEL_H + ROW_GAP);
+        let y = GRID_TOP + row * ROW_H - self.scroll;
         (x, y, TILE, TILE)
+    }
+
+    // ---- scrolling -------------------------------------------------------
+
+    fn view_h(&self) -> i32 {
+        (HOME_H as i32 - BOTBAR) - GRID_TOP
+    }
+    fn content_h(&self) -> i32 {
+        let rows = ((self.tile_count() + COLS - 1) / COLS) as i32;
+        (rows * ROW_H - ROW_GAP).max(0)
+    }
+    fn max_scroll(&self) -> i32 {
+        (self.content_h() - self.view_h()).max(0)
+    }
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.clamp(0, self.max_scroll());
+    }
+    /// Auto-scroll so the selected tile is fully within the viewport.
+    fn ensure_visible(&mut self) {
+        let row = (self.selected / COLS) as i32;
+        let top = row * ROW_H;
+        let bot = top + TILE + LABEL_H;
+        if top < self.scroll {
+            self.scroll = top;
+        } else if bot > self.scroll + self.view_h() {
+            self.scroll = bot - self.view_h();
+        }
+        self.clamp_scroll();
+    }
+    /// Host wheel/drag scroll.
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.scroll += delta;
+        self.clamp_scroll();
+        self.render();
     }
 
     /// Advance one frame: edge-triggered nav, redraw, return action.
@@ -215,6 +254,7 @@ impl Home {
         if pressed & KEY_UP != 0 {
             self.selected = self.selected.saturating_sub(COLS);
         }
+        self.ensure_visible();
         if pressed & KEY_SELECT != 0 {
             self.open_settings();
             return HomeAction::None;
@@ -283,6 +323,10 @@ impl Home {
             self.open_settings();
             return HomeAction::None;
         }
+        // Taps in the top/bottom bars don't hit tiles.
+        if y < GRID_TOP || y >= HOME_H as i32 - BOTBAR {
+            return HomeAction::None;
+        }
         for i in 0..self.tile_count() {
             let (tx, ty, tw, th) = self.tile_rect(i);
             if x >= tx && x < tx + tw && y >= ty && y < ty + th + LABEL_H {
@@ -344,17 +388,13 @@ impl Home {
     fn render_grid(&mut self) {
         self.vgradient(BG_TOP, BG_BOT);
 
-        // Top bar (with the SET button top-right).
-        self.fill_rect(0, 0, HOME_W as i32, TOPBAR, BAR_BG);
-        self.text(12, 8, 2, BAR_TEXT, "EMULATORS");
-        self.text(HOME_W as i32 - 52, 8, 2, CURSOR, "SET");
-
         let n = self.tile_count();
         let add_idx = self.entries.len();
         for i in 0..n {
             let (x, y, w, h) = self.tile_rect(i);
-            if y + h > HOME_H as i32 - BOTBAR {
-                break; // no scrolling yet — clip rows under the action bar
+            // Skip tiles fully outside the scroll viewport (bars cover the edges).
+            if y + h + LABEL_H <= GRID_TOP || y >= HOME_H as i32 - BOTBAR {
+                continue;
             }
             let sel = i == self.selected;
             if sel {
@@ -393,6 +433,13 @@ impl Home {
             }
         }
 
+        self.draw_scrollbar();
+
+        // Bars drawn last so they cover tiles scrolled past the top/bottom edges.
+        self.fill_rect(0, 0, HOME_W as i32, TOPBAR, BAR_BG);
+        self.text(12, 8, 2, BAR_TEXT, "EMULATORS");
+        self.text(HOME_W as i32 - 52, 8, 2, CURSOR, "SET");
+
         // Bottom action bar: selected name + the OPEN hint.
         let by = HOME_H as i32 - BOTBAR;
         self.fill_rect(0, by, HOME_W as i32, BOTBAR, BAR_BG);
@@ -406,6 +453,18 @@ impl Home {
         };
         self.label_color(12, by + 10, 28, &name, BAR_TEXT, 2);
         self.text(HOME_W as i32 - 96, by + 10, 2, CURSOR, "A OPEN");
+    }
+
+    fn draw_scrollbar(&mut self) {
+        let max = self.max_scroll();
+        if max <= 0 {
+            return;
+        }
+        let track_h = self.view_h();
+        let content = self.content_h();
+        let thumb_h = (track_h * track_h / content.max(1)).clamp(16, track_h);
+        let thumb_y = GRID_TOP + (track_h - thumb_h) * self.scroll / max;
+        self.fill_rect(HOME_W as i32 - 5, thumb_y, 3, thumb_h, CURSOR);
     }
 
     fn render_settings(&mut self) {
@@ -655,6 +714,29 @@ mod tests {
         assert!(matches!(h.run_frame(KEY_A), HomeAction::None)); // arms confirm
         h.run_frame(0); // release
         assert!(matches!(h.run_frame(KEY_A), HomeAction::ClearAll)); // confirms
+    }
+
+    #[test]
+    fn scrolls_to_keep_selection_visible() {
+        let mut h = Home::new();
+        let ids = (0..30).map(|i| format!("g{i}")).collect::<Vec<_>>().join("\n");
+        let titles = (0..30).map(|i| format!("Game {i}")).collect::<Vec<_>>().join("\n");
+        let sys = vec!["GBA"; 30].join("\n");
+        let pl = vec!["1"; 30].join("\n");
+        h.set_games_from_str(&ids, &titles, &sys, &pl);
+        assert_eq!(h.scroll, 0);
+        for _ in 0..8 {
+            h.run_frame(KEY_DOWN);
+            h.run_frame(0); // release for the next edge
+        }
+        assert!(h.scroll > 0, "grid should scroll to follow the selection");
+        assert!(h.scroll <= h.max_scroll());
+        // Scrolling back up returns to the top.
+        for _ in 0..10 {
+            h.run_frame(KEY_UP);
+            h.run_frame(0);
+        }
+        assert_eq!(h.scroll, 0);
     }
 
     #[test]

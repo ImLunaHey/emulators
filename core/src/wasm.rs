@@ -258,6 +258,11 @@ impl WasmHome {
         self.inner.set_crisp(crisp);
     }
 
+    /// Scroll the game grid by `delta` pixels (host mouse wheel / drag).
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.inner.scroll_by(delta);
+    }
+
     /// RGBA8888 framebuffer as a copy — convenient `putImageData` path for the
     /// menu (perf is irrelevant here; the zero-copy pair below exists for
     /// parity with the emulator's hot path).
