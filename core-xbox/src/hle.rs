@@ -163,8 +163,35 @@ fn disc_relative(p: &str) -> Option<String> {
     None
 }
 
+/// True if the path refers to the (stubbed) hard disk rather than the game disc.
+/// Halo 2's launcher mounts/opens `\Device\Harddisk0\partition1\` (and the T:/U:
+/// title/save partitions) during boot; a real console always has an HDD, so
+/// failing the open makes the title relaunch (reboot). We present an empty HDD.
+fn is_hdd_path(p: &str) -> bool {
+    let low = p.replace('\\', "/").to_ascii_lowercase();
+    let low = low.trim_start_matches('/');
+    low.starts_with("device/harddisk")
+        || low.starts_with("??/t:")
+        || low.starts_with("??/u:")
+        || low.starts_with("??/y:")
+        || low.starts_with("??/z:")
+        || low.starts_with("t:")
+        || low.starts_with("u:")
+}
+
+/// Sentinel `FileHandle.offset` marking a hard-disk pseudo-handle (no backing
+/// disc bytes; reads return zero-filled success).
+const HDD_PSEUDO_OFFSET: usize = usize::MAX;
+
 /// Open a file by Xbox path. Returns `(status, handle, information)`.
 fn open_file(path: &str) -> (u32, u32, u32) {
+    // Hard-disk paths: present an empty-but-present HDD so the launcher's
+    // partition open succeeds and it doesn't relaunch (reboot to dashboard).
+    if is_hdd_path(path) {
+        let mut files = FILES.lock().unwrap();
+        files.push(Some(FileHandle { offset: HDD_PSEUDO_OFFSET, size: 0x4000, pos: 0 }));
+        return (0, FILE_HANDLE_BASE + (files.len() as u32 - 1), FILE_OPENED);
+    }
     let rel = match disc_relative(path) {
         Some(r) if !r.is_empty() => r,
         _ => return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0),
@@ -195,6 +222,15 @@ fn read_file(mem: &mut Mem, h: u32, buf: u32, len: u32, byte_offset: Option<u32>
         Some(f) => f,
         None => return (STATUS_INVALID_HANDLE, 0),
     };
+    // Hard-disk pseudo-handle: no backing disc bytes — return the requested
+    // length as zero-filled success (an empty/blank partition).
+    if fh.offset == HDD_PSEUDO_OFFSET {
+        let n = len as usize;
+        for i in 0..n {
+            mem.ram_write8(buf.wrapping_add(i as u32), 0);
+        }
+        return (0, n as u32);
+    }
     let pos = byte_offset.map(|o| o as usize).unwrap_or(fh.pos);
     let avail = fh.size.saturating_sub(pos);
     let n = (len as usize).min(avail);
@@ -785,6 +821,8 @@ const ORD_NT_OPEN_FILE: u32 = 202;
 const ORD_NT_CREATE_FILE: u32 = 190;
 const ORD_NT_READ_FILE: u32 = 219;
 const ORD_NT_CLOSE: u32 = 187;
+const ORD_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 218;
+const ORD_EX_QUERY_NON_VOLATILE_SETTING: u32 = 24;
 const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
 const ORD_KE_INITIALIZE_INTERRUPT: u32 = 109;
 const ORD_KE_CONNECT_INTERRUPT: u32 = 98;
@@ -797,13 +835,27 @@ const ORD_AV_SET_DISPLAY_MODE: u32 = 3;
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
 
+/// Plausible EEPROM / non-volatile config values keyed by the XC_* ValueIndex
+/// passed to ExQueryNonVolatileSetting. A retail console returns concrete
+/// settings here; returning 0 ("unconfigured") makes setup code bail/reboot.
+fn nonvolatile_value(index: u32) -> u32 {
+    match index {
+        0x0007 => 0x00000000, // XC_VIDEO flags (no widescreen/letterbox/60Hz)
+        0x0008 => 0x00010001, // XC_AUDIO (stereo, no AC3/DTS)
+        0x000C => 0x00000001, // XC_LANGUAGE = English
+        0x0102 => 0x00400100, // XC_FACTORY_AV_REGION (NTSC-M / video standard)
+        0x0103 => 0x00000001, // XC_FACTORY_GAME_REGION = North America
+        0x0010 => 0x0a000a00, // XC_TIMEZONE_BIAS
+        _ => 0x00000001,      // generic non-zero "configured" default
+    }
+}
+
 /// Ordinals safe to stub as "return STATUS_SUCCESS, clean the stack" — init /
 /// notification / registration functions whose side effects don't matter for
 /// reaching the title screen. Grown empirically as the boot progresses.
 const SAFE_NOOP: &[u32] = &[
     47,  // HalRegisterShutdownNotification
     113, // KeInitializeTimerEx
-    24,  // ExQueryNonVolatileSetting (returns success; value left zero)
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
     100, // KeDisconnectInterrupt
@@ -1083,6 +1135,66 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+
+        // NTSTATUS ExQueryNonVolatileSetting(DWORD ValueIndex, DWORD *Type,
+        //   PVOID Value, SIZE_T ValueLength, PSIZE_T ResultLength) — read EEPROM
+        // config. Return plausible values so setup checks don't see 0 and bail.
+        ORD_EX_QUERY_NON_VOLATILE_SETTING => {
+            let value_index = arg(cpu, mem, 0);
+            let type_out = arg(cpu, mem, 1);
+            let value_out = arg(cpu, mem, 2);
+            let value_len = arg(cpu, mem, 3);
+            let result_len = arg(cpu, mem, 4);
+            let val: u32 = nonvolatile_value(value_index);
+            if type_out != 0 {
+                mem.ram_write32(type_out, 4); // REG_DWORD
+            }
+            if value_out != 0 && value_len >= 4 {
+                mem.ram_write32(value_out, val);
+            }
+            if result_len != 0 {
+                mem.ram_write32(result_len, 4);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
+            Dispatch::Handled("ExQueryNonVolatileSetting")
+        }
+
+        // NTSTATUS NtQueryVolumeInformationFile(HANDLE, PIO_STATUS_BLOCK,
+        //   PVOID FsInformation, ULONG Length, FS_INFORMATION_CLASS Class).
+        // The launcher queries the (stubbed) HDD partition size/free space;
+        // report a large, mostly-free FATX volume so it's satisfied.
+        ORD_NT_QUERY_VOLUME_INFORMATION_FILE => {
+            let iosb = arg(cpu, mem, 1);
+            let info = arg(cpu, mem, 2);
+            let len = arg(cpu, mem, 3);
+            let class = arg(cpu, mem, 4);
+            if info != 0 && len >= 8 {
+                match class {
+                    // FileFsSizeInformation (3): TotalAllocationUnits(i64),
+                    // AvailableAllocationUnits(i64), SectorsPerUnit(u32),
+                    // BytesPerSector(u32).
+                    3 if len >= 24 => {
+                        mem.ram_write32(info, 0x0010_0000); // total units (low)
+                        mem.ram_write32(info.wrapping_add(4), 0);
+                        mem.ram_write32(info.wrapping_add(8), 0x000F_0000); // avail (low)
+                        mem.ram_write32(info.wrapping_add(12), 0);
+                        mem.ram_write32(info.wrapping_add(16), 32); // sectors/unit
+                        mem.ram_write32(info.wrapping_add(20), 512); // bytes/sector
+                    }
+                    _ => {
+                        for o in (0..len.min(64)).step_by(4) {
+                            mem.ram_write32(info.wrapping_add(o), 0);
+                        }
+                    }
+                }
+            }
+            if iosb != 0 {
+                mem.ram_write32(iosb, STATUS_SUCCESS);
+                mem.ram_write32(iosb.wrapping_add(4), len.min(24));
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
+            Dispatch::Handled("NtQueryVolumeInformationFile")
         }
 
         // ---- Reboot / firmware ----
