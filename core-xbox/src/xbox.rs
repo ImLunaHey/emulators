@@ -244,8 +244,17 @@ impl Xbox {
                     let eip = self.cpu.eip;
                     if (Self::HLE_BASE..Self::HLE_BASE + Self::HLE_SPAN).contains(&eip) {
                         let idx = ((eip - Self::HLE_BASE) / 4) as usize;
-                        self.last_kernel_ordinal = self.kernel_ordinals.get(idx).copied().or(Some(0));
-                        break;
+                        let ord = self.kernel_ordinals.get(idx).copied().unwrap_or(0);
+                        // Hand the kernel import to the HLE kernel. If it handles
+                        // the call it returns control to the caller and we keep
+                        // executing; otherwise we stop and report the ordinal.
+                        match crate::hle::dispatch(&mut self.cpu, &mut self.mem, ord) {
+                            crate::hle::Dispatch::Handled(_) => continue,
+                            crate::hle::Dispatch::Unhandled(_) => {
+                                self.last_kernel_ordinal = Some(ord);
+                                break;
+                            }
+                        }
                     }
                     if self.cpu.fault.is_some() || self.cpu.halted {
                         break;
@@ -357,7 +366,10 @@ impl Xbox {
             };
             format!("STOP  {} OP {:02X} EIP {:08X}", what, f.opcode, f.eip)
         } else if let Some(ord) = self.last_kernel_ordinal {
-            format!("STOP  KERNEL IMPORT ORD {}", ord)
+            match crate::hle_table::lookup(ord) {
+                Some((name, _)) => format!("STOP  KERNEL {} ({})", ord, name.to_uppercase()),
+                None => format!("STOP  KERNEL IMPORT ORD {}", ord),
+            }
         } else if self.cpu.halted {
             "STOP  HLT".to_string()
         } else {
