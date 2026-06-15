@@ -774,6 +774,45 @@ mod tests {
         assert_eq!(Format::from_cnt(3 << 29), Format::Psg);
     }
 
+    /// Regression for the glitchy-audio root cause: a one-shot channel whose
+    /// key-on `step()` has already cleared produces silence from `mix()`. The
+    /// orchestrator must therefore mix BEFORE stepping (or incrementally), so a
+    /// short sound effect that ends within a frame is still heard. This test
+    /// pins both halves of that contract.
+    #[test]
+    fn oneshot_cleared_by_step_is_silent_but_audible_before_step() {
+        let make = || {
+            let mut s = Sound::new();
+            s.write_byte(0x0400_0500, 0x7F);
+            s.write_byte(0x0400_0501, 0x80); // master enable + vol
+            let base = ch_base(0);
+            write32(&mut s, base + 4, 0x0200_0000); // sad → main ram
+            write32(&mut s, base + 0xC, 1); // len 1 → very short one-shot
+            s.write_byte(base + 8, 0x00);
+            s.write_byte(base + 9, 0xFF); // period 0x100
+            let cnt = 0x8000_0000u32 | (2 << 27) | 0x7F; // one-shot, vol 127, PCM8
+            write32(&mut s, base, cnt);
+            s
+        };
+        let main = vec![0x7Fu8; 0x1000];
+        let iwram = vec![0u8; 0x10];
+
+        // (a) Mix while still playing → audible.
+        let mut s = make();
+        let mut out = [0.0f32; 16];
+        s.mix(&mut out, 8, NDS_SOUND_CLOCK / 0x100, &main, &iwram);
+        assert!(out[0] > 0.0, "playing one-shot must be audible when mixed");
+
+        // (b) If step() runs first and clears the one-shot, a later mix is silent
+        // — which is exactly the dropped-sound bug when mixing only at end-of-frame.
+        let mut s = make();
+        s.step(0x100); // one-shot finishes → key-on cleared
+        assert!(!s.channels[0].is_playing());
+        let mut out2 = [0.0f32; 16];
+        s.mix(&mut out2, 8, NDS_SOUND_CLOCK / 0x100, &main, &iwram);
+        assert!(out2.iter().all(|&v| v == 0.0), "cleared one-shot mixes silent");
+    }
+
     #[test]
     fn psg_channel_emits_silence_from_mixer() {
         let mut s = Sound::new();

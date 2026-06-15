@@ -115,9 +115,11 @@ impl Ppu {
 
     // ─── Framebuffer API (what the host FrameSource blits) ────────────────
     //
-    // POWCNT1 bit 15 swaps which engine drives which physical screen. When
-    // clear, Engine A → top, Engine B → bottom; when set, they swap. The host
-    // calls `top_framebuffer()` / `bottom_framebuffer()`; each returns a
+    // POWCNT1 bit 15 ("Display Swap", GBATEK: 0 = send Display A to the lower
+    // [bottom] screen, 1 = send Display A to the upper [top] screen) selects
+    // which engine drives which physical screen. When SET, Engine A → top /
+    // Engine B → bottom; when CLEAR, Engine A → bottom / Engine B → top. The
+    // host calls `top_framebuffer()` / `bottom_framebuffer()`; each returns a
     // 256x192 RGBA8888 slice (FB_BYTES long).
 
     /// The 256x192 RGBA8888 framebuffer for the TOP screen.
@@ -518,6 +520,68 @@ mod tests {
 
         // Sanity: the frame is genuinely non-uniform (tile != backdrop).
         assert_ne!(rgba_pixel(fb, 3, 3), rgba_pixel(fb, 10, 3));
+    }
+
+    /// Engine B (the SUB engine, which drives the BOTTOM screen with the default
+    /// POWCNT1) must render its own 2D scene into `bottom_framebuffer()`. This
+    /// exercises the Engine-B-specific paths: PRAM base 0x400, OAM base 0x400,
+    /// the sub-BG VRAM window (0x06200000, supplied by bank C MST=4) and the
+    /// POWCNT1 bit-15 routing — all of which the bottom screen depends on.
+    #[test]
+    fn engine_b_renders_to_bottom_framebuffer() {
+        let mut ppu = Ppu::new();
+        let mut irq9 = Irq::new();
+        let mut irq7 = Irq::new();
+        let mut mem = SharedMemory::new();
+        let router = VramRouter::new();
+
+        // Default POWCNT1 0x820F → bit15 set → Engine A top / Engine B bottom.
+        assert_ne!(ppu.powcnt1 & 0x8000, 0);
+
+        // Route VRAM bank C to the Engine-B BG window (MST=4, enabled = 0x84).
+        // The sub-BG window 0x06200000 then resolves to bank C → vram[0x40000].
+        ppu.vramcnt[2] = 0x84;
+        let cbase = 0x40000usize; // bank C base in the flat vram[] array
+
+        // ── Engine B configuration (DISPCNT mode 1, BG0 4bpp text) ──────────
+        let e = &mut ppu.engine_b;
+        e.dispcnt = (1 << 16) | (1 << 8); // graphics mode, BG0 enabled
+        e.bg.cnt[0] = 0x0100; // 4bpp text, char_base 0, screen_base block 1
+
+        // ── Engine B PRAM lives at byte offset 0x400 ────────────────────────
+        // Backdrop (entry 0) = red (BGR555 0x001F); palette idx 1 = blue (0x7C00).
+        let pb = 0x400usize;
+        mem.pram[pb] = 0x1F;
+        mem.pram[pb + 1] = 0x00;
+        mem.pram[pb + 2] = 0x00;
+        mem.pram[pb + 3] = 0x7C;
+
+        // ── Tile + map data in bank C (sub-BG VRAM) ─────────────────────────
+        // Tile 0: all index-1 nibbles (opaque blue block).
+        for b in 0..32usize {
+            mem.vram[cbase + b] = 0x11;
+        }
+        // Screen map at byte offset 0x800: cell (0,0) → tile 0.
+        mem.vram[cbase + 0x800] = 0x00;
+        mem.vram[cbase + 0x801] = 0x00;
+        // Cell (1,0) → tile 1 (untouched → transparent → backdrop shows).
+        mem.vram[cbase + 0x802] = 0x01;
+        mem.vram[cbase + 0x803] = 0x00;
+
+        // Drive one full frame.
+        for _ in 0..LINES_PER_FRAME {
+            ppu.step(DOTS_PER_LINE, &mut irq9, &mut irq7, &mem, &router);
+        }
+        assert!(ppu.frame_done);
+
+        let fb = ppu.bottom_framebuffer();
+        assert_eq!(fb.len(), FB_BYTES);
+        assert_eq!(fb[3], 0xFF, "bottom framebuffer must be opaque (rendered)");
+        // Inside tile (0,0): blue.
+        assert_eq!(rgba_pixel(fb, 3, 3), (0, 0, 0xFF, 0xFF), "Engine B tile blue");
+        // Outside the tile: backdrop red.
+        let (r, g, b, _) = rgba_pixel(fb, 10, 3);
+        assert_eq!((r, g, b), (0xFF, 0, 0), "Engine B backdrop red");
     }
 
     /// POWCNT1 bit 15 swaps which engine drives which physical screen.

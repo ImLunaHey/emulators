@@ -1011,8 +1011,10 @@ impl Nds {
             0x0400_0000..=0x0400_0003 | 0x0400_0008..=0x0400_006F => {
                 Some(self.ppu.read_engine_reg8(false, addr - 0x0400_0000))
             }
-            // Engine B mirror at 0x04001000..0x0400106F.
-            0x0400_1000..=0x0400_106F => {
+            // Engine B mirror at 0x04001000..0x0400106F. Like Engine A, the
+            // 0x04..0x07 slot (DISPSTAT/VCOUNT) is PPU-global and not part of the
+            // engine register block, so it is excluded from the mirror.
+            0x0400_1000..=0x0400_1003 | 0x0400_1008..=0x0400_106F => {
                 Some(self.ppu.read_engine_reg8(true, addr - 0x0400_1000))
             }
             _ => None,
@@ -1040,7 +1042,7 @@ impl Nds {
                 self.ppu.write_engine_reg8(false, addr - 0x0400_0000, v);
                 true
             }
-            0x0400_1000..=0x0400_106F => {
+            0x0400_1000..=0x0400_1003 | 0x0400_1008..=0x0400_106F => {
                 self.ppu.write_engine_reg8(true, addr - 0x0400_1000, v);
                 true
             }
@@ -1427,6 +1429,19 @@ impl Nds {
         let mut dots_done = 0u32;
         let mut a7_carry = 0u32;
 
+        // Audio is mixed INCREMENTALLY, one chunk per scanline batch, instead of
+        // once at end-of-frame. The per-scanline `sound.step` clears key-on for
+        // one-shot channels the instant their sample ends; a single end-of-frame
+        // mix would therefore see those channels already silenced and drop short
+        // sound effects entirely (the cause of the glitchy/choppy NDS audio).
+        // Mixing per batch lets the mixer observe each channel while it is still
+        // playing. `audio_acc` carries the fractional sample remainder so the
+        // chunk sizes sum to exactly AUDIO_FRAMES over the whole frame.
+        const AUDIO_FRAMES: usize = 735;
+        let mut frame_audio: Vec<f32> = Vec::with_capacity(AUDIO_FRAMES * 2);
+        let mut audio_acc: f64 = 0.0;
+        let mut audio_emitted: usize = 0;
+
         while dots_done < total_dots {
             let batch = BATCH_DOTS.min(total_dots - dots_done);
 
@@ -1501,9 +1516,48 @@ impl Nds {
             let bus_cycles = batch * BUS_CYCLES_PER_DOT;
             self.timers9.step(bus_cycles, &mut self.irq9);
             self.timers7.step(bus_cycles, &mut self.irq7);
+
+            // Mix this batch's slice of audio FIRST (channel state is still as it
+            // was for the scanline just executed), THEN advance the channel
+            // auto-clear. How many output frames this batch is worth is its share
+            // of the frame, with the fractional part carried in `audio_acc`.
+            audio_acc += (AUDIO_FRAMES as f64) * (batch as f64) / (total_dots as f64);
+            let mut want = audio_acc.floor() as usize;
+            audio_acc -= want as f64;
+            // Never exceed the per-frame budget (guards float rounding on the
+            // last batch).
+            want = want.min(AUDIO_FRAMES - audio_emitted);
+            if want > 0 {
+                let base = frame_audio.len();
+                frame_audio.resize(base + want * 2, 0.0);
+                self.sound.mix(
+                    &mut frame_audio[base..],
+                    want,
+                    44_100,
+                    &self.mem.main_ram[..],
+                    &self.mem.arm7_iwram[..],
+                );
+                audio_emitted += want;
+            }
+
             self.sound.step(bus_cycles);
 
             dots_done += batch;
+        }
+
+        // Top up any frames lost to rounding so each frame contributes a stable
+        // sample count to the host stream.
+        if audio_emitted < AUDIO_FRAMES {
+            let want = AUDIO_FRAMES - audio_emitted;
+            let base = frame_audio.len();
+            frame_audio.resize(base + want * 2, 0.0);
+            self.sound.mix(
+                &mut frame_audio[base..],
+                want,
+                44_100,
+                &self.mem.main_ram[..],
+                &self.mem.arm7_iwram[..],
+            );
         }
 
         // Move the live register files back into the canonical slots before the
@@ -1537,15 +1591,12 @@ impl Nds {
             self.present_crash();
         }
 
-        // Mix one frame of audio (~735 stereo samples @ 44.1 kHz) for the host.
-        const AUDIO_FRAMES: usize = 735;
-        let mut tmp = [0.0f32; AUDIO_FRAMES * 2];
-        self.sound
-            .mix(&mut tmp, AUDIO_FRAMES, 44_100, &self.mem.main_ram[..], &self.mem.arm7_iwram[..]);
+        // Hand the frame's incrementally-mixed audio (735 stereo frames @ 44.1
+        // kHz) to the host-drained buffer.
         if self.audio_buf.len() > 44_100 {
             self.audio_buf.clear(); // host fell behind — drop the backlog
         }
-        self.audio_buf.extend_from_slice(&tmp);
+        self.audio_buf.extend_from_slice(&frame_audio);
     }
 
     /// Draw the crash screen into the TOP-screen framebuffer from the latched
@@ -2219,6 +2270,33 @@ mod tests {
                 (fb[o], fb[o + 1], fb[o + 2], fb[o + 3]),
                 (0xFF, 0, 0, 0xFF),
                 "pixel ({x},{y}) should be backdrop red"
+            );
+        }
+    }
+
+    /// Each `run_frame` must contribute exactly 735 stereo frames (1470 f32) of
+    /// audio at 44.1 kHz / 60 fps. The mixer runs incrementally per scanline
+    /// batch but the per-frame total is held stable so the host stream never
+    /// drifts (a wrong count is itself an audible glitch source).
+    #[test]
+    fn run_frame_emits_exactly_735_stereo_frames() {
+        // A bare busy-loop on both cores is enough to exercise the per-frame
+        // audio accumulator; the sample-count invariant is independent of what
+        // the channels play.
+        let arm9_bytes = 0xEAFF_FFFEu32.to_le_bytes().to_vec(); // B .
+        let arm7_bytes = 0xEAFF_FFFEu32.to_le_bytes().to_vec(); // B .
+        let rom = smoke_synth_cart(&arm9_bytes, 0x0200_0000, &arm7_bytes, 0x0380_0000);
+
+        let mut nds = Nds::new();
+        nds.load_rom(&rom);
+
+        for _ in 0..3 {
+            nds.run_frame();
+            let a = nds.drain_audio();
+            assert_eq!(
+                a.len(),
+                735 * 2,
+                "run_frame must emit exactly 735 stereo frames of audio"
             );
         }
     }
