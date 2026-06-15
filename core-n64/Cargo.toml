@@ -1,0 +1,39 @@
+[package]
+name = "n64-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Nintendo 64 core, built from scratch against the n64brew wiki, the
+# NEC VR4300 / MIPS R4300i user manual, and the n64dev hardware docs — there is
+# no source to port. The N64 is a hard system; this crate is a *foundation*: a
+# correct, well-tested VR4300 integer CPU + COP0 + exceptions, the full RCP
+# memory map, ROM byte-order detection, an HLE IPL3 boot, an RSP/RDP skeleton,
+# and a VI that scans out the RDRAM framebuffer. The vector unit, the RDP
+# rasteriser and audio are explicitly stubbed (see `lib.rs` for the matrix).
+#
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface on top. The core stays binding-agnostic.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter.
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. (cargo test
+# runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
+
+[dev-dependencies]
+
+[dependencies]
