@@ -239,8 +239,17 @@ impl Cart {
         }
         self.aux_out = self.sav_tick_byte((v & 0xFF) as u8);
         // If the SDK released CS-hold before this byte, the byte just exchanged
-        // was the final one — end the transaction now.
+        // was the final one — end the transaction now. This is the framing the
+        // NitroSDK actually uses (hold-high on intermediate bytes, hold-low on
+        // the last), so the program/erase trigger fires HERE, not on a CS
+        // rising edge. PAGE PROGRAM (0x02/0x0A) and WRSR (0x01) auto-clear WEL
+        // when the chip executes the command on CS deassert; without this the
+        // SDK polls RDSR, sees WEL still latched, and reports the write failed
+        // ("the data could not be saved" — e.g. Need for Speed FLASH saves).
         if self.aux_release_after_next {
+            if self.sav_cmd == 0x02 || self.sav_cmd == 0x0A || self.sav_cmd == 0x01 {
+                self.sav_write_enabled = false;
+            }
             self.sav_cmd = 0;
             self.sav_addr_bytes = 0;
             self.sav_byte_pos = 0;
@@ -747,6 +756,60 @@ mod tests {
     fn begin_tx(c: &mut Cart) {
         c.write_auxspicnt(1 << 13); // CS low, backup selected
         c.write_auxspicnt((1 << 13) | (1 << 6)); // CS rising edge → new tx
+    }
+
+    /// Drive one full save-chip transaction the way the NitroSDK / real
+    /// hardware does it: AUXSPICNT bit 6 (CS-hold) is SET for every byte
+    /// except the last, and CLEAR for the final byte (which deasserts CS and
+    /// ends the transaction). Backup-select (bit 13) stays latched throughout.
+    /// Returns the chip's shift-out for each byte. This is the framing the SDK
+    /// actually uses — `begin_tx` artificially forces a rising edge instead.
+    fn transact_sav(c: &mut Cart, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            let last = i + 1 == bytes.len();
+            let hold = if last { 0 } else { 1 << 6 };
+            c.write_auxspicnt((1 << 13) | hold);
+            c.write_auxspidata(b as u32);
+            out.push(c.read_auxspidata() as u8);
+        }
+        out
+    }
+
+    /// Reproduces the "data could not be saved" bug: the NitroSDK FLASH save
+    /// path frames each SPI command as its own transaction (hold-high on the
+    /// intermediate bytes, hold-low on the last). WREN is a single hold-low
+    /// byte. The PROGRAM that follows must be seen as a fresh command — if the
+    /// previous transaction's byte counter is never cleared on CS deassert, the
+    /// PROGRAM's command byte is mis-parsed and no data ever lands in the blob.
+    #[test]
+    fn save_flash_program_sequence_hardware_framing() {
+        let mut c = fresh();
+
+        // WREN — single byte, CS-hold low (one-byte transaction).
+        transact_sav(&mut c, &[0x06]);
+
+        // RDSR must report WEL set after WREN.
+        let resp = transact_sav(&mut c, &[0x05, 0x00]);
+        assert_eq!(resp[1] & 0x02, 0x02, "WEL must be set after WREN");
+
+        // PROGRAM (0x02) + 3-byte address 0x000010 + two data bytes.
+        transact_sav(&mut c, &[0x02, 0x00, 0x00, 0x10, 0xAB, 0xCD]);
+        assert!(c.sav_dirty, "PROGRAM must flip save_dirty");
+        assert_eq!(c.sav()[0x10], 0xAB, "PROGRAM must store byte 0");
+        assert_eq!(c.sav()[0x11], 0xCD, "PROGRAM must store byte 1");
+
+        // The completed PROGRAM must auto-clear WEL, exactly like real FLASH:
+        // the chip latches CS-deassert as the program trigger and resets WEL.
+        // The NitroSDK polls RDSR after the program and treats a still-set WEL
+        // (with WIP clear) as a failed write → "the data could not be saved".
+        let resp = transact_sav(&mut c, &[0x05, 0x00]);
+        assert_eq!(resp[1] & 0x02, 0x00, "PROGRAM must auto-clear WEL on CS deassert");
+
+        // READ back to confirm the bytes are visible via the save blob.
+        let resp = transact_sav(&mut c, &[0x03, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(resp[4], 0xAB);
+        assert_eq!(resp[5], 0xCD);
     }
 
     #[test]
