@@ -31,6 +31,23 @@ fn hdr(method: u32) -> u32 {
     (1u32 << 18) | method
 }
 
+/// Emit an immediate-mode flat triangle (screen-space coords) into the
+/// pushbuffer: BEGIN(triangles), 3 × (diffuse, posX, posY), END.
+fn triangle(w: &mut Vec<u32>, verts: [(f32, f32); 3], color: u32) {
+    w.push(hdr(0x17FC)); // SET_BEGIN_END
+    w.push(4); // TRIANGLES
+    for (x, y) in verts {
+        w.push(hdr(0x194C)); // diffuse color
+        w.push(color);
+        w.push(hdr(0x1880)); // vertex X
+        w.push(x.to_bits());
+        w.push(hdr(0x1884)); // vertex Y (completes the vertex)
+        w.push(y.to_bits());
+    }
+    w.push(hdr(0x17FC)); // SET_BEGIN_END
+    w.push(0); // END -> rasterize
+}
+
 /// Emit a clip-rect + clear-to-color into the pushbuffer.
 fn clip_clear(w: &mut Vec<u32>, x: u32, width: u32, y: u32, height: u32, color: u32) {
     w.push(hdr(0x0200)); // SET_SURFACE_CLIP_HORIZONTAL
@@ -66,6 +83,8 @@ fn main() {
     clip_clear(&mut words, 0, 640, 0, 80, 0xFF6C_D84C); // top bar (Xbox green)
     clip_clear(&mut words, 220, 200, 180, 120, 0xFFE8_E8E8); // center panel
     clip_clear(&mut words, 0, 640, 440, 40, 0xFF20_50C0); // bottom bar (blue)
+    // A red triangle drawn through the primitive pipeline, over the panel.
+    triangle(&mut words, [(320.0, 180.0), (250.0, 320.0), (390.0, 320.0)], 0xFFD0_2020);
 
     // x86: write the pushbuffer into RAM, set GET then PUT (kicks the GPU), spin.
     let mut code = Vec::new();

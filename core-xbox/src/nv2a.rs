@@ -84,6 +84,19 @@ pub struct Nv2a {
     clip_h: u16,
     pub width: u16,
     pub height: u16,
+
+    // Immediate-mode drawing state.
+    prim: Option<u32>,        // current primitive type (BEGIN..END), if drawing
+    verts: Vec<Vertex>,       // accumulated vertices
+    vcolor: u32,              // current diffuse color (D3DCOLOR ARGB)
+    vx: f32,                  // pending vertex X (until Y completes the vertex)
+}
+
+#[derive(Clone, Copy)]
+struct Vertex {
+    x: f32,
+    y: f32,
+    color: u32,
 }
 
 // PGRAPH (NV20 "Kelvin" 3D class 0x97) method offsets we care about.
@@ -94,7 +107,18 @@ mod m {
     pub const SET_SURFACE_COLOR_OFFSET: u32 = 0x0210;
     pub const SET_COLOR_CLEAR_VALUE: u32 = 0x1D90;
     pub const CLEAR_SURFACE: u32 = 0x1D94;
+    // Immediate-mode drawing.
+    pub const SET_BEGIN_END: u32 = 0x17FC; // data 0 = end, else begin(primitive)
+    pub const VERTEX_POS_X: u32 = 0x1880; // SET_VERTEX_DATA2F attr0 component0
+    pub const VERTEX_POS_Y: u32 = 0x1884; // component1 — completes the vertex
+    pub const VERTEX_DIFFUSE: u32 = 0x194C; // SET_VERTEX_DATA4UB attr3 (diffuse)
 }
+
+/// NV2A primitive types (the ones we rasterize).
+const PRIM_TRIANGLES: u32 = 4;
+const PRIM_TRIANGLE_STRIP: u32 = 5;
+const PRIM_TRIANGLE_FAN: u32 = 6;
+const PRIM_QUADS: u32 = 8;
 
 #[inline]
 fn rd32(ram: &[u8], addr: u32) -> u32 {
@@ -144,8 +168,14 @@ impl Nv2a {
             clip_y: 0,
             clip_w: 640,
             clip_h: 480,
-            width: 640,
-            height: 480,
+            // The displayed surface size is established by the first clear
+            // (grown to the largest cleared extent); 0 until then.
+            width: 0,
+            height: 0,
+            prim: None,
+            verts: Vec::new(),
+            vcolor: 0xFFFF_FFFF,
+            vx: 0.0,
         }
     }
 
@@ -302,7 +332,96 @@ impl Nv2a {
                     self.clear_color_buffer(ram);
                 }
             }
+            m::SET_BEGIN_END => {
+                if data == 0 {
+                    self.draw_primitives(ram); // END: rasterize what we gathered
+                    self.prim = None;
+                    self.verts.clear();
+                } else {
+                    self.prim = Some(data); // BEGIN(primitive)
+                    self.verts.clear();
+                }
+            }
+            m::VERTEX_DIFFUSE => self.vcolor = data,
+            m::VERTEX_POS_X => self.vx = f32::from_bits(data),
+            m::VERTEX_POS_Y => {
+                // The second position component completes a vertex.
+                let v = Vertex {
+                    x: self.vx,
+                    y: f32::from_bits(data),
+                    color: self.vcolor,
+                };
+                if self.verts.len() < 4096 {
+                    self.verts.push(v);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Rasterize the gathered vertices for the current primitive into the color
+    /// surface. Vertices are taken as screen-space (the homebrew submits
+    /// pre-transformed positions); flat-shaded with the first vertex's color.
+    fn draw_primitives(&mut self, ram: &mut [u8]) {
+        let prim = match self.prim {
+            Some(p) => p,
+            None => return,
+        };
+        let v = self.verts.clone();
+        match prim {
+            PRIM_TRIANGLES => {
+                for t in v.chunks_exact(3) {
+                    self.fill_triangle(ram, t[0], t[1], t[2]);
+                }
+            }
+            PRIM_TRIANGLE_FAN | PRIM_QUADS if v.len() >= 3 => {
+                for i in 1..v.len() - 1 {
+                    self.fill_triangle(ram, v[0], v[i], v[i + 1]);
+                }
+            }
+            PRIM_TRIANGLE_STRIP if v.len() >= 3 => {
+                for i in 0..v.len() - 2 {
+                    self.fill_triangle(ram, v[i], v[i + 1], v[i + 2]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Flat-fill a triangle into the surface (edge-function rasterizer).
+    fn fill_triangle(&mut self, ram: &mut [u8], a: Vertex, b: Vertex, c: Vertex) {
+        let pitch = if self.surface_pitch == 0 {
+            self.width as u32 * 4
+        } else {
+            self.surface_pitch
+        };
+        let (sw, sh) = (self.width as i32, self.height as i32);
+        let minx = a.x.min(b.x).min(c.x).floor().max(0.0) as i32;
+        let maxx = (a.x.max(b.x).max(c.x).ceil() as i32).min(sw - 1);
+        let miny = a.y.min(b.y).min(c.y).floor().max(0.0) as i32;
+        let maxy = (a.y.max(b.y).max(c.y).ceil() as i32).min(sh - 1);
+        let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| {
+            (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+        };
+        let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
+        if area.abs() < 1e-3 {
+            return;
+        }
+        let color = a.color;
+        for y in miny..=maxy {
+            for x in minx..=maxx {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let w0 = edge(b.x, b.y, c.x, c.y, px, py);
+                let w1 = edge(c.x, c.y, a.x, a.y, px, py);
+                let w2 = edge(a.x, a.y, b.x, b.y, px, py);
+                // Inside if all edge functions share the winding sign.
+                let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
+                    || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+                if inside {
+                    let off = self.surface_offset.wrapping_add(y as u32 * pitch + x as u32 * 4);
+                    wr32(ram, off, color);
+                }
+            }
         }
     }
 
@@ -329,6 +448,11 @@ impl Nv2a {
         self.width = self.width.max((x0 + w) as u16);
         self.height = self.height.max((y0 + h) as u16);
         self.has_surface = true;
+    }
+
+    #[cfg(test)]
+    fn test_get_set(&mut self, o: u32, v: u32, ram: &mut [u8]) {
+        self.mmio_write(o, v, 4, ram);
     }
 
     /// Scan the color surface out to `fb` (converting the Xbox's ARGB/XRGB
@@ -358,5 +482,59 @@ impl Nv2a {
             }
         }
         Some((self.width, self.height))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(m: u32) -> u32 {
+        (1u32 << 18) | m
+    }
+
+    #[test]
+    fn fifo_clear_and_triangle_render() {
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let surf = 0x10_0000u32;
+        // Build a pushbuffer: set surface, clear to ARGB 0xFF112233, then a
+        // triangle covering the top-left in red (0xFFD00000).
+        let mut w: Vec<u32> = Vec::new();
+        w.extend([hdr(m::SET_SURFACE_PITCH), 64 * 4]);
+        w.extend([hdr(m::SET_SURFACE_COLOR_OFFSET), surf]);
+        w.extend([hdr(m::SET_SURFACE_CLIP_HORIZONTAL), 64 << 16]);
+        w.extend([hdr(m::SET_SURFACE_CLIP_VERTICAL), 48 << 16]);
+        w.extend([hdr(m::SET_COLOR_CLEAR_VALUE), 0xFF11_2233]);
+        w.extend([hdr(m::CLEAR_SURFACE), 0xF0]);
+        w.extend([hdr(m::SET_BEGIN_END), PRIM_TRIANGLES]);
+        for (x, y) in [(0.0f32, 0.0f32), (40.0, 0.0), (0.0, 40.0)] {
+            w.extend([hdr(m::VERTEX_DIFFUSE), 0xFFD0_0000]);
+            w.extend([hdr(m::VERTEX_POS_X), x.to_bits()]);
+            w.extend([hdr(m::VERTEX_POS_Y), y.to_bits()]);
+        }
+        w.extend([hdr(m::SET_BEGIN_END), 0]);
+
+        let pbuf = 0x1000u32;
+        for (i, &word) in w.iter().enumerate() {
+            let o = pbuf as usize + i * 4;
+            ram[o..o + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        nv.test_get_set(off::DMA_GET, pbuf, &mut ram);
+        nv.test_get_set(off::DMA_PUT, pbuf + w.len() as u32 * 4, &mut ram);
+
+        let mut fb = Vec::new();
+        assert_eq!(nv.scanout(&ram, &mut fb), Some((64, 48)));
+        // A far corner keeps the clear color (ARGB 112233 -> RGBA word FF332211).
+        assert_eq!(fb[47 * 64 + 63], 0xFF33_2211);
+        // The top-left corner is inside the triangle -> red (D00000 -> FF0000D0).
+        assert_eq!(fb[0], 0xFF00_00D0);
+    }
+
+    #[test]
+    fn pfifo_reports_idle() {
+        let mut nv = Nv2a::new();
+        // CACHE1_STATUS LOW_MARK (empty) set so "wait for FIFO" loops complete.
+        assert_eq!(nv.mmio_read(off::PFIFO_CACHE1_STATUS, 4) & 0x10, 0x10);
     }
 }
