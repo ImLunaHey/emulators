@@ -336,6 +336,7 @@ const ORD_NT_OPEN_FILE: u32 = 202;
 const ORD_NT_CREATE_FILE: u32 = 190;
 const ORD_NT_READ_FILE: u32 = 219;
 const ORD_NT_CLOSE: u32 = 187;
+const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
 
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
@@ -349,6 +350,9 @@ const SAFE_NOOP: &[u32] = &[
     24,  // ExQueryNonVolatileSetting (returns success; value left zero)
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
+    109, // KeInitializeInterrupt
+    98,  // KeConnectInterrupt
+    100, // KeDisconnectInterrupt
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.
@@ -591,6 +595,18 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+
+        // ---- Interrupts (stub: echo the bus level as the vector) ----
+        ORD_HAL_GET_INTERRUPT_VECTOR => {
+            // ULONG HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql).
+            let level = arg(cpu, mem, 0);
+            let irql_out = arg(cpu, mem, 1);
+            if irql_out != 0 {
+                mem.ram_write32(irql_out, level); // plausible IRQL
+            }
+            stdcall_return(cpu, mem, level, 8);
+            Dispatch::Handled("HalGetInterruptVector")
         }
 
         // ---- Threads ----

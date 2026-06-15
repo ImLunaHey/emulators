@@ -1589,6 +1589,8 @@ impl Cpu {
                 self.set_reg32(EAX, self.instret as u32);
                 self.set_reg32(EDX, (self.instret >> 32) as u32);
             }
+            // INVD / WBINVD — cache invalidate/flush; no cache modeled, so nop.
+            0x08 | 0x09 => {}
             // CPUID: a minimal, plausible Pentium III response.
             0xA2 => self.do_cpuid(),
             // Jcc near
