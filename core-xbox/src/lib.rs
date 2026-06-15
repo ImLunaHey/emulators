@@ -58,6 +58,10 @@ pub mod xiso;
 // --- XBE (Xbox executable) parsing + loading into RAM.
 pub mod xbe;
 
+// --- HLE Xbox kernel: dispatch for game kernel imports + the export table.
+pub mod hle;
+pub mod hle_table;
+
 // --- Top-level orchestrator (the god-struct + Bus impl).
 pub mod xbox;
 
