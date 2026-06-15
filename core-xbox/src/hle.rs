@@ -353,6 +353,14 @@ const SAFE_NOOP: &[u32] = &[
     109, // KeInitializeInterrupt
     98,  // KeConnectInterrupt
     100, // KeDisconnectInterrupt
+    // Events / synchronization. Single-threaded HLE: setting/pulsing is a no-op
+    // and waits return 0 (= WAIT_OBJECT_0 / signaled) so nothing blocks.
+    145, // KeSetEvent (returns previous state 0)
+    138, // KeResetEvent
+    108, // KeInitializeEvent
+    123, // KePulseEvent
+    159, // KeWaitForSingleObject -> WAIT_OBJECT_0
+    158, // KeWaitForMultipleObjects -> WAIT_OBJECT_0
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.

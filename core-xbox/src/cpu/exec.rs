@@ -1036,6 +1036,43 @@ impl Cpu {
                 self.push(bus, ret, osize);
                 self.jump_rel(d);
             }
+            // ---- port I/O ----
+            0xE4 => {
+                let p = self.fetch_u8(bus) as u16;
+                let v = bus.port_in(p, 1);
+                self.set_reg8(EAX, v);
+            }
+            0xE5 => {
+                let p = self.fetch_u8(bus) as u16;
+                let v = bus.port_in(p, osize);
+                self.set_reg(EAX, osize, v);
+            }
+            0xE6 => {
+                let p = self.fetch_u8(bus) as u16;
+                bus.port_out(p, 1, self.reg8(EAX));
+            }
+            0xE7 => {
+                let p = self.fetch_u8(bus) as u16;
+                bus.port_out(p, osize, self.reg(EAX, osize));
+            }
+            0xEC => {
+                let p = self.reg16(EDX) as u16;
+                let v = bus.port_in(p, 1);
+                self.set_reg8(EAX, v);
+            }
+            0xED => {
+                let p = self.reg16(EDX) as u16;
+                let v = bus.port_in(p, osize);
+                self.set_reg(EAX, osize, v);
+            }
+            0xEE => {
+                let p = self.reg16(EDX) as u16;
+                bus.port_out(p, 1, self.reg8(EAX));
+            }
+            0xEF => {
+                let p = self.reg16(EDX) as u16;
+                bus.port_out(p, osize, self.reg(EAX, osize));
+            }
             0xE3 => {
                 // JCXZ / JECXZ
                 let d = self.fetch_i8(bus);

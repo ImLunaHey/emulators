@@ -246,6 +246,9 @@ impl Xbox {
 
         // A booted game: step the CPU and show a live boot diagnostic.
         if self.booted {
+            // Signal one vblank per frame so the game's interrupt-service loop
+            // advances its frame/timer bookkeeping.
+            self.nv2a.raise_vblank();
             if self.cpu.fault.is_none() && !self.cpu.halted {
                 for _ in 0..Self::STEP_BUDGET {
                     // Kernel-import boundary: a CALL landed in the HLE trap region,
