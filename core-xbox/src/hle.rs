@@ -228,6 +228,227 @@ fn close_file(h: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Cooperative thread scheduler.
+//
+// The Xbox is multi-threaded (a main thread plus asset-loader / audio threads).
+// We run all guest threads on the one interpreter via round-robin preemption
+// plus real blocking on kernel events: a thread that waits on an unsignalled
+// object yields to another, and is woken when the object is signalled. Without
+// this, a game's main thread waits forever on loader threads that never run.
+//
+// LIMITATION: the x87/SSE state lives in process thread-locals, so it is NOT
+// switched per guest thread yet — integer/segment/control state is. Good enough
+// to get past the asset-load barrier; FP-heavy cross-thread state may be racy.
+// ---------------------------------------------------------------------------
+
+/// A saved integer/segment/control CPU context for a guest thread.
+#[derive(Clone)]
+struct ThreadCtx {
+    regs: [u32; 8],
+    eip: u32,
+    eflags: u32,
+    seg_sel: [u16; 6],
+    seg_base: [u32; 6],
+    cr: [u32; 5],
+    halted: bool,
+}
+
+#[derive(Clone, PartialEq)]
+enum TState {
+    Ready,
+    Blocked(u32), // waiting on this object key (event ptr)
+    Terminated,
+}
+
+struct Thread {
+    ctx: ThreadCtx,
+    state: TState,
+}
+
+struct Sched {
+    threads: Vec<Thread>,
+    current: usize,
+    started: bool,
+    signaled: std::collections::HashSet<u32>,
+}
+
+static SCHED: Mutex<Option<Sched>> = Mutex::new(None);
+
+fn capture(cpu: &Cpu) -> ThreadCtx {
+    ThreadCtx {
+        regs: cpu.regs,
+        eip: cpu.eip,
+        eflags: cpu.eflags,
+        seg_sel: cpu.seg_sel,
+        seg_base: cpu.seg_base,
+        cr: cpu.cr,
+        halted: cpu.halted,
+    }
+}
+
+fn apply(cpu: &mut Cpu, c: &ThreadCtx) {
+    if c.eip < 0x0010_0000 && std::env::var_os("XBOX_TRACE_THREAD").is_some() {
+        eprintln!("[thread] apply suspicious eip={:#010X} esp={:#X}", c.eip, c.regs[ESP]);
+    }
+    cpu.regs = c.regs;
+    cpu.eip = c.eip;
+    cpu.eflags = c.eflags;
+    cpu.seg_sel = c.seg_sel;
+    cpu.seg_base = c.seg_base;
+    cpu.cr = c.cr;
+    cpu.halted = c.halted;
+    cpu.fault = None;
+}
+
+/// Pick the next Ready thread after `current` (round-robin). Returns its index.
+fn pick_next(s: &Sched) -> Option<usize> {
+    let n = s.threads.len();
+    for off in 1..=n {
+        let i = (s.current + off) % n;
+        if s.threads[i].state == TState::Ready {
+            return Some(i);
+        }
+    }
+    if s.threads[s.current].state == TState::Ready {
+        return Some(s.current);
+    }
+    None
+}
+
+/// Create a guest thread (PsCreateSystemThreadEx). Registers the creator as a
+/// thread on first use, then enqueues the new thread Ready — execution stays
+/// with the creator (no switch).
+pub fn create_thread(cpu: &mut Cpu, mem: &mut Mem, entry: u32, ctx1: u32, ctx2: u32) {
+    let mut g = SCHED.lock().unwrap();
+    let s = g.get_or_insert_with(|| Sched {
+        threads: Vec::new(),
+        current: 0,
+        started: false,
+        signaled: std::collections::HashSet::new(),
+    });
+    if !s.started {
+        s.threads.push(Thread {
+            ctx: capture(cpu),
+            state: TState::Ready,
+        });
+        s.current = 0;
+        s.started = true;
+    }
+    let stack_size = 0x0004_0000u32;
+    let base = heap_alloc(stack_size, PAGE);
+    let mut sp = base.wrapping_add(stack_size);
+    sp = sp.wrapping_sub(4);
+    mem.ram_write32(sp, ctx2);
+    sp = sp.wrapping_sub(4);
+    mem.ram_write32(sp, ctx1);
+    sp = sp.wrapping_sub(4);
+    mem.ram_write32(sp, THREAD_EXIT_SENTINEL);
+    let mut ctx = capture(cpu); // inherit flat protected-mode segments
+    ctx.eip = entry;
+    ctx.regs[ESP] = sp;
+    ctx.halted = false;
+    if std::env::var_os("XBOX_TRACE_THREAD").is_some() {
+        eprintln!(
+            "[thread] create #{} entry={entry:#010X} ctx1={ctx1:#X} sp={sp:#X}",
+            s.threads.len()
+        );
+    }
+    s.threads.push(Thread {
+        ctx,
+        state: TState::Ready,
+    });
+}
+
+/// Block the current thread on `obj` and switch to the next ready thread. If
+/// `obj` is already signalled, consume it and return without blocking.
+pub fn wait_object(cpu: &mut Cpu, obj: u32) {
+    let mut g = SCHED.lock().unwrap();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    if s.signaled.remove(&obj) {
+        return; // already signalled
+    }
+    s.threads[s.current].ctx = capture(cpu);
+    s.threads[s.current].state = TState::Blocked(obj);
+    if let Some(next) = pick_next(s) {
+        s.current = next;
+        let ctx = s.threads[next].ctx.clone();
+        apply(cpu, &ctx);
+    } else {
+        // Nothing else to run: unblock self to avoid a hard hang.
+        s.threads[s.current].state = TState::Ready;
+    }
+}
+
+/// Signal an object: mark it signalled and wake any threads blocked on it.
+pub fn signal_object(obj: u32) {
+    let mut g = SCHED.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        s.signaled.insert(obj);
+        for t in &mut s.threads {
+            if t.state == TState::Blocked(obj) {
+                t.state = TState::Ready;
+            }
+        }
+    }
+}
+
+/// Clear an object's signalled state.
+pub fn reset_object(obj: u32) {
+    let mut g = SCHED.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        s.signaled.remove(&obj);
+    }
+}
+
+/// Voluntarily yield / round-robin preempt: save the current thread (Ready) and
+/// run the next ready one.
+pub fn preempt(cpu: &mut Cpu) {
+    let mut g = SCHED.lock().unwrap();
+    let s = match g.as_mut() {
+        Some(s) if s.threads.len() > 1 => s,
+        _ => return,
+    };
+    s.threads[s.current].ctx = capture(cpu);
+    if s.threads[s.current].state == TState::Blocked(0) {
+        // never; placeholder
+    }
+    let cur = s.current;
+    if s.threads[cur].state != TState::Terminated {
+        s.threads[cur].state = TState::Ready;
+    }
+    if let Some(next) = pick_next(s) {
+        if next != cur {
+            s.current = next;
+            let ctx = s.threads[next].ctx.clone();
+            apply(cpu, &ctx);
+        }
+    }
+}
+
+/// Terminate the current thread and switch away.
+pub fn terminate_current(cpu: &mut Cpu) {
+    let mut g = SCHED.lock().unwrap();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => {
+            cpu.halted = true;
+            return;
+        }
+    };
+    s.threads[s.current].state = TState::Terminated;
+    if let Some(next) = pick_next(s) {
+        s.current = next;
+        let ctx = s.threads[next].ctx.clone();
+        apply(cpu, &ctx);
+    } else {
+        cpu.halted = true; // last thread done
+    }
+}
+
+// ---------------------------------------------------------------------------
 // stdcall helpers.
 // ---------------------------------------------------------------------------
 
@@ -332,6 +553,17 @@ const ORD_RTL_INITIALIZE_CRITICAL_SECTION: u32 = 291;
 const ORD_RTL_LEAVE_CRITICAL_SECTION: u32 = 294;
 const ORD_RTL_LEAVE_CRITICAL_SECTION_AND_REGION: u32 = 295;
 const ORD_PS_CREATE_SYSTEM_THREAD_EX: u32 = 255;
+const ORD_PS_TERMINATE_SYSTEM_THREAD: u32 = 258;
+const ORD_KE_INITIALIZE_EVENT: u32 = 108;
+const ORD_KE_SET_EVENT: u32 = 145;
+const ORD_KE_RESET_EVENT: u32 = 138;
+const ORD_KE_PULSE_EVENT: u32 = 123;
+const ORD_KE_WAIT_FOR_SINGLE_OBJECT: u32 = 159;
+const ORD_KE_WAIT_FOR_MULTIPLE_OBJECTS: u32 = 158;
+const ORD_KE_DELAY_EXECUTION_THREAD: u32 = 99;
+const ORD_NT_YIELD_EXECUTION: u32 = 238;
+const ORD_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 233;
+const ORD_NT_WAIT_FOR_SINGLE_OBJECT_EX: u32 = 234;
 const ORD_NT_OPEN_FILE: u32 = 202;
 const ORD_NT_CREATE_FILE: u32 = 190;
 const ORD_NT_READ_FILE: u32 = 219;
@@ -353,18 +585,11 @@ const SAFE_NOOP: &[u32] = &[
     109, // KeInitializeInterrupt
     98,  // KeConnectInterrupt
     100, // KeDisconnectInterrupt
-    // Events / synchronization. Single-threaded HLE: setting/pulsing is a no-op
-    // and waits return 0 (= WAIT_OBJECT_0 / signaled) so nothing blocks.
-    145, // KeSetEvent (returns previous state 0)
-    138, // KeResetEvent
-    108, // KeInitializeEvent
-    123, // KePulseEvent
-    159, // KeWaitForSingleObject -> WAIT_OBJECT_0
-    158, // KeWaitForMultipleObjects -> WAIT_OBJECT_0
+    // (events / waits / threads are handled by the scheduler, not here)
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.
-const THREAD_EXIT_SENTINEL: u32 = 0xDEAD_0000;
+pub const THREAD_EXIT_SENTINEL: u32 = 0xDEAD_0000;
 
 // ---------------------------------------------------------------------------
 // dispatch
@@ -617,19 +842,12 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             Dispatch::Handled("HalGetInterruptVector")
         }
 
-        // ---- Threads ----
+        // ---- Threads + synchronization (cooperative scheduler) ----
         ORD_PS_CREATE_SYSTEM_THREAD_EX => {
-            // NTSTATUS PsCreateSystemThreadEx(PHANDLE ThreadHandle, ULONG
-            //   ThreadExtraSize, ULONG KernelStackSize, ULONG TlsDataSize,
-            //   PULONG ThreadId, PVOID StartContext1, PVOID StartContext2,
-            //   BOOLEAN CreateSuspended, BOOLEAN DebuggerThread,
-            //   PKSTART_ROUTINE StartRoutine)  — 10 args, 40 bytes.
-            //
-            // Single-threaded HLE: rather than spawn a real thread, *switch* the
-            // CPU to the new thread so the game's main code runs. The creating
-            // context is abandoned (it's typically the init stub that would just
-            // idle/exit). A cooperative scheduler for multiple live threads is a
-            // larger future phase.
+            // PsCreateSystemThreadEx(PHANDLE, ExtraSize, KernelStackSize,
+            //   TlsDataSize, PULONG ThreadId, Ctx1, Ctx2, CreateSuspended,
+            //   DebuggerThread, StartRoutine) — 10 args. Enqueue the thread Ready;
+            //   the scheduler runs it. Execution stays with the creator.
             let h_out = arg(cpu, mem, 0);
             let id_out = arg(cpu, mem, 4);
             let ctx1 = arg(cpu, mem, 5);
@@ -641,21 +859,69 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             if id_out != 0 {
                 mem.ram_write32(id_out, 1);
             }
-            // Build the new thread's stack: StartRoutine(StartContext1,
-            // StartContext2) stdcall — push args right-to-left under a return
-            // sentinel.
-            let stack_size = 0x0004_0000u32; // 256 KB
-            let base = heap_alloc(stack_size, PAGE);
-            let mut sp = base.wrapping_add(stack_size);
-            sp = sp.wrapping_sub(4);
-            mem.ram_write32(sp, ctx2);
-            sp = sp.wrapping_sub(4);
-            mem.ram_write32(sp, ctx1);
-            sp = sp.wrapping_sub(4);
-            mem.ram_write32(sp, THREAD_EXIT_SENTINEL);
-            cpu.set_reg32(ESP, sp);
-            cpu.eip = start;
+            // Return to the creator FIRST (so the creator thread is captured at
+            // its real resume point, not the HLE trap stub), then enqueue the new
+            // thread.
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 40);
+            create_thread(cpu, mem, start, ctx1, ctx2);
             Dispatch::Handled("PsCreateSystemThreadEx")
+        }
+        ORD_PS_TERMINATE_SYSTEM_THREAD => {
+            terminate_current(cpu);
+            Dispatch::Handled("PsTerminateSystemThread")
+        }
+        ORD_KE_INITIALIZE_EVENT => {
+            // KeInitializeEvent(Event, Type, SignalState) — start signalled if so.
+            let ev = arg(cpu, mem, 0);
+            let initial = arg(cpu, mem, 2);
+            if initial != 0 {
+                signal_object(ev);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 12);
+            Dispatch::Handled("KeInitializeEvent")
+        }
+        ORD_KE_SET_EVENT => {
+            // LONG KeSetEvent(Event, Increment, Wait) — wake waiters; return prev.
+            signal_object(arg(cpu, mem, 0));
+            stdcall_return(cpu, mem, 0, 12);
+            Dispatch::Handled("KeSetEvent")
+        }
+        ORD_KE_PULSE_EVENT => {
+            let ev = arg(cpu, mem, 0);
+            signal_object(ev);
+            reset_object(ev);
+            stdcall_return(cpu, mem, 0, 12);
+            Dispatch::Handled("KePulseEvent")
+        }
+        ORD_KE_RESET_EVENT => {
+            reset_object(arg(cpu, mem, 0));
+            stdcall_return(cpu, mem, 0, 4);
+            Dispatch::Handled("KeResetEvent")
+        }
+        ORD_KE_WAIT_FOR_SINGLE_OBJECT => {
+            // KeWaitForSingleObject(Object, WaitReason, WaitMode, Alertable,
+            //   Timeout) — return WAIT_OBJECT_0, then block on the object.
+            let obj = arg(cpu, mem, 0);
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
+            wait_object(cpu, obj);
+            Dispatch::Handled("KeWaitForSingleObject")
+        }
+        ORD_KE_WAIT_FOR_MULTIPLE_OBJECTS => {
+            // Approximate: don't block (return WAIT_OBJECT_0).
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 32);
+            Dispatch::Handled("KeWaitForMultipleObjects")
+        }
+        ORD_KE_DELAY_EXECUTION_THREAD | ORD_NT_YIELD_EXECUTION => {
+            let argbytes = hle_table::lookup(ordinal).map(|(_, b)| b as u32).unwrap_or(0);
+            stdcall_return(cpu, mem, STATUS_SUCCESS, argbytes);
+            preempt(cpu); // yield to another thread
+            Dispatch::Handled("Yield")
+        }
+        ORD_NT_WAIT_FOR_SINGLE_OBJECT | ORD_NT_WAIT_FOR_SINGLE_OBJECT_EX => {
+            // Handle-based waits: don't block (return signalled).
+            let argbytes = hle_table::lookup(ordinal).map(|(_, b)| b as u32).unwrap_or(12);
+            stdcall_return(cpu, mem, STATUS_SUCCESS, argbytes);
+            Dispatch::Handled("NtWaitForSingleObject")
         }
 
         // ---- Unknown: leave the CPU untouched; orchestrator stops & reports ----

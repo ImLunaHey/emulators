@@ -172,8 +172,13 @@ impl Xbox {
             self.cpu.seg_sel[s] = 0x08;
             self.cpu.seg_base[s] = 0;
         }
+        // Push a thread-exit sentinel as the entry's return address, so when the
+        // entry routine returns (after init) it terminates cleanly instead of
+        // popping off the empty stack into garbage.
+        let sp = Self::STACK_TOP - 4;
+        self.mem.ram_write32(sp, crate::hle::THREAD_EXIT_SENTINEL);
         self.cpu.eip = img.entry;
-        self.cpu.set_reg32(ESP, Self::STACK_TOP);
+        self.cpu.set_reg32(ESP, sp);
 
         self.booted = true;
         self.boot_title = title.to_string();
@@ -249,18 +254,24 @@ impl Xbox {
             // Signal one vblank per frame so the game's interrupt-service loop
             // advances its frame/timer bookkeeping.
             self.nv2a.raise_vblank();
-            if self.cpu.fault.is_none() && !self.cpu.halted {
-                for _ in 0..Self::STEP_BUDGET {
-                    // Kernel-import boundary: a CALL landed in the HLE trap region,
-                    // i.e. the game called an OS function we don't implement yet.
-                    // Record the ordinal and stop (the honest seam).
+            if self.cpu.fault.is_none() {
+                let mut quantum = 0u32;
+                let mut steps = 0u32;
+                while steps < Self::STEP_BUDGET {
+                    steps += 1;
                     let eip = self.cpu.eip;
+
+                    // A thread returned from its entry routine: terminate it and
+                    // schedule another.
+                    if eip == crate::hle::THREAD_EXIT_SENTINEL {
+                        crate::hle::terminate_current(&mut self.cpu);
+                        continue;
+                    }
+                    // Kernel-import boundary: route the call through the HLE kernel
+                    // (which may also switch threads). Unhandled -> stop + report.
                     if (Self::HLE_BASE..Self::HLE_BASE + Self::HLE_SPAN).contains(&eip) {
                         let idx = ((eip - Self::HLE_BASE) / 4) as usize;
                         let ord = self.kernel_ordinals.get(idx).copied().unwrap_or(0);
-                        // Hand the kernel import to the HLE kernel. If it handles
-                        // the call it returns control to the caller and we keep
-                        // executing; otherwise we stop and report the ordinal.
                         match crate::hle::dispatch(&mut self.cpu, &mut self.mem, ord) {
                             crate::hle::Dispatch::Handled(_) => continue,
                             crate::hle::Dispatch::Unhandled(_) => {
@@ -269,10 +280,23 @@ impl Xbox {
                             }
                         }
                     }
-                    if self.cpu.fault.is_some() || self.cpu.halted {
+                    if self.cpu.fault.is_some() {
                         break;
                     }
+                    // A thread idled (HLT): hand the slice to another thread.
+                    if self.cpu.halted {
+                        self.cpu.halted = false;
+                        crate::hle::preempt(&mut self.cpu);
+                        continue;
+                    }
                     self.step_cpu();
+                    // Round-robin preemption so a busy-waiting thread can't starve
+                    // the loaders/workers it's waiting on.
+                    quantum += 1;
+                    if quantum >= 8192 {
+                        quantum = 0;
+                        crate::hle::preempt(&mut self.cpu);
+                    }
                 }
             }
             // If the GPU has produced a color surface, scan it out to the screen;
