@@ -802,6 +802,8 @@ impl Cpu {
 
             // ---- NOP / XCHG eAX, reg ----
             0x90 => { /* NOP (xchg eAX,eAX) */ }
+            // FWAIT/WAIT — wait for pending x87 exceptions; none modeled, so nop.
+            0x9B => {}
             0x91..=0x97 => {
                 let r = (op - 0x90) as usize;
                 let a = self.reg(EAX, osize);
