@@ -51,6 +51,9 @@ pub struct Xbox {
     /// The ordinal of the first kernel import the game called (the seam where the
     /// foundation stops: it has no HLE kernel).
     last_kernel_ordinal: Option<u32>,
+
+    /// NV2A GPU (pushbuffer + scanout).
+    nv2a: crate::nv2a::Nv2a,
 }
 
 impl Default for Xbox {
@@ -75,6 +78,7 @@ impl Xbox {
             boot_entry: 0,
             kernel_ordinals: Vec::new(),
             last_kernel_ordinal: None,
+            nv2a: crate::nv2a::Nv2a::new(),
         }
     }
 
@@ -268,8 +272,15 @@ impl Xbox {
                     self.step_cpu();
                 }
             }
-            let lines = self.boot_lines();
-            crash::render(&mut self.gpu, &lines);
+            // If the GPU has produced a color surface, scan it out to the screen;
+            // otherwise show the live boot diagnostic.
+            if let Some((w, h)) = self.nv2a.scanout(&self.mem.ram[..], &mut self.gpu.framebuffer) {
+                self.gpu.display_w = w;
+                self.gpu.display_h = h;
+            } else {
+                let lines = self.boot_lines();
+                crash::render(&mut self.gpu, &lines);
+            }
             self.gpu.frames = self.gpu.frames.wrapping_add(1);
             self.frames = self.frames.wrapping_add(1);
             return;
@@ -326,10 +337,11 @@ impl Xbox {
             return v;
         }
         match region {
-            // MMIO band: open bus for now (no device behaviour).
-            Region::Mmio(_) => {
+            // MMIO band: the NV2A GPU window lives at the bottom (0xFD00_0000);
+            // route it there. Other devices are still open-bus.
+            Region::Mmio(off) => {
                 trace_mmio(addr);
-                0
+                self.nv2a.mmio_read(off, size)
             }
             Region::Unmapped => 0,
             // RAM/flash handled by region_read above.
@@ -343,7 +355,7 @@ impl Xbox {
             return;
         }
         match region {
-            Region::Mmio(_) => {}   // swallow MMIO writes for now
+            Region::Mmio(off) => self.nv2a.mmio_write(off, v, size, &mut self.mem.ram[..]),
             Region::Unmapped => {}
             Region::Ram(_) | Region::Flash(_) => {}
         }
