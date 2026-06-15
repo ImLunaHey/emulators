@@ -1,0 +1,38 @@
+[package]
+name = "atari2600-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Atari 2600 (VCS) core, built from-scratch against the Stella
+# Programmer's Guide, the AtariAge "2600 101" / TIA hardware docs, and the
+# 6502.org instruction reference — there is no source to port. The machine is
+# uniquely timing-critical ("racing the beam"): the CPU and TIA run in lockstep
+# at 1 CPU cycle = 3 TIA colour clocks, and games steer the picture by writing
+# TIA registers mid-scanline.
+#
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface on top. The core stays binding-agnostic.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter.
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. (cargo test
+# runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
+
+[dev-dependencies]
+
+[dependencies]
