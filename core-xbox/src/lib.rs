@@ -55,6 +55,9 @@ pub mod crash;
 // --- XISO / XDVDFS disc parsing (mount + identify a game disc).
 pub mod xiso;
 
+// --- XBE (Xbox executable) parsing + loading into RAM.
+pub mod xbe;
+
 // --- Top-level orchestrator (the god-struct + Bus impl).
 pub mod xbox;
 

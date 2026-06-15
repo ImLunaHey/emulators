@@ -39,6 +39,10 @@ pub struct DiscInfo {
     pub entry: u32,
     /// Which XOR key de-obfuscated the entry point ("retail"/"debug"/"unknown").
     pub entry_key: &'static str,
+    /// Byte offset + size of default.xbe within the disc image (0 if absent), so
+    /// the loader can extract the executable.
+    pub xbe_offset: usize,
+    pub xbe_size: usize,
     /// Root-directory listing.
     pub files: Vec<FileEntry>,
 }
@@ -145,9 +149,13 @@ pub fn probe(disc: &[u8]) -> Option<DiscInfo> {
     // tree for the entry's start sector (cheap; root dirs are tiny).
     let (mut title, mut title_id, mut base, mut entry, mut key) =
         (String::new(), 0u32, 0u32, 0u32, "unknown");
-    if xbe.is_some() {
+    let mut xbe_offset = 0usize;
+    let mut xbe_size = 0usize;
+    if let Some(xe) = xbe {
         if let Some(start) = find_start_sector(root, "default.xbe") {
             let xbe_off = (start as usize).checked_mul(SECTOR)?;
+            xbe_offset = xbe_off;
+            xbe_size = xe.size as usize;
             if let Some(hdr) = disc.get(xbe_off..xbe_off + 0x1000) {
                 if &hdr[0..4] == b"XBEH" {
                     base = rd_u32(hdr, 0x104)?;
@@ -182,6 +190,8 @@ pub fn probe(disc: &[u8]) -> Option<DiscInfo> {
         base,
         entry,
         entry_key: key,
+        xbe_offset,
+        xbe_size,
         files,
     })
 }

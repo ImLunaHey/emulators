@@ -9,6 +9,7 @@
 //! are stubs/seams. It is NOT a functional Xbox emulator.
 
 use crate::bus::{self, Bus, Region};
+use crate::cpu::state::{CR0_PE, ESP};
 use crate::cpu::Cpu;
 use crate::gpu::Gpu;
 use crate::mem::Mem;
@@ -35,6 +36,21 @@ pub struct Xbox {
     /// it — see [`crate::xiso`]).
     disc: Option<crate::xiso::DiscInfo>,
     disc_shown: bool,
+
+    /// True once a game XBE is loaded and the CPU is executing it. `run_frame`
+    /// then steps the interpreter instead of showing the identify screen.
+    booted: bool,
+    /// Title shown on the boot diagnostic.
+    boot_title: String,
+    /// The XBE entry point (for the diagnostic).
+    boot_entry: u32,
+    /// Kernel-import ordinals indexed by thunk slot — parallel to the HLE stub
+    /// addresses patched into the thunk table. A CALL into the HLE region is a
+    /// call to the ordinal at that slot.
+    kernel_ordinals: Vec<u32>,
+    /// The ordinal of the first kernel import the game called (the seam where the
+    /// foundation stops: it has no HLE kernel).
+    last_kernel_ordinal: Option<u32>,
 }
 
 impl Default for Xbox {
@@ -54,8 +70,21 @@ impl Xbox {
             crash_shown: false,
             disc: None,
             disc_shown: false,
+            booted: false,
+            boot_title: String::new(),
+            boot_entry: 0,
+            kernel_ordinals: Vec::new(),
+            last_kernel_ordinal: None,
         }
     }
+
+    /// Linear base of the HLE kernel-import trap region (in the unmapped band).
+    /// Each thunk slot is mapped to `HLE_BASE + slot*4`; a CALL there means the
+    /// game invoked the kernel import recorded for that slot.
+    const HLE_BASE: u32 = 0x8000_0000;
+    const HLE_SPAN: u32 = 0x4000;
+    /// Initial stack pointer — high in RAM, clear of the loaded image.
+    const STACK_TOP: u32 = 0x0300_0000;
 
     /// Load a flash/BIOS image (256 KB retail, or a larger mirrored dump — the
     /// tail is used) and reset to the x86 reset vector (`0xFFFF_FFF0`, inside the
@@ -66,21 +95,90 @@ impl Xbox {
         self.reset();
     }
 
-    /// Load a game image. If it's an XDVDFS (Xbox) disc, mount it and identify
-    /// the title — [`Xbox::run_frame`] then shows a "disc mounted" info screen.
-    /// (Actually *booting* the game needs the kernel/NV2A layers the foundation
-    /// doesn't have; this proves the disc loader works on a full-size image.)
+    /// Load a game image: a raw `.xbe`, or an XDVDFS disc (we extract its
+    /// `default.xbe`). The XBE is mapped into RAM and the CPU starts at its entry
+    /// point — [`Xbox::run_frame`] then executes the game's real x86 code. It will
+    /// run the CRT/startup until it calls a kernel import (no HLE kernel yet) or
+    /// hits an unimplemented instruction; the boot diagnostic reports how far.
     pub fn load_rom(&mut self, bytes: Vec<u8>) {
-        self.disc = crate::xiso::probe(&bytes);
-        self.disc_shown = false;
-        // (bytes drop here; the foundation only needs the parsed header. A real
-        // loader would keep the image mapped for the filesystem/DVD emulation.)
+        // Raw XBE.
+        if bytes.get(0..4) == Some(&b"XBEH"[..]) {
+            self.boot_xbe(&bytes, "DEFAULT.XBE");
+            return;
+        }
+        // Disc image — identify, then extract + boot default.xbe.
+        if let Some(info) = crate::xiso::probe(&bytes) {
+            let title = if info.title.is_empty() { "XBOX".into() } else { info.title.clone() };
+            if info.xbe_size > 0 {
+                let start = info.xbe_offset;
+                let end = start.saturating_add(info.xbe_size).min(bytes.len());
+                if start < end && self.boot_xbe(&bytes[start..end].to_vec(), &title) {
+                    self.disc = Some(info);
+                    return;
+                }
+            }
+            // Couldn't boot: fall back to the identify-only screen.
+            self.disc = Some(info);
+            self.disc_shown = false;
+        }
+    }
+
+    /// Map an XBE into RAM, patch its kernel-import thunks to HLE trap stubs, and
+    /// point the CPU at the entry point in flat 32-bit protected mode. Returns
+    /// false if the bytes aren't a valid XBE.
+    pub fn boot_xbe(&mut self, xbe: &[u8], title: &str) -> bool {
+        let img = match crate::xbe::parse(xbe) {
+            Some(i) => i,
+            None => return false,
+        };
+        // Fresh RAM, then map the image.
+        self.mem = Mem::new();
+        crate::xbe::load_into(&img, xbe, &mut self.mem.ram[..]);
+
+        // Patch the kernel-import thunk table: replace each `0x8000_0000|ordinal`
+        // entry with a unique HLE stub address so a CALL traps to our dispatch.
+        self.kernel_ordinals.clear();
+        let mut addr = img.kernel_thunk;
+        while addr != 0 {
+            let v = self.mem.ram_read32(addr);
+            if v == 0 {
+                break;
+            }
+            let ordinal = v & 0x7FFF_FFFF;
+            let idx = self.kernel_ordinals.len() as u32;
+            self.kernel_ordinals.push(ordinal);
+            self.mem.ram_write32(addr, Self::HLE_BASE + idx * 4);
+            addr = addr.wrapping_add(4);
+            if idx >= Self::HLE_SPAN / 4 - 1 {
+                break;
+            }
+        }
+
+        // CPU: flat 32-bit protected mode (PE set, segment bases 0), entry point,
+        // a high stack clear of the image.
+        self.cpu = Cpu::new();
+        self.cpu.cr[0] |= CR0_PE;
+        for s in 0..6 {
+            self.cpu.seg_sel[s] = 0x08;
+            self.cpu.seg_base[s] = 0;
+        }
+        self.cpu.eip = img.entry;
+        self.cpu.set_reg32(ESP, Self::STACK_TOP);
+
+        self.booted = true;
+        self.boot_title = title.to_string();
+        self.boot_entry = img.entry;
+        self.last_kernel_ordinal = None;
+        self.crash_shown = false;
+        self.disc = None;
+        true
     }
 
     /// Reset the CPU to the x86 reset vector.
     pub fn reset(&mut self) {
         self.cpu = Cpu::new();
         self.crash_shown = false;
+        self.booted = false;
     }
 
     /// The current display framebuffer as a byte slice (RGBA8888,
@@ -135,6 +233,32 @@ impl Xbox {
     /// panicking, exactly like the other cores' first phase.
     pub fn run_frame(&mut self) {
         let _ = Self::CYCLES_PER_FRAME; // documented budget; not yet cycle-accurate
+
+        // A booted game: step the CPU and show a live boot diagnostic.
+        if self.booted {
+            if self.cpu.fault.is_none() && !self.cpu.halted {
+                for _ in 0..Self::STEP_BUDGET {
+                    // Kernel-import boundary: a CALL landed in the HLE trap region,
+                    // i.e. the game called an OS function we don't implement yet.
+                    // Record the ordinal and stop (the honest seam).
+                    let eip = self.cpu.eip;
+                    if (Self::HLE_BASE..Self::HLE_BASE + Self::HLE_SPAN).contains(&eip) {
+                        let idx = ((eip - Self::HLE_BASE) / 4) as usize;
+                        self.last_kernel_ordinal = self.kernel_ordinals.get(idx).copied().or(Some(0));
+                        break;
+                    }
+                    if self.cpu.fault.is_some() || self.cpu.halted {
+                        break;
+                    }
+                    self.step_cpu();
+                }
+            }
+            let lines = self.boot_lines();
+            crash::render(&mut self.gpu, &lines);
+            self.gpu.frames = self.gpu.frames.wrapping_add(1);
+            self.frames = self.frames.wrapping_add(1);
+            return;
+        }
 
         // A mounted disc takes priority: identify it on screen. The foundation
         // can't boot it, so there's no CPU to step here.
@@ -205,6 +329,36 @@ impl Xbox {
             Region::Unmapped => {}
             Region::Ram(_) | Region::Flash(_) => {}
         }
+    }
+}
+
+impl Xbox {
+    /// Build the live boot-diagnostic text: title, entry, how far the CPU got,
+    /// and where it stopped (kernel import, fault, HLT, or still running).
+    fn boot_lines(&self) -> Vec<String> {
+        let status = if let Some(f) = self.cpu.fault {
+            let what = match f.vector {
+                0 => "DIV ERROR",
+                6 => "BAD OPCODE",
+                13 => "GEN PROTECT",
+                14 => "PAGE FAULT",
+                _ => "EXCEPTION",
+            };
+            format!("STOP  {} OP {:02X} EIP {:08X}", what, f.opcode, f.eip)
+        } else if let Some(ord) = self.last_kernel_ordinal {
+            format!("STOP  KERNEL IMPORT ORD {}", ord)
+        } else if self.cpu.halted {
+            "STOP  HLT".to_string()
+        } else {
+            "RUNNING".to_string()
+        };
+        vec![
+            format!("BOOTING {}", self.boot_title.to_uppercase()),
+            format!("ENTRY {:08X}  EIP {:08X}", self.boot_entry, self.cpu.eip),
+            format!("INSTRS {}", self.cpu.instret),
+            format!("IMPORTS {}", self.kernel_ordinals.len()),
+            status,
+        ]
     }
 }
 
