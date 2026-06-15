@@ -263,6 +263,7 @@ impl Xbox {
                 while steps < Self::STEP_BUDGET {
                     steps += 1;
                     let eip = self.cpu.eip;
+                    trace_eip(eip);
 
                     // A delivered ISR returned: restore the interrupted context.
                     if eip == crate::hle::ISR_RETURN_SENTINEL {
@@ -441,6 +442,32 @@ impl Xbox {
             format!("IMPORTS {}", self.kernel_ordinals.len()),
             status,
         ]
+    }
+}
+
+/// Debug aid: count EIP visits (gated on `XBOX_TRACE_EIP`) and surface the
+/// hottest instruction — pinpoints a spin loop's PC.
+use std::collections::HashMap as EipMap;
+static EIP_HIST: std::sync::Mutex<Option<EipMap<u32, u64>>> = std::sync::Mutex::new(None);
+
+fn trace_eip(eip: u32) {
+    if std::env::var_os("XBOX_TRACE_EIP").is_none() {
+        return;
+    }
+    let mut g = EIP_HIST.lock().unwrap();
+    *g.get_or_insert_with(EipMap::new).entry(eip).or_insert(0) += 1;
+}
+
+/// Print the hottest instruction addresses (the spin loop). Call after running.
+pub fn dump_eip_hist() {
+    let g = EIP_HIST.lock().unwrap();
+    if let Some(m) = g.as_ref() {
+        let mut v: Vec<(u32, u64)> = m.iter().map(|(&k, &c)| (k, c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("[eip top]");
+        for (eip, c) in v.into_iter().take(10) {
+            eprintln!("  {eip:#010X}  {c}");
+        }
     }
 }
 

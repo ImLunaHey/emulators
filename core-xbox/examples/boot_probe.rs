@@ -101,6 +101,7 @@ fn main() {
     for _ in 0..frames {
         xb.run_frame();
     }
+    xbox_core::xbox::dump_eip_hist(); // top spin EIPs when XBOX_TRACE_EIP is set
     println!("--- boot diagnostic ---");
     for line in xb.boot_diagnostic() {
         println!("  {line}");
