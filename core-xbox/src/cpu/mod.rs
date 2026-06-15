@@ -17,6 +17,7 @@
 
 pub mod exec;
 pub mod fpu;
+pub mod sse;
 pub mod state;
 
 pub use state::{Cpu, Exception, Fault};

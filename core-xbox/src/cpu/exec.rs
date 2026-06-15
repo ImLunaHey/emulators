@@ -1747,46 +1747,712 @@ impl Cpu {
                     self.set_reg(EAX, size, dst);
                 }
             }
-            // ---- SSE / MMX moves (best-effort) ----
+            // ---- SSE / SSE2 (real XMM register file) ----
             //
-            // Game code reaches a handful of packed/scalar move opcodes very
-            // early (compiler-emitted struct/vector copies). We have no XMM/MMX
-            // register file to model, so for now we only need to *not* #UD and
-            // to advance EIP past the (correctly-sized) operands so the
-            // surrounding integer code keeps running. The forms that move into
-            // or out of memory are honoured as raw 32-bit moves of the low
-            // dword (enough for the common dword spill/reload); register<->
-            // register XMM/MMX forms are accepted as no-ops. See the report:
-            // a full SSE state model is a follow-up.
+            // The Pentium III has the full SSE set. These opcodes use the
+            // "mandatory prefix" decode scheme: the same second opcode byte
+            // means a packed-single (no prefix), packed-double (0x66), scalar-
+            // single (0xF3) or scalar-double (0xF2) instruction depending on the
+            // legacy prefix that came before the 0x0F. The XMM register file
+            // lives in the thread-local in `super::sse`; see [`Cpu::exec_sse`].
             //
-            // MOVUPS/MOVAPS (0F 10 / 0F 11), MOVMSKPS-adjacent moves are not
-            // included; MOVD/MOVQ (0F 6E/7E/6F/7F) plus the prefixed scalar
-            // moves all flow through here.
-            0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0x12 | 0x13 | 0x16
-            | 0x17 => {
-                let (_reg, ea) = self.modrm(bus, p, asize);
-                // Touch the memory operand so faults/MMIO side-effects still
-                // occur, but there is no XMM file to land it in (or source it
-                // from), so the data move itself is a no-op for now.
-                if let Ea::Mem { lin, .. } = ea {
-                    match op2 {
-                        // store forms (reg -> r/m): write a zero dword so a
-                        // subsequent load reads something defined.
-                        0x11 | 0x29 | 0x7E | 0x7F | 0x13 | 0x17 => {
-                            let _ = lin; // intentionally do not clobber guest RAM
-                        }
-                        // load forms (r/m -> reg): read to trigger any MMIO.
-                        _ => {
-                            let _ = self.read_mem(bus, lin, 4);
-                        }
-                    }
-                }
+            // This list mirrors the dispatch in `exec_sse`. Anything not handled
+            // there falls through to the documented #UD seam.
+            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x16 | 0x17 | 0x28 | 0x29 | 0x2A
+            | 0x2C | 0x2D | 0x2E | 0x2F | 0x50 | 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56
+            | 0x57 | 0x58 | 0x59 | 0x5A | 0x5B | 0x5C | 0x5D | 0x5E | 0x5F | 0x6E | 0x6F
+            | 0x7E | 0x7F | 0xAE | 0xC2 | 0xC6 | 0xD6 | 0xEF => {
+                self.exec_sse(bus, op2, asize, p, start_eip);
             }
 
             _ => {
                 self.eip = start_eip;
                 self.raise(Exception::InvalidOpcode, 0, op2);
             }
+        }
+    }
+
+    // ============================ SSE / SSE2 ============================
+    //
+    // Helpers for moving 128/64-bit XMM operands through the 32-bit memory
+    // accessors (`read_mem`/`write_mem` top out at a dword), and the big
+    // mandatory-prefix dispatch table.
+
+    /// Read 16 bytes (a full XMM register's worth) from guest memory as four
+    /// little-endian dwords.
+    fn read_xmm_mem(&mut self, bus: &mut impl Bus, lin: u32) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        for i in 0..4 {
+            let dw = self.read_mem(bus, lin.wrapping_add(i * 4), 4);
+            b[(i * 4) as usize..(i * 4 + 4) as usize].copy_from_slice(&dw.to_le_bytes());
+        }
+        b
+    }
+    /// Write 16 bytes to guest memory as four little-endian dwords.
+    fn write_xmm_mem(&mut self, bus: &mut impl Bus, lin: u32, b: [u8; 16]) {
+        for i in 0..4u32 {
+            let j = (i * 4) as usize;
+            let dw = u32::from_le_bytes([b[j], b[j + 1], b[j + 2], b[j + 3]]);
+            self.write_mem(bus, lin.wrapping_add(i * 4), 4, dw);
+        }
+    }
+    /// Read 8 bytes (a qword) from guest memory as two little-endian dwords.
+    fn read_qword_mem(&mut self, bus: &mut impl Bus, lin: u32) -> u64 {
+        let lo = self.read_mem(bus, lin, 4) as u64;
+        let hi = self.read_mem(bus, lin.wrapping_add(4), 4) as u64;
+        lo | (hi << 32)
+    }
+    /// Write 8 bytes (a qword) to guest memory as two little-endian dwords.
+    fn write_qword_mem(&mut self, bus: &mut impl Bus, lin: u32, v: u64) {
+        self.write_mem(bus, lin, 4, v as u32);
+        self.write_mem(bus, lin.wrapping_add(4), 4, (v >> 32) as u32);
+    }
+
+    /// Read a packed 128-bit source operand: an XMM register (mod==3) or 16
+    /// bytes of memory.
+    fn sse_src128(&mut self, bus: &mut impl Bus, ea: Ea) -> [u8; 16] {
+        match ea {
+            Ea::Reg(r) => super::sse::with_xmm(|x| x.bytes(r as usize)),
+            Ea::Mem { lin, .. } => self.read_xmm_mem(bus, lin),
+        }
+    }
+
+    /// Dispatch one SSE/SSE2 instruction (the second opcode byte after 0x0F).
+    ///
+    /// `p.opsize` (0x66), `p.rep == 0xF3`, `p.rep == 0xF2` and "no prefix"
+    /// select among the four variants of each opcode. `asize` is the effective
+    /// address size for the ModR/M decode. Genuinely rare encodings fall through
+    /// to the documented #UD seam.
+    fn exec_sse(
+        &mut self,
+        bus: &mut impl Bus,
+        op2: u8,
+        asize: u8,
+        p: &Prefixes,
+        start_eip: u32,
+    ) {
+        // Mandatory-prefix selector.
+        let pfx66 = p.opsize;
+        let f3 = p.rep == 0xF3;
+        let f2 = p.rep == 0xF2;
+
+        match op2 {
+            // ---- MOVUPS/MOVUPD/MOVSS/MOVSD (load: 0x10, store: 0x11) ----
+            0x10 | 0x11 => {
+                let store = op2 == 0x11;
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if f3 {
+                    // MOVSS — scalar single (32-bit lane 0).
+                    if store {
+                        match ea {
+                            Ea::Reg(r) => {
+                                let v = super::sse::with_xmm(|x| x.lane0_f32(reg));
+                                super::sse::with_xmm(|x| x.set_lane0_f32(r as usize, v));
+                            }
+                            Ea::Mem { lin, .. } => {
+                                let v = super::sse::with_xmm(|x| x.dword0(reg));
+                                self.write_mem(bus, lin, 4, v);
+                            }
+                        }
+                    } else {
+                        match ea {
+                            // reg<-reg preserves upper lanes
+                            Ea::Reg(r) => {
+                                let v = super::sse::with_xmm(|x| x.dword0(r as usize));
+                                super::sse::with_xmm(|x| x.set_dword0(reg, v));
+                            }
+                            // reg<-mem zeroes the upper 96 bits
+                            Ea::Mem { lin, .. } => {
+                                let v = self.read_mem(bus, lin, 4);
+                                let mut b = [0u8; 16];
+                                b[0..4].copy_from_slice(&v.to_le_bytes());
+                                super::sse::with_xmm(|x| x.set_bytes(reg, b));
+                            }
+                        }
+                    }
+                } else if f2 {
+                    // MOVSD — scalar double (64-bit lane 0).
+                    if store {
+                        match ea {
+                            Ea::Reg(r) => {
+                                let v = super::sse::with_xmm(|x| x.qword_lo(reg));
+                                super::sse::with_xmm(|x| x.set_qword_lo(r as usize, v));
+                            }
+                            Ea::Mem { lin, .. } => {
+                                let v = super::sse::with_xmm(|x| x.qword_lo(reg));
+                                self.write_qword_mem(bus, lin, v);
+                            }
+                        }
+                    } else {
+                        match ea {
+                            Ea::Reg(r) => {
+                                let v = super::sse::with_xmm(|x| x.qword_lo(r as usize));
+                                super::sse::with_xmm(|x| x.set_qword_lo(reg, v));
+                            }
+                            Ea::Mem { lin, .. } => {
+                                let v = self.read_qword_mem(bus, lin);
+                                super::sse::with_xmm(|x| x.set_u64s(reg, [v, 0]));
+                            }
+                        }
+                    }
+                } else {
+                    // MOVUPS/MOVUPD — full 128-bit move (alignment not enforced).
+                    if store {
+                        let b = super::sse::with_xmm(|x| x.bytes(reg));
+                        match ea {
+                            Ea::Reg(r) => super::sse::with_xmm(|x| x.set_bytes(r as usize, b)),
+                            Ea::Mem { lin, .. } => self.write_xmm_mem(bus, lin, b),
+                        }
+                    } else {
+                        let b = self.sse_src128(bus, ea);
+                        super::sse::with_xmm(|x| x.set_bytes(reg, b));
+                    }
+                }
+            }
+
+            // ---- MOVLPS/MOVLPD (0x12 load, 0x13 store) ----
+            // Move the low 64 bits to/from memory (or movhlps for reg form).
+            0x12 | 0x13 => {
+                let store = op2 == 0x13;
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if store {
+                    let lo = super::sse::with_xmm(|x| x.qword_lo(reg));
+                    match ea {
+                        Ea::Mem { lin, .. } => self.write_qword_mem(bus, lin, lo),
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.set_qword_lo(r as usize, lo)),
+                    }
+                } else {
+                    match ea {
+                        // MOVHLPS xmm1, xmm2: low(dest) <- high(src)
+                        Ea::Reg(r) => {
+                            let hi = super::sse::with_xmm(|x| x.qword_hi(r as usize));
+                            super::sse::with_xmm(|x| x.set_qword_lo(reg, hi));
+                        }
+                        // MOVLPS xmm, m64: low 64 <- mem, high preserved
+                        Ea::Mem { lin, .. } => {
+                            let v = self.read_qword_mem(bus, lin);
+                            super::sse::with_xmm(|x| x.set_qword_lo(reg, v));
+                        }
+                    }
+                }
+            }
+
+            // ---- MOVHPS/MOVHPD (0x16 load, 0x17 store) ----
+            0x16 | 0x17 => {
+                let store = op2 == 0x17;
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if store {
+                    let hi = super::sse::with_xmm(|x| x.qword_hi(reg));
+                    match ea {
+                        Ea::Mem { lin, .. } => self.write_qword_mem(bus, lin, hi),
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.set_qword_hi(r as usize, hi)),
+                    }
+                } else {
+                    match ea {
+                        // MOVLHPS xmm1, xmm2: high(dest) <- low(src)
+                        Ea::Reg(r) => {
+                            let lo = super::sse::with_xmm(|x| x.qword_lo(r as usize));
+                            super::sse::with_xmm(|x| x.set_qword_hi(reg, lo));
+                        }
+                        // MOVHPS xmm, m64: high 64 <- mem, low preserved
+                        Ea::Mem { lin, .. } => {
+                            let v = self.read_qword_mem(bus, lin);
+                            super::sse::with_xmm(|x| x.set_qword_hi(reg, v));
+                        }
+                    }
+                }
+            }
+
+            // ---- UNPCKLPS/UNPCKHPS (0x14/0x15) ----
+            0x14 | 0x15 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let d = super::sse::with_xmm(|x| x.f32s(reg));
+                let sb = self.sse_src128(bus, ea);
+                let s = bytes_to_f32s(sb);
+                let r = if op2 == 0x14 {
+                    // low: d0,s0,d1,s1
+                    [d[0], s[0], d[1], s[1]]
+                } else {
+                    // high: d2,s2,d3,s3
+                    [d[2], s[2], d[3], s[3]]
+                };
+                super::sse::with_xmm(|x| x.set_f32s(reg, r));
+            }
+
+            // ---- MOVAPS/MOVAPD (0x28 load, 0x29 store) ----
+            0x28 | 0x29 => {
+                let store = op2 == 0x29;
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if store {
+                    let b = super::sse::with_xmm(|x| x.bytes(reg));
+                    match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.set_bytes(r as usize, b)),
+                        Ea::Mem { lin, .. } => self.write_xmm_mem(bus, lin, b),
+                    }
+                } else {
+                    let b = self.sse_src128(bus, ea);
+                    super::sse::with_xmm(|x| x.set_bytes(reg, b));
+                }
+            }
+
+            // ---- CVTSI2SS/CVTSI2SD (F3/F2 0x2A) ----
+            0x2A => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                // Source is an r/m32 integer (signed).
+                let src = self.read_ea(bus, ea, 4) as i32;
+                if f3 {
+                    super::sse::with_xmm(|x| x.set_lane0_f32(reg, src as f32));
+                } else if f2 {
+                    super::sse::with_xmm(|x| x.set_lane0_f64(reg, src as f64));
+                } else {
+                    // Packed MMX integer->float (CVTPI2PS) is rare; #UD it.
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                }
+            }
+
+            // ---- CVTTSS2SI/CVTTSD2SI (0x2C) and CVTSS2SI/CVTSD2SI (0x2D) ----
+            0x2C | 0x2D => {
+                let truncate = op2 == 0x2C;
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if f3 {
+                    let v = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f32(r as usize)),
+                        Ea::Mem { lin, .. } => {
+                            f32::from_bits(self.read_mem(bus, lin, 4))
+                        }
+                    } as f64;
+                    let r = convert_to_i32(v, truncate);
+                    self.set_reg32(reg, r as u32);
+                } else if f2 {
+                    let v = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f64(r as usize)),
+                        Ea::Mem { lin, .. } => self.read_f64(bus, lin),
+                    };
+                    let r = convert_to_i32(v, truncate);
+                    self.set_reg32(reg, r as u32);
+                } else {
+                    // CVTPS2PI / CVTTPS2PI (MMX dest) — rare; #UD.
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                }
+            }
+
+            // ---- UCOMISS/UCOMISD (0x2E) and COMISS/COMISD (0x2F) ----
+            0x2E | 0x2F => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let (a, b) = if pfx66 {
+                    let a = super::sse::with_xmm(|x| x.lane0_f64(reg));
+                    let b = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f64(r as usize)),
+                        Ea::Mem { lin, .. } => self.read_f64(bus, lin),
+                    };
+                    (a, b)
+                } else {
+                    let a = super::sse::with_xmm(|x| x.lane0_f32(reg)) as f64;
+                    let b = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f32(r as usize)) as f64,
+                        Ea::Mem { lin, .. } => {
+                            f32::from_bits(self.read_mem(bus, lin, 4)) as f64
+                        }
+                    };
+                    (a, b)
+                };
+                // EFLAGS: OF/SF/AF cleared; ZF/PF/CF set from the comparison.
+                self.set_flag(OF, false);
+                self.set_flag(SF, false);
+                self.set_flag(AF, false);
+                if a.is_nan() || b.is_nan() {
+                    // unordered: ZF=PF=CF=1
+                    self.set_flag(ZF, true);
+                    self.set_flag(PF, true);
+                    self.set_flag(CF, true);
+                } else if a < b {
+                    self.set_flag(ZF, false);
+                    self.set_flag(PF, false);
+                    self.set_flag(CF, true);
+                } else if a > b {
+                    self.set_flag(ZF, false);
+                    self.set_flag(PF, false);
+                    self.set_flag(CF, false);
+                } else {
+                    self.set_flag(ZF, true);
+                    self.set_flag(PF, false);
+                    self.set_flag(CF, false);
+                }
+            }
+
+            // ---- MOVMSKPS/MOVMSKPD (0x50) ----
+            0x50 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let src = match ea {
+                    Ea::Reg(r) => r as usize,
+                    // MOVMSK requires a register source; mem form is illegal.
+                    Ea::Mem { .. } => {
+                        self.eip = start_eip;
+                        self.raise(Exception::InvalidOpcode, 0, op2);
+                        return;
+                    }
+                };
+                let bits = super::sse::with_xmm(|x| x.u32s(src));
+                let mask = if pfx66 {
+                    // PD: sign bits of the two doubles (lanes 1 and 3 hold them).
+                    ((bits[1] >> 31) & 1) | (((bits[3] >> 31) & 1) << 1)
+                } else {
+                    // PS: sign bits of the four singles.
+                    (bits[0] >> 31 & 1)
+                        | ((bits[1] >> 31 & 1) << 1)
+                        | ((bits[2] >> 31 & 1) << 2)
+                        | ((bits[3] >> 31 & 1) << 3)
+                };
+                self.set_reg32(reg as usize, mask);
+            }
+
+            // ---- arithmetic & SQRT/RCP/RSQRT (0x51..0x5F except logic/conv) ----
+            0x51 | 0x52 | 0x53 | 0x58 | 0x59 | 0x5C | 0x5D | 0x5E | 0x5F => {
+                self.sse_arith(bus, op2, asize, p);
+            }
+
+            // ---- ANDPS/ANDNPS/ORPS/XORPS (0x54..0x57) — bitwise 128-bit ----
+            0x54..=0x57 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let d = super::sse::with_xmm(|x| x.u64s(reg));
+                let s = bytes_to_u64s(self.sse_src128(bus, ea));
+                let r = match op2 {
+                    0x54 => [d[0] & s[0], d[1] & s[1]],         // AND
+                    0x55 => [!d[0] & s[0], !d[1] & s[1]],       // ANDN: ~dest & src
+                    0x56 => [d[0] | s[0], d[1] | s[1]],         // OR
+                    _ => [d[0] ^ s[0], d[1] ^ s[1]],            // XOR
+                };
+                super::sse::with_xmm(|x| x.set_u64s(reg, r));
+            }
+
+            // ---- CVTPS2PD/CVTPD2PS, CVTSS2SD/CVTSD2SS (0x5A) ----
+            0x5A => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                if f3 {
+                    // CVTSS2SD: scalar single -> double (lane 0).
+                    let v = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f32(r as usize)),
+                        Ea::Mem { lin, .. } => f32::from_bits(self.read_mem(bus, lin, 4)),
+                    };
+                    super::sse::with_xmm(|x| x.set_lane0_f64(reg, v as f64));
+                } else if f2 {
+                    // CVTSD2SS: scalar double -> single (lane 0).
+                    let v = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f64(r as usize)),
+                        Ea::Mem { lin, .. } => self.read_f64(bus, lin),
+                    };
+                    super::sse::with_xmm(|x| x.set_lane0_f32(reg, v as f32));
+                } else if pfx66 {
+                    // CVTPD2PS: 2 doubles -> 2 singles (upper lanes zeroed).
+                    let s = bytes_to_f64s(self.sse_src128(bus, ea));
+                    super::sse::with_xmm(|x| x.set_f32s(reg, [s[0] as f32, s[1] as f32, 0.0, 0.0]));
+                } else {
+                    // CVTPS2PD: low 2 singles -> 2 doubles.
+                    let s = bytes_to_f32s(self.sse_src128(bus, ea));
+                    super::sse::with_xmm(|x| x.set_f64s(reg, [s[0] as f64, s[1] as f64]));
+                }
+            }
+
+            // ---- CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ (0x5B) ----
+            0x5B => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let sb = self.sse_src128(bus, ea);
+                if f3 {
+                    // CVTTPS2DQ: 4 singles -> 4 i32 (truncate).
+                    let s = bytes_to_f32s(sb);
+                    let r = [
+                        convert_to_i32(s[0] as f64, true) as u32,
+                        convert_to_i32(s[1] as f64, true) as u32,
+                        convert_to_i32(s[2] as f64, true) as u32,
+                        convert_to_i32(s[3] as f64, true) as u32,
+                    ];
+                    super::sse::with_xmm(|x| x.set_u32s(reg, r));
+                } else if pfx66 {
+                    // CVTPS2DQ: 4 singles -> 4 i32 (round).
+                    let s = bytes_to_f32s(sb);
+                    let r = [
+                        convert_to_i32(s[0] as f64, false) as u32,
+                        convert_to_i32(s[1] as f64, false) as u32,
+                        convert_to_i32(s[2] as f64, false) as u32,
+                        convert_to_i32(s[3] as f64, false) as u32,
+                    ];
+                    super::sse::with_xmm(|x| x.set_u32s(reg, r));
+                } else {
+                    // CVTDQ2PS: 4 i32 -> 4 singles.
+                    let s = bytes_to_u32s(sb);
+                    let r = [
+                        s[0] as i32 as f32,
+                        s[1] as i32 as f32,
+                        s[2] as i32 as f32,
+                        s[3] as i32 as f32,
+                    ];
+                    super::sse::with_xmm(|x| x.set_f32s(reg, r));
+                }
+            }
+
+            // ---- MOVD (66 0x6E load r/m32 -> xmm) ----
+            0x6E => {
+                if !pfx66 {
+                    // MMX MOVD (mm dest) — out of scope; #UD.
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                    return;
+                }
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let v = self.read_ea(bus, ea, 4);
+                // Zero-extend into the full 128-bit register.
+                super::sse::with_xmm(|x| x.set_u32s(reg as usize, [v, 0, 0, 0]));
+            }
+
+            // ---- MOVDQA/MOVDQU (66/F3 0x6F load) ----
+            0x6F => {
+                if !pfx66 && !f3 {
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                    return;
+                }
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let b = self.sse_src128(bus, ea);
+                super::sse::with_xmm(|x| x.set_bytes(reg as usize, b));
+            }
+
+            // ---- MOVD store (66 0x7E xmm -> r/m32) and MOVQ load (F3 0x7E) ----
+            0x7E => {
+                if f3 {
+                    // MOVQ xmm <- xmm/m64, zero-extending the upper 64 bits.
+                    let (reg, ea) = self.modrm(bus, p, asize);
+                    let reg = reg as usize;
+                    let v = match ea {
+                        Ea::Reg(r) => super::sse::with_xmm(|x| x.qword_lo(r as usize)),
+                        Ea::Mem { lin, .. } => self.read_qword_mem(bus, lin),
+                    };
+                    super::sse::with_xmm(|x| x.set_u64s(reg, [v, 0]));
+                } else if pfx66 {
+                    // MOVD r/m32 <- xmm (low dword).
+                    let (reg, ea) = self.modrm(bus, p, asize);
+                    let v = super::sse::with_xmm(|x| x.dword0(reg as usize));
+                    self.write_ea(bus, ea, 4, v);
+                } else {
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                }
+            }
+
+            // ---- MOVDQA/MOVDQU store (66/F3 0x7F) ----
+            0x7F => {
+                if !pfx66 && !f3 {
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                    return;
+                }
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let b = super::sse::with_xmm(|x| x.bytes(reg as usize));
+                match ea {
+                    Ea::Reg(r) => super::sse::with_xmm(|x| x.set_bytes(r as usize, b)),
+                    Ea::Mem { lin, .. } => self.write_xmm_mem(bus, lin, b),
+                }
+            }
+
+            // ---- LDMXCSR/STMXCSR + fences/prefetch (0xAE group) ----
+            0xAE => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                match (reg, ea) {
+                    // /2 LDMXCSR m32
+                    (2, Ea::Mem { lin, .. }) => {
+                        let v = self.read_mem(bus, lin, 4);
+                        super::sse::with_xmm(|x| x.mxcsr = v);
+                    }
+                    // /3 STMXCSR m32
+                    (3, Ea::Mem { lin, .. }) => {
+                        let v = super::sse::with_xmm(|x| x.mxcsr);
+                        self.write_mem(bus, lin, 4, v);
+                    }
+                    // /5 LFENCE, /6 MFENCE, /7 SFENCE (reg form) — no-ops.
+                    // /0,/1 PREFETCH* (mem form) — no-ops.
+                    _ => {}
+                }
+            }
+
+            // ---- CMPPS/CMPPD/CMPSS/CMPSD (0xC2, imm8 predicate) ----
+            0xC2 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let sb = self.sse_src128(bus, ea);
+                let imm = self.fetch_u8(bus) & 0x7;
+                if f3 {
+                    // scalar single
+                    let a = super::sse::with_xmm(|x| x.lane0_f32(reg));
+                    let b = f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+                    let m = if cmp_predicate(a as f64, b as f64, imm) {
+                        0xFFFF_FFFFu32
+                    } else {
+                        0
+                    };
+                    super::sse::with_xmm(|x| x.set_dword0(reg, m));
+                } else if f2 {
+                    // scalar double
+                    let a = super::sse::with_xmm(|x| x.lane0_f64(reg));
+                    let b = bytes_to_f64s(sb)[0];
+                    let m = if cmp_predicate(a, b, imm) {
+                        0xFFFF_FFFF_FFFF_FFFFu64
+                    } else {
+                        0
+                    };
+                    super::sse::with_xmm(|x| x.set_qword_lo(reg, m));
+                } else if pfx66 {
+                    // packed double
+                    let a = super::sse::with_xmm(|x| x.f64s(reg));
+                    let s = bytes_to_f64s(sb);
+                    let mut r = [0u64; 2];
+                    for i in 0..2 {
+                        r[i] = if cmp_predicate(a[i], s[i], imm) {
+                            0xFFFF_FFFF_FFFF_FFFF
+                        } else {
+                            0
+                        };
+                    }
+                    super::sse::with_xmm(|x| x.set_u64s(reg, r));
+                } else {
+                    // packed single
+                    let a = super::sse::with_xmm(|x| x.f32s(reg));
+                    let s = bytes_to_f32s(sb);
+                    let mut r = [0u32; 4];
+                    for i in 0..4 {
+                        r[i] = if cmp_predicate(a[i] as f64, s[i] as f64, imm) {
+                            0xFFFF_FFFF
+                        } else {
+                            0
+                        };
+                    }
+                    super::sse::with_xmm(|x| x.set_u32s(reg, r));
+                }
+            }
+
+            // ---- SHUFPS/SHUFPD (0xC6, imm8) ----
+            0xC6 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let sb = self.sse_src128(bus, ea);
+                let imm = self.fetch_u8(bus);
+                if pfx66 {
+                    // SHUFPD: bit0 picks dest lane, bit1 picks src lane.
+                    let d = super::sse::with_xmm(|x| x.f64s(reg));
+                    let s = bytes_to_f64s(sb);
+                    let r0 = d[(imm & 1) as usize];
+                    let r1 = s[((imm >> 1) & 1) as usize];
+                    super::sse::with_xmm(|x| x.set_f64s(reg, [r0, r1]));
+                } else {
+                    // SHUFPS: lanes 0,1 from dest; lanes 2,3 from src.
+                    let d = super::sse::with_xmm(|x| x.f32s(reg));
+                    let s = bytes_to_f32s(sb);
+                    let r = [
+                        d[(imm & 3) as usize],
+                        d[((imm >> 2) & 3) as usize],
+                        s[((imm >> 4) & 3) as usize],
+                        s[((imm >> 6) & 3) as usize],
+                    ];
+                    super::sse::with_xmm(|x| x.set_f32s(reg, r));
+                }
+            }
+
+            // ---- MOVQ store (66 0xD6 xmm -> xmm/m64) ----
+            0xD6 => {
+                if !pfx66 {
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                    return;
+                }
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let v = super::sse::with_xmm(|x| x.qword_lo(reg as usize));
+                match ea {
+                    // reg dest: low 64 <- src low 64, upper 64 zeroed.
+                    Ea::Reg(r) => super::sse::with_xmm(|x| x.set_u64s(r as usize, [v, 0])),
+                    Ea::Mem { lin, .. } => self.write_qword_mem(bus, lin, v),
+                }
+            }
+
+            // ---- PXOR (66 0xEF) — 128-bit integer XOR ----
+            0xEF => {
+                if !pfx66 {
+                    // MMX PXOR — out of scope; #UD.
+                    self.eip = start_eip;
+                    self.raise(Exception::InvalidOpcode, 0, op2);
+                    return;
+                }
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let reg = reg as usize;
+                let d = super::sse::with_xmm(|x| x.u64s(reg));
+                let s = bytes_to_u64s(self.sse_src128(bus, ea));
+                super::sse::with_xmm(|x| x.set_u64s(reg, [d[0] ^ s[0], d[1] ^ s[1]]));
+            }
+
+            _ => {
+                self.eip = start_eip;
+                self.raise(Exception::InvalidOpcode, 0, op2);
+            }
+        }
+    }
+
+    /// The packed/scalar floating arithmetic ops (ADD/MUL/SUB/DIV/MIN/MAX and
+    /// the unary SQRT/RCP/RSQRT), selected by the mandatory prefix into PS/PD/
+    /// SS/SD variants.
+    fn sse_arith(&mut self, bus: &mut impl Bus, op2: u8, asize: u8, p: &Prefixes) {
+        let pfx66 = p.opsize;
+        let f3 = p.rep == 0xF3;
+        let f2 = p.rep == 0xF2;
+        let (reg, ea) = self.modrm(bus, p, asize);
+        let reg = reg as usize;
+        let unary = matches!(op2, 0x51..=0x53);
+
+        if f3 {
+            // scalar single — operate on lane 0 only, preserve upper lanes.
+            let a = super::sse::with_xmm(|x| x.lane0_f32(reg)) as f64;
+            let b = match ea {
+                Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f32(r as usize)) as f64,
+                Ea::Mem { lin, .. } => f32::from_bits(self.read_mem(bus, lin, 4)) as f64,
+            };
+            let r = sse_op(op2, a, b, unary) as f32;
+            super::sse::with_xmm(|x| x.set_lane0_f32(reg, r));
+        } else if f2 {
+            // scalar double — lane 0 only.
+            let a = super::sse::with_xmm(|x| x.lane0_f64(reg));
+            let b = match ea {
+                Ea::Reg(r) => super::sse::with_xmm(|x| x.lane0_f64(r as usize)),
+                Ea::Mem { lin, .. } => self.read_f64(bus, lin),
+            };
+            let r = sse_op(op2, a, b, unary);
+            super::sse::with_xmm(|x| x.set_lane0_f64(reg, r));
+        } else if pfx66 {
+            // packed double — both lanes.
+            let a = super::sse::with_xmm(|x| x.f64s(reg));
+            let s = bytes_to_f64s(self.sse_src128(bus, ea));
+            let mut r = [0f64; 2];
+            for i in 0..2 {
+                r[i] = sse_op(op2, a[i], s[i], unary);
+            }
+            super::sse::with_xmm(|x| x.set_f64s(reg, r));
+        } else {
+            // packed single — all four lanes.
+            let a = super::sse::with_xmm(|x| x.f32s(reg));
+            let s = bytes_to_f32s(self.sse_src128(bus, ea));
+            let mut r = [0f32; 4];
+            for i in 0..4 {
+                r[i] = sse_op(op2, a[i] as f64, s[i] as f64, unary) as f32;
+            }
+            super::sse::with_xmm(|x| x.set_f32s(reg, r));
         }
     }
 
@@ -2351,6 +3017,109 @@ fn sign_ext(v: u32, size: u8) -> u32 {
         1 => v as u8 as i8 as i32 as u32,
         2 => v as u16 as i16 as i32 as u32,
         _ => v,
+    }
+}
+
+// ============================ SSE free helpers ============================
+
+/// Reinterpret 16 raw little-endian bytes as four f32 lanes.
+fn bytes_to_f32s(b: [u8; 16]) -> [f32; 4] {
+    let mut out = [0f32; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let j = i * 4;
+        *o = f32::from_le_bytes([b[j], b[j + 1], b[j + 2], b[j + 3]]);
+    }
+    out
+}
+/// Reinterpret 16 raw little-endian bytes as two f64 lanes.
+fn bytes_to_f64s(b: [u8; 16]) -> [f64; 2] {
+    [
+        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        f64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+    ]
+}
+/// Reinterpret 16 raw little-endian bytes as four u32 lanes.
+fn bytes_to_u32s(b: [u8; 16]) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    for (i, o) in out.iter_mut().enumerate() {
+        let j = i * 4;
+        *o = u32::from_le_bytes([b[j], b[j + 1], b[j + 2], b[j + 3]]);
+    }
+    out
+}
+/// Reinterpret 16 raw little-endian bytes as two u64 lanes.
+fn bytes_to_u64s(b: [u8; 16]) -> [u64; 2] {
+    [
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+    ]
+}
+
+/// Apply one SSE binary/unary float op (selected by the 0x0F opcode byte) at
+/// f64 precision. For packed-single callers the caller down-converts the result
+/// to f32. `unary` ops (SQRT/RCP/RSQRT) ignore `a` and operate on `b`.
+fn sse_op(op2: u8, a: f64, b: f64, _unary: bool) -> f64 {
+    match op2 {
+        0x58 => a + b,            // ADD
+        0x59 => a * b,            // MUL
+        0x5C => a - b,            // SUB
+        0x5E => a / b,            // DIV
+        // MIN/MAX: the SDM returns the *second* operand if either is NaN or
+        // they are equal; we approximate with the host min/max which is close
+        // enough for game branch behaviour.
+        0x5D => {
+            if a.is_nan() || b.is_nan() {
+                b
+            } else if a < b {
+                a
+            } else {
+                b
+            }
+        }
+        0x5F => {
+            if a.is_nan() || b.is_nan() {
+                b
+            } else if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        0x51 => b.sqrt(),         // SQRT (operates on the source)
+        0x53 => 1.0 / b,          // RCP  (approximate reciprocal)
+        0x52 => 1.0 / b.sqrt(),   // RSQRT (approximate)
+        _ => b,
+    }
+}
+
+/// Evaluate a CMPxx imm8 predicate (low 3 bits) per the SDM.
+fn cmp_predicate(a: f64, b: f64, imm: u8) -> bool {
+    let unord = a.is_nan() || b.is_nan();
+    match imm & 7 {
+        0 => a == b,                 // EQ (ordered)
+        1 => a < b,                  // LT
+        2 => a <= b,                 // LE
+        3 => unord,                  // UNORD
+        4 => a != b || unord,        // NEQ (unordered)
+        5 => a >= b || unord,        // NLT  (not-less-than, true if unordered)
+        6 => a > b || unord,         // NLE  (not-less-or-equal)
+        _ => !unord,                 // ORD
+    }
+}
+
+/// Convert an f64 to a signed i32 for the CVT*2SI family. `truncate` selects
+/// round-toward-zero (CVTT*); otherwise round-to-nearest (the default MXCSR
+/// mode, which is what game code uses). Out-of-range / NaN yields the SSE
+/// "integer indefinite" 0x8000_0000.
+fn convert_to_i32(v: f64, truncate: bool) -> i32 {
+    if v.is_nan() {
+        return i32::MIN;
+    }
+    let r = if truncate { v.trunc() } else { v.round_ties_even() };
+    if r >= i32::MAX as f64 + 1.0 || r < i32::MIN as f64 {
+        i32::MIN
+    } else {
+        r as i32
     }
 }
 
@@ -3082,5 +3851,257 @@ mod tests {
         // Verify little-endian byte order in RAM.
         assert_eq!(xb.mem.ram_read8(0x1000), 0x78);
         assert_eq!(xb.mem.ram_read8(0x1003), 0x12);
+    }
+
+    // ============================ SSE ============================
+
+    use super::super::sse::{reset_xmm, with_xmm};
+
+    /// Seed 16 bytes of guest RAM (little-endian f32 lanes) and return the
+    /// absolute address used.
+    fn seed_f32s(xb: &mut Xbox, addr: u32, lanes: [f32; 4]) {
+        for (i, v) in lanes.iter().enumerate() {
+            for (k, &byte) in v.to_le_bytes().iter().enumerate() {
+                xb.mem.ram_write8(addr + i as u32 * 4 + k as u32, byte as u32);
+            }
+        }
+    }
+
+    fn read_ram_f32(xb: &Xbox, addr: u32) -> f32 {
+        let b = [
+            xb.mem.ram_read8(addr) as u8,
+            xb.mem.ram_read8(addr + 1) as u8,
+            xb.mem.ram_read8(addr + 2) as u8,
+            xb.mem.ram_read8(addr + 3) as u8,
+        ];
+        f32::from_le_bytes(b)
+    }
+
+    #[test]
+    fn movaps_reg_mem_roundtrip() {
+        reset_xmm();
+        // movaps xmm0, [0x1000] ; movaps [0x1010], xmm0
+        // 0F 28 /r with disp32 = ModRM 05 -> [disp32]
+        let mut xb = harness(&[
+            0x0F, 0x28, 0x05, 0x00, 0x10, 0x00, 0x00, // movaps xmm0,[0x1000]
+            0x0F, 0x29, 0x05, 0x10, 0x10, 0x00, 0x00, // movaps [0x1010],xmm0
+        ]);
+        seed_f32s(&mut xb, 0x1000, [1.0, 2.0, 3.0, 4.0]);
+        run(&mut xb, 2);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [1.0, 2.0, 3.0, 4.0]);
+        // Round-tripped 16 bytes out to RAM.
+        for (i, want) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            assert_eq!(read_ram_f32(&xb, 0x1010 + i as u32 * 4), *want);
+        }
+    }
+
+    #[test]
+    fn movss_load_zeroes_upper_lanes() {
+        reset_xmm();
+        // Pre-fill xmm0 with junk, then MOVSS xmm0, [mem] must zero lanes 1..3.
+        with_xmm(|x| x.set_f32s(0, [9.0, 9.0, 9.0, 9.0]));
+        // F3 0F 10 /r, ModRM 05 -> [disp32]
+        let mut xb = harness(&[0xF3, 0x0F, 0x10, 0x05, 0x00, 0x10, 0x00, 0x00]);
+        seed_f32s(&mut xb, 0x1000, [7.5, 0.0, 0.0, 0.0]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [7.5, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn movss_reg_reg_preserves_upper_lanes() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]); // dest
+            x.set_f32s(1, [9.0, 8.0, 7.0, 6.0]); // src
+        });
+        // F3 0F 10 C1 -> movss xmm0, xmm1 (mod=11, reg=0, rm=1)
+        let mut xb = harness(&[0xF3, 0x0F, 0x10, 0xC1]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [9.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn addps_packed_lanes() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]);
+            x.set_f32s(1, [10.0, 20.0, 30.0, 40.0]);
+        });
+        // 0F 58 C1 -> addps xmm0, xmm1
+        let mut xb = harness(&[0x0F, 0x58, 0xC1]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn mulps_packed_lanes() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]);
+            x.set_f32s(1, [2.0, 3.0, 4.0, 5.0]);
+        });
+        // 0F 59 C1 -> mulps xmm0, xmm1
+        let mut xb = harness(&[0x0F, 0x59, 0xC1]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [2.0, 6.0, 12.0, 20.0]);
+    }
+
+    #[test]
+    fn addss_scalar_only_touches_lane0() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]);
+            x.set_f32s(1, [10.0, 99.0, 99.0, 99.0]);
+        });
+        // F3 0F 58 C1 -> addss xmm0, xmm1
+        let mut xb = harness(&[0xF3, 0x0F, 0x58, 0xC1]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [11.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn xorps_self_zeroes_register() {
+        reset_xmm();
+        with_xmm(|x| x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]));
+        // 0F 57 C0 -> xorps xmm0, xmm0
+        let mut xb = harness(&[0x0F, 0x57, 0xC0]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.u64s(0)), [0, 0]);
+    }
+
+    #[test]
+    fn pxor_self_zeroes_register() {
+        reset_xmm();
+        with_xmm(|x| x.set_u64s(0, [0xDEAD, 0xBEEF]));
+        // 66 0F EF C0 -> pxor xmm0, xmm0
+        let mut xb = harness(&[0x66, 0x0F, 0xEF, 0xC0]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.u64s(0)), [0, 0]);
+    }
+
+    #[test]
+    fn cvtsi2ss_then_cvttss2si_roundtrip() {
+        reset_xmm();
+        // mov eax, 42 ; cvtsi2ss xmm0, eax ; cvttss2si ebx, xmm0
+        let mut xb = harness(&[
+            0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax,42
+            0xF3, 0x0F, 0x2A, 0xC0, // cvtsi2ss xmm0, eax (rm=0=EAX)
+            0xF3, 0x0F, 0x2C, 0xD8, // cvttss2si ebx, xmm0 (reg=3=EBX, rm=0)
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(with_xmm(|x| x.lane0_f32(0)), 42.0);
+        assert_eq!(xb.cpu.reg32(EBX), 42);
+    }
+
+    #[test]
+    fn cvttss2si_truncates() {
+        reset_xmm();
+        with_xmm(|x| x.set_lane0_f32(0, 3.9));
+        // F3 0F 2C C0 -> cvttss2si eax, xmm0
+        let mut xb = harness(&[0xF3, 0x0F, 0x2C, 0xC0]);
+        run(&mut xb, 1);
+        assert_eq!(xb.cpu.reg32(EAX), 3, "truncation toward zero");
+    }
+
+    #[test]
+    fn shufps_selects_lanes() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [1.0, 2.0, 3.0, 4.0]); // dest
+            x.set_f32s(1, [5.0, 6.0, 7.0, 8.0]); // src
+        });
+        // shufps xmm0, xmm1, imm8. imm = 0b11_10_01_00 = 0xE4 (identity-ish):
+        // lane0=d[0]=1, lane1=d[1]=2, lane2=s[2]=7, lane3=s[3]=8
+        let mut xb = harness(&[0x0F, 0xC6, 0xC1, 0xE4]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [1.0, 2.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn comiss_sets_eflags() {
+        reset_xmm();
+        // a < b -> CF=1, ZF=0
+        with_xmm(|x| {
+            x.set_lane0_f32(0, 1.0);
+            x.set_lane0_f32(1, 2.0);
+        });
+        // 0F 2F C1 -> comiss xmm0, xmm1
+        let mut xb = harness(&[0x0F, 0x2F, 0xC1]);
+        run(&mut xb, 1);
+        assert!(xb.cpu.flag(CF), "1.0 < 2.0 -> CF");
+        assert!(!xb.cpu.flag(ZF));
+
+        // a == b -> ZF=1, CF=0
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_lane0_f32(0, 5.0);
+            x.set_lane0_f32(1, 5.0);
+        });
+        let mut xb = harness(&[0x0F, 0x2F, 0xC1]);
+        run(&mut xb, 1);
+        assert!(xb.cpu.flag(ZF), "equal -> ZF");
+        assert!(!xb.cpu.flag(CF));
+
+        // a > b -> ZF=0, CF=0
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_lane0_f32(0, 9.0);
+            x.set_lane0_f32(1, 1.0);
+        });
+        let mut xb = harness(&[0x0F, 0x2F, 0xC1]);
+        run(&mut xb, 1);
+        assert!(!xb.cpu.flag(ZF));
+        assert!(!xb.cpu.flag(CF), "greater -> CF clear");
+    }
+
+    #[test]
+    fn movd_to_and_from_gpr() {
+        reset_xmm();
+        // mov eax,0xCAFEBABE ; movd xmm0,eax ; movd ebx,xmm0
+        let mut xb = harness(&[
+            0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // mov eax,0xCAFEBABE
+            0x66, 0x0F, 0x6E, 0xC0, // movd xmm0, eax
+            0x66, 0x0F, 0x7E, 0xC3, // movd ebx, xmm0 (reg=0=xmm0, rm=3=EBX)
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(with_xmm(|x| x.u32s(0)), [0xCAFE_BABE, 0, 0, 0]);
+        assert_eq!(xb.cpu.reg32(EBX), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn divps_packed_lanes() {
+        reset_xmm();
+        with_xmm(|x| {
+            x.set_f32s(0, [10.0, 20.0, 30.0, 40.0]);
+            x.set_f32s(1, [2.0, 4.0, 5.0, 8.0]);
+        });
+        // 0F 5E C1 -> divps xmm0, xmm1
+        let mut xb = harness(&[0x0F, 0x5E, 0xC1]);
+        run(&mut xb, 1);
+        assert_eq!(with_xmm(|x| x.f32s(0)), [5.0, 5.0, 6.0, 5.0]);
+    }
+
+    #[test]
+    fn ldmxcsr_stmxcsr_roundtrip() {
+        reset_xmm();
+        // mov dword [0x1000], 0x1FA0 ; ldmxcsr [0x1000] ; stmxcsr [0x1004]
+        let mut xb = harness(&[
+            0xC7, 0x05, 0x00, 0x10, 0x00, 0x00, 0xA0, 0x1F, 0x00,
+            0x00, // mov dword [0x1000],0x1FA0
+            0x0F, 0xAE, 0x15, 0x00, 0x10, 0x00, 0x00, // ldmxcsr [0x1000] (/2)
+            0x0F, 0xAE, 0x1D, 0x04, 0x10, 0x00, 0x00, // stmxcsr [0x1004] (/3)
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(with_xmm(|x| x.mxcsr), 0x1FA0);
+        let stored = {
+            let b = [
+                xb.mem.ram_read8(0x1004) as u8,
+                xb.mem.ram_read8(0x1005) as u8,
+                xb.mem.ram_read8(0x1006) as u8,
+                xb.mem.ram_read8(0x1007) as u8,
+            ];
+            u32::from_le_bytes(b)
+        };
+        assert_eq!(stored, 0x1FA0);
     }
 }
