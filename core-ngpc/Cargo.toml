@@ -1,0 +1,39 @@
+[package]
+name = "ngpc-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Neo Geo Pocket / Neo Geo Pocket Color core, built from-scratch
+# against public hardware documentation: the NeoGeo Pocket dev wiki / ngpcspec,
+# the Toshiba TLCS-900/H1 User's Manual (the main CPU), the Zilog Z80 manual
+# (the sound CPU), and the K1GE/K2GE video + T6W28 PSG notes. There is no source
+# to port. ONE core handles both the mono NGP and the colour NGPC: the colour
+# chip (K2GE) is a superset of the mono one (K1GE); the cart header byte at
+# offset 0x23 (0x10 = colour) and the system register at 0x6F95 select the mode.
+#
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface on top. The core stays binding-agnostic.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter.
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. (cargo test
+# runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
+
+[dev-dependencies]
+
+[dependencies]
