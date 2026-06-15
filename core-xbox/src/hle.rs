@@ -179,15 +179,36 @@ fn is_hdd_path(p: &str) -> bool {
         || low.starts_with("u:")
 }
 
+/// True if an HDD path's final component looks like a concrete file (has a `.`
+/// extension), as opposed to a directory/partition. On a fresh HDD such files
+/// don't exist, so opening them must fail.
+fn hdd_path_is_file(p: &str) -> bool {
+    let s = p.replace('\\', "/");
+    let last = s.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    // A drive/partition root like "partition1" or a hex title dir has no '.'.
+    last.contains('.')
+}
+
 /// Sentinel `FileHandle.offset` marking a hard-disk pseudo-handle (no backing
 /// disc bytes; reads return zero-filled success).
 const HDD_PSEUDO_OFFSET: usize = usize::MAX;
 
 /// Open a file by Xbox path. Returns `(status, handle, information)`.
 fn open_file(path: &str) -> (u32, u32, u32) {
+    if std::env::var_os("XBOX_TRACE_FS").is_some() {
+        eprintln!("[fs] open {path:?}");
+    }
     // Hard-disk paths: present an empty-but-present HDD so the launcher's
-    // partition open succeeds and it doesn't relaunch (reboot to dashboard).
+    // partition/directory opens succeed and it doesn't relaunch (reboot to
+    // dashboard). But a fresh console has NO save data, so opening a concrete
+    // *file* (e.g. a save's TitleMeta.xbx / SaveImage.xbx) must report
+    // NOT_FOUND — returning a zero-filled success makes the game parse junk as a
+    // valid save and jump through a garbage pointer. We treat any HDD path whose
+    // final component has a file extension as a non-existent file.
     if is_hdd_path(path) {
+        if hdd_path_is_file(path) {
+            return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+        }
         let mut files = FILES.lock().unwrap();
         files.push(Some(FileHandle { offset: HDD_PSEUDO_OFFSET, size: 0x4000, pos: 0 }));
         return (0, FILE_HANDLE_BASE + (files.len() as u32 - 1), FILE_OPENED);
@@ -247,6 +268,30 @@ fn read_file(mem: &mut Mem, h: u32, buf: u32, len: u32, byte_offset: Option<u32>
     }
 }
 
+/// Query an open handle's (size, position). Returns None for an invalid handle.
+fn file_size_pos(h: u32) -> Option<(usize, usize)> {
+    if h < FILE_HANDLE_BASE {
+        return None;
+    }
+    let idx = (h - FILE_HANDLE_BASE) as usize;
+    let files = FILES.lock().unwrap();
+    files.get(idx).and_then(|s| s.as_ref()).map(|f| (f.size, f.pos))
+}
+
+/// Set an open handle's position (NtSetInformationFile / FilePositionInformation).
+fn file_set_pos(h: u32, pos: usize) -> bool {
+    if h < FILE_HANDLE_BASE {
+        return false;
+    }
+    let idx = (h - FILE_HANDLE_BASE) as usize;
+    let mut files = FILES.lock().unwrap();
+    if let Some(f) = files.get_mut(idx).and_then(|s| s.as_mut()) {
+        f.pos = pos;
+        return true;
+    }
+    false
+}
+
 /// Close an open handle. Returns true if it was one of ours.
 fn close_file(h: u32) -> bool {
     if h < FILE_HANDLE_BASE {
@@ -297,6 +342,14 @@ pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
             mem.ram_write16(addr.wrapping_add(2), 0);
             mem.ram_write16(addr.wrapping_add(4), 5838);
             mem.ram_write16(addr.wrapping_add(6), 1);
+        }
+        ORD_LAUNCH_DATA_PAGE => {
+            // On a real console `LaunchDataPage` is a pointer the kernel sets to a
+            // 4 KB launch-data page when a title is launched WITH data (via the
+            // dashboard or XLaunchNewImage), and leaves NULL on a plain cold
+            // boot. We leave the pointer NULL here; the reboot path
+            // (set_launch_data_slot) fills it on a warm relaunch.
+            mem.ram_write32(addr, 0);
         }
         _ => {
             for i in 0..16 {
@@ -820,8 +873,12 @@ const ORD_NT_WAIT_FOR_SINGLE_OBJECT_EX: u32 = 234;
 const ORD_NT_OPEN_FILE: u32 = 202;
 const ORD_NT_CREATE_FILE: u32 = 190;
 const ORD_NT_READ_FILE: u32 = 219;
+const ORD_NT_WRITE_FILE: u32 = 236;
 const ORD_NT_CLOSE: u32 = 187;
 const ORD_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 218;
+const ORD_NT_QUERY_INFORMATION_FILE: u32 = 211;
+const ORD_NT_SET_INFORMATION_FILE: u32 = 226;
+const ORD_NT_QUERY_FULL_ATTRIBUTES_FILE: u32 = 210;
 const ORD_EX_QUERY_NON_VOLATILE_SETTING: u32 = 24;
 const ORD_RTL_EQUAL_STRING: u32 = 279;
 const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
@@ -1133,6 +1190,23 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             stdcall_return(cpu, mem, status, 32);
             Dispatch::Handled("NtReadFile")
         }
+        ORD_NT_WRITE_FILE => {
+            // NtWriteFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID ApcCtx,
+            //   PIO_STATUS_BLOCK, PVOID Buffer, ULONG Length, PLARGE_INTEGER
+            //   ByteOffset) — 32 bytes. We have no writable backing store (the
+            //   disc is read-only and the HDD is a stub), so accept the write and
+            //   report all bytes written without persisting them. This keeps a
+            //   game that journals to the HDD progressing; it just won't see its
+            //   data survive a (re)boot.
+            let iosb = arg(cpu, mem, 4);
+            let len = arg(cpu, mem, 6);
+            if iosb != 0 {
+                mem.ram_write32(iosb, STATUS_SUCCESS);
+                mem.ram_write32(iosb.wrapping_add(4), len); // Information = bytes written
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 32);
+            Dispatch::Handled("NtWriteFile")
+        }
         ORD_NT_CLOSE => {
             let h = arg(cpu, mem, 0);
             close_file(h);
@@ -1198,6 +1272,129 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
             Dispatch::Handled("NtQueryVolumeInformationFile")
+        }
+
+        // NTSTATUS NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK,
+        //   PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS Class).
+        // Report size/position for an open handle so the game's seek/read logic
+        // has real numbers. The common classes during boot are FileStandard (5),
+        // FilePosition (14), and FileNetworkOpen (34).
+        ORD_NT_QUERY_INFORMATION_FILE => {
+            let h = arg(cpu, mem, 0);
+            let iosb = arg(cpu, mem, 1);
+            let info = arg(cpu, mem, 2);
+            let len = arg(cpu, mem, 3);
+            let class = arg(cpu, mem, 4);
+            let (size, pos) = file_size_pos(h).unwrap_or((0, 0));
+            let size = size as u64;
+            let pos = pos as u64;
+            let mut status = STATUS_SUCCESS;
+            let mut written = 0u32;
+            if info != 0 {
+                let w64 = |mem: &mut Mem, a: u32, v: u64| {
+                    mem.ram_write32(a, v as u32);
+                    mem.ram_write32(a.wrapping_add(4), (v >> 32) as u32);
+                };
+                match class {
+                    // FileStandardInformation (5): AllocationSize(i64),
+                    // EndOfFile(i64), NumberOfLinks(u32), DeletePending(u8),
+                    // Directory(u8). 24 bytes.
+                    5 if len >= 24 => {
+                        let alloc = (size + 0xFFF) & !0xFFF;
+                        w64(mem, info, alloc);
+                        w64(mem, info.wrapping_add(8), size);
+                        mem.ram_write32(info.wrapping_add(16), 1); // NumberOfLinks
+                        mem.ram_write8(info.wrapping_add(20), 0); // DeletePending
+                        mem.ram_write8(info.wrapping_add(21), 0); // Directory
+                        written = 24;
+                    }
+                    // FilePositionInformation (14): CurrentByteOffset(i64). 8 bytes.
+                    14 if len >= 8 => {
+                        w64(mem, info, pos);
+                        written = 8;
+                    }
+                    // FileNetworkOpenInformation (34): CreationTime, LastAccess,
+                    // LastWrite, ChangeTime (each i64), AllocationSize(i64),
+                    // EndOfFile(i64), FileAttributes(u32). 56 bytes.
+                    34 if len >= 56 => {
+                        for i in 0..4 {
+                            w64(mem, info.wrapping_add(i * 8), 0);
+                        }
+                        let alloc = (size + 0xFFF) & !0xFFF;
+                        w64(mem, info.wrapping_add(32), alloc);
+                        w64(mem, info.wrapping_add(40), size);
+                        mem.ram_write32(info.wrapping_add(48), 0x80); // FILE_ATTRIBUTE_NORMAL
+                        written = 56;
+                    }
+                    _ => {
+                        // Zero-fill the buffer for unknown classes.
+                        for o in (0..len.min(64)).step_by(4) {
+                            mem.ram_write32(info.wrapping_add(o), 0);
+                        }
+                        written = len.min(64);
+                        if file_size_pos(h).is_none() {
+                            status = STATUS_INVALID_HANDLE;
+                        }
+                    }
+                }
+            }
+            if iosb != 0 {
+                mem.ram_write32(iosb, status);
+                mem.ram_write32(iosb.wrapping_add(4), written);
+            }
+            stdcall_return(cpu, mem, status, 20);
+            Dispatch::Handled("NtQueryInformationFile")
+        }
+
+        // NTSTATUS NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK,
+        //   PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS Class).
+        // The only class we honour is FilePositionInformation (14) — a seek.
+        ORD_NT_SET_INFORMATION_FILE => {
+            let h = arg(cpu, mem, 0);
+            let iosb = arg(cpu, mem, 1);
+            let info = arg(cpu, mem, 2);
+            let len = arg(cpu, mem, 3);
+            let class = arg(cpu, mem, 4);
+            if class == 14 && info != 0 && len >= 8 {
+                let pos = mem.ram_read32(info) as usize; // low 32 bits
+                file_set_pos(h, pos);
+            }
+            if iosb != 0 {
+                mem.ram_write32(iosb, STATUS_SUCCESS);
+                mem.ram_write32(iosb.wrapping_add(4), 0);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
+            Dispatch::Handled("NtSetInformationFile")
+        }
+
+        // NTSTATUS NtQueryFullAttributesFile(POBJECT_ATTRIBUTES,
+        //   PFILE_NETWORK_OPEN_INFORMATION). Resolve the path; if it exists,
+        // report its size, else NAME_NOT_FOUND so the game knows it's absent.
+        ORD_NT_QUERY_FULL_ATTRIBUTES_FILE => {
+            let oa = arg(cpu, mem, 0);
+            let out = arg(cpu, mem, 1);
+            let path = read_obj_path(mem, oa);
+            let (status, handle, _info) = open_file(&path);
+            if status == STATUS_SUCCESS {
+                let (size, _pos) = file_size_pos(handle).unwrap_or((0, 0));
+                close_file(handle);
+                if out != 0 {
+                    let w64 = |mem: &mut Mem, a: u32, v: u64| {
+                        mem.ram_write32(a, v as u32);
+                        mem.ram_write32(a.wrapping_add(4), (v >> 32) as u32);
+                    };
+                    for i in 0..4 {
+                        w64(mem, out.wrapping_add(i * 8), 0); // timestamps
+                    }
+                    let size = size as u64;
+                    let alloc = (size + 0xFFF) & !0xFFF;
+                    w64(mem, out.wrapping_add(32), alloc);
+                    w64(mem, out.wrapping_add(40), size);
+                    mem.ram_write32(out.wrapping_add(48), 0x80);
+                }
+            }
+            stdcall_return(cpu, mem, status, 8);
+            Dispatch::Handled("NtQueryFullAttributesFile")
         }
 
         // BOOLEAN RtlEqualString(PSTRING S1, PSTRING S2, BOOLEAN CaseInsensitive).
@@ -1681,6 +1878,79 @@ mod tests {
         dispatch(&mut cpu, &mut mem, ORD_NT_ALLOCATE_VIRTUAL_MEMORY);
         assert_returned(&cpu, esp0, STATUS_SUCCESS, 20);
         assert_eq!(mem.ram_read32(p_base), 0x0030_0000, "kept caller's base");
+    }
+
+    #[test]
+    fn nt_query_information_file_standard_reports_size() {
+        let _g = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Install an open handle with a known size/pos directly in the table.
+        {
+            let mut files = FILES.lock().unwrap();
+            files.clear();
+            files.push(Some(FileHandle { offset: 0, size: 0x1234, pos: 0x10 }));
+        }
+        let h = FILE_HANDLE_BASE;
+        let iosb = 0x0007_0000u32;
+        let info = 0x0007_1000u32;
+        // args: handle, iosb, info, length, class(5 = FileStandardInformation)
+        let (mut cpu, mut mem, esp0) = frame(&[h, iosb, info, 24, 5]);
+        let out = dispatch(&mut cpu, &mut mem, ORD_NT_QUERY_INFORMATION_FILE);
+        assert!(matches!(out, Dispatch::Handled("NtQueryInformationFile")));
+        assert_returned(&cpu, esp0, STATUS_SUCCESS, 20);
+        // EndOfFile (i64 @ +8) == size.
+        assert_eq!(mem.ram_read32(info + 8), 0x1234, "EndOfFile low dword == size");
+        assert_eq!(mem.ram_read32(info + 12), 0, "EndOfFile high dword == 0");
+        // IoStatusBlock.Information == bytes written (24).
+        assert_eq!(mem.ram_read32(iosb + 4), 24);
+        FILES.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn nt_query_information_file_position() {
+        let _g = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut files = FILES.lock().unwrap();
+            files.clear();
+            files.push(Some(FileHandle { offset: 0, size: 0x1000, pos: 0x40 }));
+        }
+        let h = FILE_HANDLE_BASE;
+        let info = 0x0008_1000u32;
+        // class 14 = FilePositionInformation.
+        let (mut cpu, mut mem, esp0) = frame(&[h, 0, info, 8, 14]);
+        dispatch(&mut cpu, &mut mem, ORD_NT_QUERY_INFORMATION_FILE);
+        assert_returned(&cpu, esp0, STATUS_SUCCESS, 20);
+        assert_eq!(mem.ram_read32(info), 0x40, "CurrentByteOffset == pos");
+        FILES.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn nt_set_information_file_seeks() {
+        let _g = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut files = FILES.lock().unwrap();
+            files.clear();
+            files.push(Some(FileHandle { offset: 0, size: 0x1000, pos: 0 }));
+        }
+        let h = FILE_HANDLE_BASE;
+        let info = 0x0009_1000u32;
+        let (mut cpu, mut mem, esp0) = frame(&[h, 0, info, 8, 14]);
+        mem.ram_write32(info, 0x200); // seek to 0x200
+        dispatch(&mut cpu, &mut mem, ORD_NT_SET_INFORMATION_FILE);
+        assert_returned(&cpu, esp0, STATUS_SUCCESS, 20);
+        assert_eq!(file_size_pos(h).unwrap().1, 0x200, "position updated");
+        FILES.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn hdd_concrete_file_open_fails() {
+        // A save file on a fresh HDD must report NOT_FOUND, not zero-filled success.
+        let (status, _, _) =
+            open_file("\\Device\\Harddisk0\\partition1\\UDATA\\4d530064\\TitleMeta.xbx");
+        assert_eq!(status, STATUS_OBJECT_NAME_NOT_FOUND);
+        // A directory/partition path still succeeds (present, empty).
+        let (status2, _, _) = open_file("\\Device\\Harddisk0\\partition1\\UDATA");
+        assert_eq!(status2, STATUS_SUCCESS);
+        FILES.lock().unwrap().clear();
     }
 
     #[test]
