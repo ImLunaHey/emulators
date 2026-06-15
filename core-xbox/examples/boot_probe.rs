@@ -105,6 +105,19 @@ fn main() {
     for line in xb.boot_diagnostic() {
         println!("  {line}");
     }
+    // Report whether a frame was rendered (top-left pixel + dims).
+    let fb = xb.framebuffer();
+    if fb.len() >= 4 {
+        println!(
+            "  screen {}x{}  top-left RGBA = {:02X} {:02X} {:02X} {:02X}",
+            xb.width(),
+            xb.height(),
+            fb[0],
+            fb[1],
+            fb[2],
+            fb[3]
+        );
+    }
     // Dump the bytes around the current EIP (to decode a spin loop).
     let eip = xb.cpu.eip;
     print!("  bytes @ {:08X}:", eip.saturating_sub(16));
