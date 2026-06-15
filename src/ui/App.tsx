@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
+import { defaultShouldDehydrateQuery } from '@tanstack/react-query';
 import type { Emulator } from '../emulator';
 import { WasmEmulator } from './wasmEmulator';
 import { AudioSink } from './audio';
@@ -11,6 +12,7 @@ import { NesPlayer } from './NesPlayer';
 import { SmsPlayer } from './SmsPlayer';
 import { GbcPlayer } from './GbcPlayer';
 import { Ps1Player } from './Ps1Player';
+import { XboxPlayer } from './XboxPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -33,7 +35,16 @@ export function App() {
   return (
     <PersistQueryClientProvider
       client={queryClient}
-      persistOptions={{ persister, maxAge: 7 * 24 * 60 * 60 * 1000 }}
+      persistOptions={{
+        persister,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+        // Keep queries flagged meta.persist: false out of localStorage (e.g. the
+        // ~512 KB PS1 BIOS bytes, which would blow the quota and serialize poorly).
+        dehydrateOptions: {
+          shouldDehydrateQuery: (q) =>
+            q.meta?.persist !== false && defaultShouldDehydrateQuery(q),
+        },
+      }}
     >
       <EmuContext.Provider value={{ emu: emuRef.current, audio: audioRef.current }}>
         <ToastProvider>
@@ -48,6 +59,8 @@ export function App() {
               <GbcPlayer romId={playing.id} onExit={() => setPlaying(null)} />
             ) : playing.system === 'ps1' ? (
               <Ps1Player romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'xbox' ? (
+              <XboxPlayer romId={playing.id} onExit={() => setPlaying(null)} />
             ) : (
               <PlayerPage romId={playing.id} onExit={() => setPlaying(null)} />
             )

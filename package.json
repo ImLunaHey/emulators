@@ -13,12 +13,13 @@
     "build:wasm:nes": "wasm-pack build core-nes --target web --out-dir pkg --release",
     "build:wasm:sms": "wasm-pack build core-sms --target web --out-dir pkg --release",
     "build:wasm:gbc": "wasm-pack build core-gbc --target web --out-dir pkg --release",
+    "build:wasm:xbox": "wasm-pack build core-xbox --target web --out-dir pkg --release",
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "cargo test --manifest-path core/Cargo.toml",
     "lint": "oxlint src",
-    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build:wasm:sms && npm run build:wasm:gbc && npm run build:wasm:ps1 && npm run build && wrangler deploy"
+    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build:wasm:sms && npm run build:wasm:gbc && npm run build:wasm:ps1 && npm run build:wasm:xbox && npm run build && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.40.0",

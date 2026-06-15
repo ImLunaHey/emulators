@@ -4,7 +4,7 @@
 // `detect_system`; for now detection is by file extension.
 
 export type SystemId =
-  | 'gba' | 'nds' | 'gb' | 'gbc' | 'nes' | 'snes' | 'n64' | 'gg' | 'sms' | 'genesis' | 'ps1';
+  | 'gba' | 'nds' | 'gb' | 'gbc' | 'nes' | 'snes' | 'n64' | 'gg' | 'sms' | 'genesis' | 'ps1' | 'xbox';
 
 const EXT_TO_SYSTEM: Record<string, SystemId> = {
   gba: 'gba',
@@ -21,15 +21,20 @@ const EXT_TO_SYSTEM: Record<string, SystemId> = {
   // .bin holds the data. (.bin is genericish — Genesis uses .md/.gen here, so
   // mapping it to PS1 is fine for this catalog.)
   cue: 'ps1', bin: 'ps1', img: 'ps1', iso: 'ps1', pbp: 'ps1',
+  // Original Xbox. .xbe is the executable; .xiso is the redump disc image. (.iso
+  // is already claimed by PS1 above; Xbox discs are typically dumped as .xiso.)
+  xbe: 'xbox', xiso: 'xbox',
 };
 
 export const SYSTEM_LABEL: Record<SystemId, string> = {
   gba: 'GBA', nds: 'NDS', gb: 'GB', gbc: 'GBC', nes: 'NES',
-  snes: 'SNES', n64: 'N64', gg: 'GG', sms: 'SMS', genesis: 'GEN', ps1: 'PS1',
+  snes: 'SNES', n64: 'N64', gg: 'GG', sms: 'SMS', genesis: 'GEN', ps1: 'PS1', xbox: 'XBOX',
 };
 
 // Systems with a working core. Everything else is addable but "coming soon".
-export const PLAYABLE: ReadonlySet<SystemId> = new Set<SystemId>(['gba', 'nds', 'nes', 'sms', 'gg', 'gbc', 'gb', 'ps1']);
+// Xbox is a foundation core: it boots a supplied BIOS far enough to single-step
+// x86 and shows a diagnostic crash screen, but does not run commercial games yet.
+export const PLAYABLE: ReadonlySet<SystemId> = new Set<SystemId>(['gba', 'nds', 'nes', 'sms', 'gg', 'gbc', 'gb', 'ps1', 'xbox']);
 
 /** Detect a system from a filename's extension, or null if unrecognized. */
 export function detectSystem(filename: string): SystemId | null {
