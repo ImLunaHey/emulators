@@ -325,6 +325,9 @@ pub fn deliver_call(cpu: &mut Cpu, mem: &mut Mem, routine: u32, args: &[u32]) ->
     if s.isr_saved.len() > 8 {
         return false; // bound nesting
     }
+    if std::env::var_os("XBOX_TRACE_ISR").is_some() {
+        eprintln!("[isr] deliver routine={routine:#010X}");
+    }
     s.isr_saved.push(capture(cpu));
     let mut sp = cpu.reg32(ESP);
     for &a in args.iter().rev() {
@@ -340,6 +343,9 @@ pub fn deliver_call(cpu: &mut Cpu, mem: &mut Mem, routine: u32, args: &[u32]) ->
 
 /// Restore the context interrupted by a delivered ISR (EIP hit the sentinel).
 pub fn isr_return(cpu: &mut Cpu) {
+    if std::env::var_os("XBOX_TRACE_ISR").is_some() {
+        eprintln!("[isr] return");
+    }
     let mut g = SCHED.lock().unwrap();
     if let Some(s) = g.as_mut() {
         if let Some(ctx) = s.isr_saved.pop() {
