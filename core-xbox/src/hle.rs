@@ -382,6 +382,7 @@ pub fn reset() {
     FILES.lock().unwrap().clear();
     DISC.lock().unwrap().clear();
     REBOOT.store(false, Ordering::SeqCst);
+    SAVED_DATA_ADDR.store(0, Ordering::SeqCst);
     *PERSISTED.lock().unwrap() = None;
     *LAUNCH_DATA.lock().unwrap() = None;
 }
@@ -397,6 +398,9 @@ pub fn reset() {
 // ---------------------------------------------------------------------------
 
 static REBOOT: AtomicBool = AtomicBool::new(false);
+/// Saved display-data address (AvSetSavedDataAddress). Survives a quick-reboot;
+/// non-zero on the warm boot is the game's "I already ran the launcher" signal.
+static SAVED_DATA_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Regions marked to survive a quick-reboot: (base, size).
 static PERSISTED: Mutex<Option<Vec<(u32, u32)>>> = Mutex::new(None);
 /// Base of the most-recently persisted page — the launch-data page.
@@ -416,6 +420,14 @@ pub fn take_disc() -> Vec<u8> {
 /// Read the launch-data page base recorded before a reboot.
 pub fn take_launch_data() -> Option<u32> {
     *LAUNCH_DATA.lock().unwrap()
+}
+
+/// Read / restore the saved display-data address across a quick-reboot.
+pub fn take_saved_data() -> u32 {
+    SAVED_DATA_ADDR.load(Ordering::SeqCst)
+}
+pub fn set_saved_data(addr: u32) {
+    SAVED_DATA_ADDR.store(addr, Ordering::SeqCst);
 }
 
 /// Capture the bytes of all persisted regions (call before reset wipes RAM).
@@ -889,6 +901,8 @@ const ORD_HAL_READ_WRITE_PCI_SPACE: u32 = 46;
 const ORD_HAL_RETURN_TO_FIRMWARE: u32 = 49;
 const ORD_AV_SEND_TV_ENCODER_OPTION: u32 = 2;
 const ORD_AV_SET_DISPLAY_MODE: u32 = 3;
+const ORD_AV_GET_SAVED_DATA_ADDRESS: u32 = 1;
+const ORD_AV_SET_SAVED_DATA_ADDRESS: u32 = 4;
 
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
@@ -919,9 +933,8 @@ const SAFE_NOOP: &[u32] = &[
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
     100, // KeDisconnectInterrupt
-    1,   // AvGetSavedDataAddress (return 0 = none)
-    4,   // AvSetSavedDataAddress
-    // (interrupt connect/init, events, waits, threads, Av display handled below)
+    // (AvGet/SetSavedDataAddress handled below — they carry the warm-boot signal;
+    //  interrupt connect/init, events, waits, threads, Av display also below)
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.
@@ -1468,6 +1481,22 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             // surface we already scan out. Report success.
             stdcall_return(cpu, mem, STATUS_SUCCESS, 24);
             Dispatch::Handled("AvSetDisplayMode")
+        }
+        // PVOID AvGetSavedDataAddress(VOID) — the saved display surface from
+        // before a quick-reboot. NULL on a cold boot, non-NULL on a warm boot:
+        // the launcher reads this to know it already ran (and to skip rebooting).
+        ORD_AV_GET_SAVED_DATA_ADDRESS => {
+            let addr = SAVED_DATA_ADDR.load(Ordering::SeqCst);
+            stdcall_return(cpu, mem, addr, 0);
+            Dispatch::Handled("AvGetSavedDataAddress")
+        }
+        // VOID AvSetSavedDataAddress(PVOID Address) — remember the surface to
+        // preserve across the next quick-reboot.
+        ORD_AV_SET_SAVED_DATA_ADDRESS => {
+            let addr = arg(cpu, mem, 0);
+            SAVED_DATA_ADDR.store(addr, Ordering::SeqCst);
+            stdcall_return(cpu, mem, 0, 4);
+            Dispatch::Handled("AvSetSavedDataAddress")
         }
 
         // ---- PCI config space ----

@@ -147,6 +147,7 @@ impl Xbox {
         self.reboots += 1;
         // Capture relaunch state before reset() wipes RAM + the disc + globals.
         let launch_page = crate::hle::take_launch_data();
+        let saved_data = crate::hle::take_saved_data();
         let snap = crate::hle::snapshot_persisted(&self.mem);
         let disc = crate::hle::take_disc();
         // Re-extract default.xbe from the (preserved) disc image.
@@ -172,6 +173,9 @@ impl Xbox {
         if let Some(page) = launch_page {
             crate::hle::set_launch_data_slot(&mut self.mem, page);
         }
+        // Re-expose the saved display surface: non-zero now tells the warm-booted
+        // launcher it already ran, so it proceeds to the game instead of rebooting.
+        crate::hle::set_saved_data(saved_data);
     }
 
     /// Map an XBE into RAM, patch its kernel-import thunks to HLE trap stubs, and
