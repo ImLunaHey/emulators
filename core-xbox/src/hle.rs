@@ -29,6 +29,7 @@ use crate::cpu::Cpu;
 use crate::hle_table;
 use crate::mem::Mem;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 /// Outcome of handling one kernel-import CALL.
 #[derive(Debug, Clone)]
@@ -108,6 +109,125 @@ fn heap_reset() {
 }
 
 // ---------------------------------------------------------------------------
+// Virtual filesystem (XISO-backed). Globals, mirroring the allocator design:
+// one mounted disc image + an open-file table. Lock order is always DISC then
+// FILES to avoid deadlock.
+// ---------------------------------------------------------------------------
+
+/// An open virtual-file handle into the mounted disc image.
+struct FileHandle {
+    offset: usize, // byte offset of the file within the disc image
+    size: usize,
+    pos: usize,
+}
+
+/// The mounted disc image (the XISO bytes). Empty when none is loaded.
+static DISC: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Open-file table; the guest handle is `FILE_HANDLE_BASE + index`.
+static FILES: Mutex<Vec<Option<FileHandle>>> = Mutex::new(Vec::new());
+const FILE_HANDLE_BASE: u32 = 0x0001_0000;
+
+// NT status codes used by the filesystem.
+const STATUS_END_OF_FILE: u32 = 0xC000_0011;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const FILE_OPENED: u32 = 1; // IoStatusBlock.Information for a successful open
+
+/// Install the mounted disc image (moves the bytes in) and reset open files.
+/// Called by the loader once the game disc is mounted.
+pub fn set_disc(image: Vec<u8>) {
+    let mut disc = DISC.lock().unwrap();
+    let mut files = FILES.lock().unwrap();
+    *disc = image;
+    files.clear();
+}
+
+/// Map an Xbox object path to a disc-relative path, or `None` if it doesn't
+/// refer to the game disc (e.g. an HDD partition we don't emulate).
+fn disc_relative(p: &str) -> Option<String> {
+    let s = p.replace('\\', "/");
+    let low = s.trim_start_matches('/').to_ascii_lowercase();
+    for pre in [
+        "device/cdrom0/",
+        "device/cdrom0",
+        "cdrom0/",
+        "??/d:/",
+        "??/d:",
+        "d:/",
+        "d:",
+    ] {
+        if let Some(rest) = low.strip_prefix(pre) {
+            return Some(rest.trim_start_matches('/').to_string());
+        }
+    }
+    None
+}
+
+/// Open a file by Xbox path. Returns `(status, handle, information)`.
+fn open_file(path: &str) -> (u32, u32, u32) {
+    let rel = match disc_relative(path) {
+        Some(r) if !r.is_empty() => r,
+        _ => return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0),
+    };
+    let found = {
+        let disc = DISC.lock().unwrap();
+        crate::xiso::resolve_path(&disc, &rel)
+    };
+    match found {
+        Some((offset, size)) => {
+            let mut files = FILES.lock().unwrap();
+            files.push(Some(FileHandle { offset, size, pos: 0 }));
+            (0, FILE_HANDLE_BASE + (files.len() as u32 - 1), FILE_OPENED)
+        }
+        None => (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0),
+    }
+}
+
+/// Read from an open handle into guest memory. Returns `(status, bytes_read)`.
+fn read_file(mem: &mut Mem, h: u32, buf: u32, len: u32, byte_offset: Option<u32>) -> (u32, u32) {
+    if h < FILE_HANDLE_BASE {
+        return (STATUS_INVALID_HANDLE, 0);
+    }
+    let idx = (h - FILE_HANDLE_BASE) as usize;
+    let disc = DISC.lock().unwrap();
+    let mut files = FILES.lock().unwrap();
+    let fh = match files.get_mut(idx).and_then(|s| s.as_mut()) {
+        Some(f) => f,
+        None => return (STATUS_INVALID_HANDLE, 0),
+    };
+    let pos = byte_offset.map(|o| o as usize).unwrap_or(fh.pos);
+    let avail = fh.size.saturating_sub(pos);
+    let n = (len as usize).min(avail);
+    let start = fh.offset + pos;
+    for i in 0..n {
+        let b = disc.get(start + i).copied().unwrap_or(0);
+        mem.ram_write8(buf.wrapping_add(i as u32), b as u32);
+    }
+    fh.pos = pos + n;
+    if n == 0 {
+        (STATUS_END_OF_FILE, 0)
+    } else {
+        (0, n as u32)
+    }
+}
+
+/// Close an open handle. Returns true if it was one of ours.
+fn close_file(h: u32) -> bool {
+    if h < FILE_HANDLE_BASE {
+        return false;
+    }
+    let idx = (h - FILE_HANDLE_BASE) as usize;
+    let mut files = FILES.lock().unwrap();
+    if let Some(slot) = files.get_mut(idx) {
+        if slot.is_some() {
+            *slot = None;
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // stdcall helpers.
 // ---------------------------------------------------------------------------
 
@@ -168,6 +288,27 @@ fn wide_len_bytes(mem: &Mem, ptr: u32) -> u32 {
     n
 }
 
+/// Read the path out of an Xbox OBJECT_ATTRIBUTES at guest `oa`:
+/// `{ HANDLE RootDirectory; POBJECT_STRING ObjectName; ULONG Attributes; }`,
+/// where OBJECT_STRING is `{ USHORT Length; USHORT MaximumLength; PCHAR Buffer; }`
+/// (ANSI on the Xbox).
+fn read_obj_path(mem: &Mem, oa: u32) -> String {
+    if oa == 0 {
+        return String::new();
+    }
+    let name = mem.ram_read32(oa.wrapping_add(4));
+    if name == 0 {
+        return String::new();
+    }
+    let len = mem.ram_read16(name) & 0xFFFF;
+    let buf = mem.ram_read32(name.wrapping_add(4));
+    let mut s = String::with_capacity(len as usize);
+    for i in 0..len.min(512) {
+        s.push(mem.ram_read8(buf.wrapping_add(i)) as u8 as char);
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Ordinal constants (cross-checked against xboxkrnl.exe.def / OpenXDK).
 // ---------------------------------------------------------------------------
@@ -191,6 +332,10 @@ const ORD_RTL_INITIALIZE_CRITICAL_SECTION: u32 = 291;
 const ORD_RTL_LEAVE_CRITICAL_SECTION: u32 = 294;
 const ORD_RTL_LEAVE_CRITICAL_SECTION_AND_REGION: u32 = 295;
 const ORD_PS_CREATE_SYSTEM_THREAD_EX: u32 = 255;
+const ORD_NT_OPEN_FILE: u32 = 202;
+const ORD_NT_CREATE_FILE: u32 = 190;
+const ORD_NT_READ_FILE: u32 = 219;
+const ORD_NT_CLOSE: u32 = 187;
 
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
@@ -396,6 +541,56 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             let (name, argbytes) = hle_table::lookup(o).unwrap_or(("noop", 0));
             stdcall_return(cpu, mem, STATUS_SUCCESS, argbytes as u32);
             Dispatch::Handled(name)
+        }
+
+        // ---- Files (XISO-backed virtual filesystem) ----
+        ORD_NT_OPEN_FILE | ORD_NT_CREATE_FILE => {
+            // NtOpenFile(PHANDLE FileHandle, ACCESS_MASK, POBJECT_ATTRIBUTES,
+            //   PIO_STATUS_BLOCK, ULONG ShareAccess). NtCreateFile has more args
+            // but OBJECT_ATTRIBUTES (arg2) + IoStatusBlock (arg3) line up.
+            let fh_out = arg(cpu, mem, 0);
+            let oa = arg(cpu, mem, 2);
+            let iosb = arg(cpu, mem, 3);
+            let path = read_obj_path(mem, oa);
+            let (status, handle, info) = open_file(&path);
+            if fh_out != 0 {
+                mem.ram_write32(fh_out, handle);
+            }
+            if iosb != 0 {
+                mem.ram_write32(iosb, status); // IoStatusBlock.Status
+                mem.ram_write32(iosb.wrapping_add(4), info); // .Information
+            }
+            let argbytes = hle_table::lookup(ordinal).map(|(_, b)| b as u32).unwrap_or(20);
+            stdcall_return(cpu, mem, status, argbytes);
+            Dispatch::Handled(if ordinal == ORD_NT_OPEN_FILE { "NtOpenFile" } else { "NtCreateFile" })
+        }
+        ORD_NT_READ_FILE => {
+            // NtReadFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID ApcCtx,
+            //   PIO_STATUS_BLOCK, PVOID Buffer, ULONG Length, PLARGE_INTEGER
+            //   ByteOffset) — 32 bytes.
+            let h = arg(cpu, mem, 0);
+            let iosb = arg(cpu, mem, 4);
+            let buf = arg(cpu, mem, 5);
+            let len = arg(cpu, mem, 6);
+            let byteoff_ptr = arg(cpu, mem, 7);
+            let off = if byteoff_ptr != 0 {
+                Some(mem.ram_read32(byteoff_ptr)) // low 32 bits of the LARGE_INTEGER
+            } else {
+                None
+            };
+            let (status, info) = read_file(mem, h, buf, len, off);
+            if iosb != 0 {
+                mem.ram_write32(iosb, status);
+                mem.ram_write32(iosb.wrapping_add(4), info);
+            }
+            stdcall_return(cpu, mem, status, 32);
+            Dispatch::Handled("NtReadFile")
+        }
+        ORD_NT_CLOSE => {
+            let h = arg(cpu, mem, 0);
+            close_file(h);
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
+            Dispatch::Handled("NtClose")
         }
 
         // ---- Threads ----

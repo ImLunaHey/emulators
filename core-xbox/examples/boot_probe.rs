@@ -78,15 +78,25 @@ fn extract_xbe(path: &str) -> Vec<u8> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: boot_probe <disc|xbe> [frames]");
+    let path = std::env::args().nth(1).expect("usage: boot_probe <disc|xbe> [frames] [full]");
     let frames: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let xbe = extract_xbe(&path);
+    // "full" mode reads the entire disc into RAM (4.7 GB) and goes through the
+    // real load_rom path, so the HLE filesystem can serve file reads. Default
+    // mode streams just default.xbe (fast; FS opens return not-found).
+    let full = std::env::args().nth(3).as_deref() == Some("full");
 
     let mut xb = Xbox::new();
-    let ok = xb.boot_xbe(&xbe, "GAME");
-    println!("boot_xbe = {ok}");
-    if !ok {
-        return;
+    if full {
+        println!("reading full disc into memory…");
+        let disc = std::fs::read(&path).expect("read disc");
+        xb.load_rom(disc);
+    } else {
+        let xbe = extract_xbe(&path);
+        let ok = xb.boot_xbe(&xbe, "GAME");
+        println!("boot_xbe = {ok}");
+        if !ok {
+            return;
+        }
     }
     for _ in 0..frames {
         xb.run_frame();

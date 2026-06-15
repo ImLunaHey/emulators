@@ -112,9 +112,15 @@ impl Xbox {
             if info.xbe_size > 0 {
                 let start = info.xbe_offset;
                 let end = start.saturating_add(info.xbe_size).min(bytes.len());
-                if start < end && self.boot_xbe(&bytes[start..end].to_vec(), &title) {
-                    self.disc = Some(info);
-                    return;
+                if start < end {
+                    let xbe = bytes[start..end].to_vec();
+                    if self.boot_xbe(&xbe, &title) {
+                        self.disc = Some(info);
+                        // Retain the disc image so the HLE filesystem can serve
+                        // the game's file reads (moves the bytes into the kernel).
+                        crate::hle::set_disc(bytes);
+                        return;
+                    }
                 }
             }
             // Couldn't boot: fall back to the identify-only screen.

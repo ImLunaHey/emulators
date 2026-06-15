@@ -196,6 +196,66 @@ pub fn probe(disc: &[u8]) -> Option<DiscInfo> {
     })
 }
 
+/// Find a named entry within one directory table. Returns `(start_sector,
+/// size_bytes, is_dir)`. Case-insensitive (XDVDFS is).
+fn find_in_dir(dir: &[u8], name: &str) -> Option<(u32, u32, bool)> {
+    let mut stack = vec![0usize];
+    let mut seen = HashSet::new();
+    while let Some(o) = stack.pop() {
+        if o + 14 > dir.len() || !seen.insert(o) {
+            continue;
+        }
+        let l = rd_u16(dir, o).unwrap_or(0xFFFF);
+        let r = rd_u16(dir, o + 2).unwrap_or(0xFFFF);
+        let start = rd_u32(dir, o + 4).unwrap_or(0);
+        let size = rd_u32(dir, o + 8).unwrap_or(0);
+        let attr = dir[o + 12];
+        let nlen = dir[o + 13] as usize;
+        if let Some(nb) = dir.get(o + 14..o + 14 + nlen) {
+            if nb.eq_ignore_ascii_case(name.as_bytes()) {
+                return Some((start, size, attr & 0x10 != 0));
+            }
+        }
+        if l != 0xFFFF {
+            stack.push(l as usize * 4);
+        }
+        if r != 0xFFFF {
+            stack.push(r as usize * 4);
+        }
+    }
+    None
+}
+
+/// Resolve a disc-relative path (components separated by `/` or `\`, no device
+/// prefix) to `(byte_offset, size)` of the file within the disc image. Descends
+/// subdirectories. Returns `None` if any component is missing or the target is a
+/// directory.
+pub fn resolve_path(disc: &[u8], path: &str) -> Option<(usize, usize)> {
+    let comps: Vec<&str> = path.split(['/', '\\']).filter(|c| !c.is_empty()).collect();
+    if comps.is_empty() {
+        return None;
+    }
+    let mut dir_off = (rd_u32(disc, VOLUME_OFFSET + 0x14)? as usize).checked_mul(SECTOR)?;
+    let mut dir_size = rd_u32(disc, VOLUME_OFFSET + 0x18)? as usize;
+    for (i, comp) in comps.iter().enumerate() {
+        let dir = disc.get(dir_off..dir_off + dir_size)?;
+        let (start, size, is_dir) = find_in_dir(dir, comp)?;
+        if i == comps.len() - 1 {
+            return if is_dir {
+                None
+            } else {
+                Some(((start as usize).checked_mul(SECTOR)?, size as usize))
+            };
+        }
+        if !is_dir {
+            return None;
+        }
+        dir_off = (start as usize).checked_mul(SECTOR)?;
+        dir_size = size as usize;
+    }
+    None
+}
+
 /// Re-scan the raw root tree for a named entry's start sector.
 fn find_start_sector(buf: &[u8], name: &str) -> Option<u32> {
     let mut stack = vec![0usize];
@@ -284,5 +344,21 @@ mod tests {
         let junk = vec![0u8; 0x20000];
         assert!(!is_xdvdfs(&junk));
         assert!(probe(&junk).is_none());
+    }
+
+    #[test]
+    fn resolve_path_finds_root_file() {
+        let disc = synth();
+        // default.xbe is at sector 34, size 0x1000 (see synth()).
+        assert_eq!(
+            resolve_path(&disc, "default.xbe"),
+            Some((34 * SECTOR, 0x1000))
+        );
+        // Case-insensitive, and tolerant of a leading slash / backslashes.
+        assert_eq!(resolve_path(&disc, "DEFAULT.XBE"), Some((34 * SECTOR, 0x1000)));
+        assert_eq!(resolve_path(&disc, "\\default.xbe"), Some((34 * SECTOR, 0x1000)));
+        // Missing files and bad subpaths resolve to None.
+        assert_eq!(resolve_path(&disc, "nope.bin"), None);
+        assert_eq!(resolve_path(&disc, "default.xbe/inner"), None);
     }
 }
