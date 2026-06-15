@@ -7,48 +7,49 @@ struct PlayerView: View {
     @EnvironmentObject var hub: EmuHub
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
+        VStack(spacing: 0) {
             if hub.isPlaying {
-                ScreenView(hub: hub)
-                    .ignoresSafeArea()
-            } else {
-                VStack(spacing: 10) {
-                    Text("No game running")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.8))
-                    Text("Launch one from the Consoles window.")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.5))
+                // A real top bar (not an overlay) so it never covers the screen.
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hub.title)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Text("\(hub.systemLabel) · \(hub.controllerInfo)")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    Spacer()
+                    Button("Stop") { hub.stop() }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(.white.opacity(0.12))
+                        .cornerRadius(6)
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(red: 0.08, green: 0.08, blue: 0.1))
             }
 
-            if hub.isPlaying {
-                VStack {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(hub.title)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white)
-                            Text("\(hub.systemLabel) · \(hub.controllerInfo)")
-                                .font(.system(size: 10))
-                                .foregroundColor(.white.opacity(0.6))
-                        }
-                        Spacer()
-                        Button("Stop") { hub.stop() }
-                            .buttonStyle(.plain)
+            ZStack {
+                Color.black
+                if hub.isPlaying {
+                    ScreenView(hub: hub)
+                } else {
+                    VStack(spacing: 10) {
+                        Text("No game running")
+                            .font(.system(size: 18, weight: .semibold))
                             .foregroundColor(.white.opacity(0.8))
-                            .padding(.horizontal, 10).padding(.vertical, 4)
-                            .background(.white.opacity(0.12))
-                            .cornerRadius(6)
+                        Text("Launch one from the Consoles window.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.5))
                     }
-                    .padding(10)
-                    .background(.black.opacity(0.45))
-                    Spacer()
                 }
             }
         }
         .frame(minWidth: 480, minHeight: 360)
+        .background(Color.black)
     }
 }
