@@ -105,6 +105,16 @@ fn main() {
     for line in xb.boot_diagnostic() {
         println!("  {line}");
     }
+    // Dump the bytes around the current EIP (to decode a spin loop).
+    let eip = xb.cpu.eip;
+    print!("  bytes @ {:08X}:", eip.saturating_sub(16));
+    for i in eip.saturating_sub(16)..eip.wrapping_add(24) {
+        if i == eip {
+            print!(" |");
+        }
+        print!("{:02X} ", xb.mem.ram_read8(i));
+    }
+    println!();
     let imports = xb.kernel_imports();
     println!("--- {} kernel imports (ordinals) ---", imports.len());
     for chunk in imports.chunks(16) {

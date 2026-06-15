@@ -327,7 +327,10 @@ impl Xbox {
         }
         match region {
             // MMIO band: open bus for now (no device behaviour).
-            Region::Mmio(_) => 0,
+            Region::Mmio(_) => {
+                trace_mmio(addr);
+                0
+            }
             Region::Unmapped => 0,
             // RAM/flash handled by region_read above.
             Region::Ram(_) | Region::Flash(_) => unreachable!(),
@@ -388,6 +391,25 @@ impl Xbox {
             format!("IMPORTS {}", self.kernel_ordinals.len()),
             status,
         ]
+    }
+}
+
+/// Debug aid: log each distinct MMIO address the guest reads (gated on the
+/// `XBOX_TRACE_MMIO` env var) — used to find what device a boot spin-loop polls.
+fn trace_mmio(addr: u32) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static COUNTS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+    if std::env::var_os("XBOX_TRACE_MMIO").is_none() {
+        return;
+    }
+    let mut g = COUNTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let c = m.entry(addr).or_insert(0);
+    *c += 1;
+    // Surface the "hot" register a spin loop hammers (printed once at 50k reads).
+    if *c == 50_000 {
+        eprintln!("[mmio HOT] {addr:#010X} (spin-polled)");
     }
 }
 
