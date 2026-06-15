@@ -1,0 +1,39 @@
+[package]
+name = "wonderswan-core"
+version = "0.0.0"
+edition = "2021"
+
+# Pure-Rust Bandai WonderSwan / WonderSwan Color core, built from-scratch
+# against the WonderSwan dev wiki ("WSMan" / Cheri's WS docs) and the NEC V30MZ
+# (80186-compatible x86) instruction reference. There is no source to port. ONE
+# core handles both systems: the WonderSwan Color is a superset of the mono
+# WonderSwan (same V30MZ CPU + tilemap/sprite video + 4-channel audio), adding a
+# 12-bit RGB palette (4096 colours) and more VRAM. A `Model` enum chosen at
+# construction selects the colour behaviour.
+#
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface on top. The core stays binding-agnostic.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter.
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. (cargo test
+# runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+# Optimize the release wasm harder than wasm-pack's default `-O`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
+
+[dev-dependencies]
+
+[dependencies]
