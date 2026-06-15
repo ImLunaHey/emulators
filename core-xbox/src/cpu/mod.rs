@@ -16,6 +16,7 @@
 //! seams for later phases.
 
 pub mod exec;
+pub mod fpu;
 pub mod state;
 
 pub use state::{Cpu, Exception, Fault};

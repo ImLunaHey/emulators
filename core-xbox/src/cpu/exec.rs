@@ -1093,6 +1093,9 @@ impl Cpu {
                 self.set_reg8(4, lo);
             }
 
+            // ---- x87 FPU ESC opcodes (0xD8..0xDF) ----
+            0xD8..=0xDF => self.exec_fpu(bus, op, asize, &p, start_eip),
+
             // ---- two-byte (0x0F) ----
             0x0F => self.exec_0f(bus, osize, asize, &p, start_eip),
 
@@ -1744,6 +1747,42 @@ impl Cpu {
                     self.set_reg(EAX, size, dst);
                 }
             }
+            // ---- SSE / MMX moves (best-effort) ----
+            //
+            // Game code reaches a handful of packed/scalar move opcodes very
+            // early (compiler-emitted struct/vector copies). We have no XMM/MMX
+            // register file to model, so for now we only need to *not* #UD and
+            // to advance EIP past the (correctly-sized) operands so the
+            // surrounding integer code keeps running. The forms that move into
+            // or out of memory are honoured as raw 32-bit moves of the low
+            // dword (enough for the common dword spill/reload); register<->
+            // register XMM/MMX forms are accepted as no-ops. See the report:
+            // a full SSE state model is a follow-up.
+            //
+            // MOVUPS/MOVAPS (0F 10 / 0F 11), MOVMSKPS-adjacent moves are not
+            // included; MOVD/MOVQ (0F 6E/7E/6F/7F) plus the prefixed scalar
+            // moves all flow through here.
+            0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0x12 | 0x13 | 0x16
+            | 0x17 => {
+                let (_reg, ea) = self.modrm(bus, p, asize);
+                // Touch the memory operand so faults/MMIO side-effects still
+                // occur, but there is no XMM file to land it in (or source it
+                // from), so the data move itself is a no-op for now.
+                if let Ea::Mem { lin, .. } = ea {
+                    match op2 {
+                        // store forms (reg -> r/m): write a zero dword so a
+                        // subsequent load reads something defined.
+                        0x11 | 0x29 | 0x7E | 0x7F | 0x13 | 0x17 => {
+                            let _ = lin; // intentionally do not clobber guest RAM
+                        }
+                        // load forms (r/m -> reg): read to trigger any MMIO.
+                        _ => {
+                            let _ = self.read_mem(bus, lin, 4);
+                        }
+                    }
+                }
+            }
+
             _ => {
                 self.eip = start_eip;
                 self.raise(Exception::InvalidOpcode, 0, op2);
@@ -1771,6 +1810,486 @@ impl Cpu {
         }
     }
 
+    // ============================ x87 FPU ============================
+    //
+    // The 0xD8..0xDF "ESC" opcodes encode the floating-point unit. Each uses the
+    // ModR/M byte two ways: `mod != 3` is a memory operand (load/store of a
+    // 32/64-bit float or 16/32-bit integer); `mod == 3` is a register-stack op
+    // selected by the (opcode, reg, rm) triple. The architectural FPU state
+    // (register stack + control/status words) lives in the thread-local in
+    // `super::fpu` — see that module's docs for why.
+
+    /// Read a 32-bit float (m32fp) from guest memory.
+    fn read_f32(&mut self, bus: &mut impl Bus, lin: u32) -> f64 {
+        let bits = self.read_mem(bus, lin, 4);
+        f32::from_bits(bits) as f64
+    }
+    /// Write a 32-bit float (m32fp) to guest memory.
+    fn write_f32(&mut self, bus: &mut impl Bus, lin: u32, v: f64) {
+        self.write_mem(bus, lin, 4, (v as f32).to_bits());
+    }
+    /// Read a 64-bit float (m64fp) — two little-endian dwords.
+    fn read_f64(&mut self, bus: &mut impl Bus, lin: u32) -> f64 {
+        let lo = self.read_mem(bus, lin, 4) as u64;
+        let hi = self.read_mem(bus, lin.wrapping_add(4), 4) as u64;
+        f64::from_bits(lo | (hi << 32))
+    }
+    /// Write a 64-bit float (m64fp) — two little-endian dwords.
+    fn write_f64(&mut self, bus: &mut impl Bus, lin: u32, v: f64) {
+        let bits = v.to_bits();
+        self.write_mem(bus, lin, 4, bits as u32);
+        self.write_mem(bus, lin.wrapping_add(4), 4, (bits >> 32) as u32);
+    }
+
+    /// Dispatch an x87 ESC opcode (0xD8..0xDF). Implements the common,
+    /// high-frequency arithmetic/load/store/compare/control set; genuinely rare
+    /// sub-encodings fall through to the documented #UD seam.
+    fn exec_fpu(
+        &mut self,
+        bus: &mut impl Bus,
+        op: u8,
+        asize: u8,
+        p: &Prefixes,
+        start_eip: u32,
+    ) {
+        // Peek the ModR/M to split memory vs. register-stack forms; `modrm`
+        // consumes the byte (and any SIB/disp) so reg/rm/Ea are resolved.
+        let modrm_byte = bus.fetch8(self.code_linear(self.eip));
+        let md = modrm_byte >> 6;
+        let reg = (modrm_byte >> 3) & 7;
+        let rm = modrm_byte & 7;
+
+        if md == 3 {
+            // Register-stack form: the ModR/M byte is just a selector — advance
+            // EIP past it (no SIB/disp on a register operand).
+            self.eip = self.eip.wrapping_add(1);
+            self.fpu_reg_form(op, reg, rm, start_eip);
+            return;
+        }
+
+        // Memory form: resolve the effective address through the normal path.
+        let (_reg, ea) = self.modrm(bus, p, asize);
+        let lin = match ea {
+            Ea::Mem { lin, .. } => lin,
+            Ea::Reg(_) => unreachable!("md != 3 yields a memory operand"),
+        };
+        self.fpu_mem_form(bus, op, reg, lin, start_eip);
+    }
+
+    /// Memory-operand x87 forms. `reg` is the ModR/M reg field (the sub-op).
+    fn fpu_mem_form(
+        &mut self,
+        bus: &mut impl Bus,
+        op: u8,
+        reg: u8,
+        lin: u32,
+        start_eip: u32,
+    ) {
+        use super::fpu::with_fpu;
+        match op {
+            // D8 /r — arithmetic with m32fp, result into ST(0).
+            0xD8 => {
+                let src = self.read_f32(bus, lin);
+                self.fpu_arith_mem(reg, src);
+            }
+            // D9 — m32fp loads/stores + control.
+            0xD9 => match reg {
+                0 => {
+                    let v = self.read_f32(bus, lin);
+                    with_fpu(|f| f.push(v)); // FLD m32fp
+                }
+                2 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_f32(bus, lin, v); // FST m32fp
+                }
+                3 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_f32(bus, lin, v);
+                    with_fpu(|f| {
+                        f.pop();
+                    }); // FSTP m32fp
+                }
+                5 => {
+                    // FLDCW m16
+                    let cw = self.read_mem(bus, lin, 2) as u16;
+                    with_fpu(|f| f.set_control_word(cw));
+                }
+                7 => {
+                    // FNSTCW m16
+                    let cw = with_fpu(|f| f.control_word());
+                    self.write_mem(bus, lin, 2, cw as u32);
+                }
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DA /r — arithmetic with m32 integer.
+            0xDA => {
+                let src = self.read_mem(bus, lin, 4) as i32 as f64;
+                self.fpu_arith_mem(reg, src);
+            }
+            // DB — m32int load/store, m80 (extended) load/store best-effort.
+            0xDB => match reg {
+                0 => {
+                    let v = self.read_mem(bus, lin, 4) as i32 as f64;
+                    with_fpu(|f| f.push(v)); // FILD m32int
+                }
+                2 => {
+                    // FIST m32int
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_mem(bus, lin, 4, fpu_to_i32(v) as u32);
+                }
+                3 => {
+                    // FISTP m32int
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_mem(bus, lin, 4, fpu_to_i32(v) as u32);
+                    with_fpu(|f| {
+                        f.pop();
+                    });
+                }
+                5 => {
+                    // FLD m80fp — read 80-bit extended, narrow to f64.
+                    let v = self.read_f80(bus, lin);
+                    with_fpu(|f| f.push(v));
+                }
+                7 => {
+                    // FSTP m80fp — widen ST(0) to 80-bit, pop.
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_f80(bus, lin, v);
+                    with_fpu(|f| {
+                        f.pop();
+                    });
+                }
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DC /r — arithmetic with m64fp, result into ST(0).
+            0xDC => {
+                let src = self.read_f64(bus, lin);
+                self.fpu_arith_mem(reg, src);
+            }
+            // DD — m64fp loads/stores + FNSTSW m16.
+            0xDD => match reg {
+                0 => {
+                    let v = self.read_f64(bus, lin);
+                    with_fpu(|f| f.push(v)); // FLD m64fp
+                }
+                2 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_f64(bus, lin, v); // FST m64fp
+                }
+                3 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_f64(bus, lin, v);
+                    with_fpu(|f| {
+                        f.pop();
+                    }); // FSTP m64fp
+                }
+                7 => {
+                    // FNSTSW m16
+                    let sw = with_fpu(|f| f.status_word());
+                    self.write_mem(bus, lin, 2, sw as u32);
+                }
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DE /r — arithmetic with m16 integer.
+            0xDE => {
+                let src = self.read_mem(bus, lin, 2) as i16 as f64;
+                self.fpu_arith_mem(reg, src);
+            }
+            // DF — m16int load/store + m64int.
+            0xDF => match reg {
+                0 => {
+                    let v = self.read_mem(bus, lin, 2) as i16 as f64;
+                    with_fpu(|f| f.push(v)); // FILD m16int
+                }
+                2 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_mem(bus, lin, 2, fpu_to_i32(v) as u32); // FIST m16int
+                }
+                3 => {
+                    let v = with_fpu(|f| f.st(0));
+                    self.write_mem(bus, lin, 2, fpu_to_i32(v) as u32);
+                    with_fpu(|f| {
+                        f.pop();
+                    }); // FISTP m16int
+                }
+                5 => {
+                    // FILD m64int
+                    let lo = self.read_mem(bus, lin, 4) as u64;
+                    let hi = self.read_mem(bus, lin.wrapping_add(4), 4) as u64;
+                    let v = (lo | (hi << 32)) as i64 as f64;
+                    with_fpu(|f| f.push(v));
+                }
+                7 => {
+                    // FISTP m64int
+                    let v = with_fpu(|f| f.st(0));
+                    let i = fpu_to_i64(v) as u64;
+                    self.write_mem(bus, lin, 4, i as u32);
+                    self.write_mem(bus, lin.wrapping_add(4), 4, (i >> 32) as u32);
+                    with_fpu(|f| {
+                        f.pop();
+                    });
+                }
+                _ => self.fpu_ud(start_eip, op),
+            },
+            _ => self.fpu_ud(start_eip, op),
+        }
+    }
+
+    /// The shared `D8/DA/DC/DE /r` arithmetic dispatch on the reg field, with a
+    /// source already converted to f64. Result goes into ST(0).
+    fn fpu_arith_mem(&mut self, reg: u8, src: f64) {
+        use super::fpu::with_fpu;
+        with_fpu(|f| {
+            let st0 = f.st(0);
+            match reg {
+                0 => f.set_st(0, st0 + src),        // FADD
+                1 => f.set_st(0, st0 * src),        // FMUL
+                2 => f.set_compare(st0, src),       // FCOM
+                3 => {
+                    f.set_compare(st0, src);
+                    f.pop();
+                } // FCOMP
+                4 => f.set_st(0, st0 - src),        // FSUB
+                5 => f.set_st(0, src - st0),        // FSUBR
+                6 => f.set_st(0, st0 / src),        // FDIV
+                _ => f.set_st(0, src / st0),        // FDIVR
+            }
+        });
+    }
+
+    /// Register-stack x87 forms (`mod == 3`). Selected by (op, reg, rm).
+    fn fpu_reg_form(&mut self, op: u8, reg: u8, rm: u8, start_eip: u32) {
+        use super::fpu::{reset_fpu, with_fpu, SW_C0, SW_C2, SW_C3};
+        let i = rm as usize;
+        match op {
+            // D8: arithmetic ST(0) op= ST(i)  +  FCOM/FCOMP ST(i)
+            0xD8 => with_fpu(|f| {
+                let st0 = f.st(0);
+                let sti = f.st(i);
+                match reg {
+                    0 => f.set_st(0, st0 + sti), // FADD ST,ST(i)
+                    1 => f.set_st(0, st0 * sti), // FMUL ST,ST(i)
+                    2 => f.set_compare(st0, sti), // FCOM ST(i)
+                    3 => {
+                        f.set_compare(st0, sti);
+                        f.pop();
+                    } // FCOMP ST(i)
+                    4 => f.set_st(0, st0 - sti), // FSUB
+                    5 => f.set_st(0, sti - st0), // FSUBR
+                    6 => f.set_st(0, st0 / sti), // FDIV
+                    _ => f.set_st(0, sti / st0), // FDIVR
+                }
+            }),
+            // D9: FLD ST(i), FXCH, and the no-operand utility group (reg 4..7).
+            0xD9 => match reg {
+                0 => with_fpu(|f| {
+                    let v = f.st(i);
+                    f.push(v);
+                }), // FLD ST(i)
+                1 => with_fpu(|f| f.xch(i)), // FXCH ST(i)
+                4 => with_fpu(|f| match rm {
+                    0 => {
+                        // FCHS (D9 E0)
+                        let v = -f.st(0);
+                        f.set_st(0, v);
+                    }
+                    1 => {
+                        // FABS (D9 E1)
+                        let v = f.st(0).abs();
+                        f.set_st(0, v);
+                    }
+                    _ => {}
+                }),
+                5 => with_fpu(|f| {
+                    // Constant loads.
+                    let c = match rm {
+                        0 => 1.0,                                   // FLD1
+                        1 => std::f64::consts::LOG2_10,             // FLDL2T
+                        2 => std::f64::consts::LOG2_E,              // FLDL2E
+                        3 => std::f64::consts::PI,                  // FLDPI
+                        4 => std::f64::consts::LOG10_2,             // FLDLG2
+                        5 => std::f64::consts::LN_2,                // FLDLN2
+                        _ => 0.0,                                   // FLDZ (rm=6)
+                    };
+                    f.push(c);
+                }),
+                6 => with_fpu(|f| match rm {
+                    0 => {} // F2XM1 (rare) — leave ST(0)
+                    4 => {
+                        // FTST: compare ST(0) with 0.0
+                        let st0 = f.st(0);
+                        f.set_compare(st0, 0.0);
+                    }
+                    _ => {}
+                }),
+                7 => with_fpu(|f| match rm {
+                    2 => {
+                        // FSQRT (D9 FA)
+                        let v = f.st(0).sqrt();
+                        f.set_st(0, v);
+                    }
+                    _ => {} // FPREM/FYL2X/FSINCOS/... left as no-ops for now
+                }),
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DA: FCMOVcc (rare) — leave as #UD beyond what we model.
+            0xDA => self.fpu_ud(start_eip, op),
+            // DB: FNINIT / FNCLEX / FUCOMI etc.
+            0xDB => match (reg, rm) {
+                (4, 2) => with_fpu(|f| f.clear_exceptions()), // FNCLEX
+                (4, 3) => reset_fpu(),                         // FNINIT
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DC: arithmetic with the destination being ST(i) (reverse sense for
+            // the non-commutative ops, per the SDM).
+            0xDC => with_fpu(|f| {
+                let st0 = f.st(0);
+                let sti = f.st(i);
+                match reg {
+                    0 => f.set_st(i, sti + st0), // FADD ST(i),ST
+                    1 => f.set_st(i, sti * st0), // FMUL ST(i),ST
+                    4 => f.set_st(i, sti - st0), // FSUB ST(i),ST  (ST(i)=ST(i)-ST(0))
+                    5 => f.set_st(i, st0 - sti), // FSUBR ST(i),ST (ST(i)=ST(0)-ST(i))
+                    6 => f.set_st(i, sti / st0), // FDIV ST(i),ST
+                    7 => f.set_st(i, st0 / sti), // FDIVR ST(i),ST
+                    _ => {}
+                }
+            }),
+            // DD: FFREE ST(i), FST/FSTP ST(i), FUCOM/FUCOMP ST(i).
+            0xDD => match reg {
+                0 => with_fpu(|f| f.free(i)), // FFREE ST(i)
+                2 => with_fpu(|f| {
+                    let v = f.st(0);
+                    f.set_st(i, v);
+                }), // FST ST(i)
+                3 => with_fpu(|f| {
+                    let v = f.st(0);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FSTP ST(i)
+                4 => with_fpu(|f| {
+                    let st0 = f.st(0);
+                    let sti = f.st(i);
+                    f.set_compare(st0, sti);
+                }), // FUCOM ST(i)
+                5 => with_fpu(|f| {
+                    let st0 = f.st(0);
+                    let sti = f.st(i);
+                    f.set_compare(st0, sti);
+                    f.pop();
+                }), // FUCOMP ST(i)
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DE: arithmetic-and-pop (FADDP/FMULP/FSUBP/FDIVP) + FCOMPP.
+            0xDE => match reg {
+                0 => with_fpu(|f| {
+                    let v = f.st(i) + f.st(0);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FADDP
+                1 => with_fpu(|f| {
+                    let v = f.st(i) * f.st(0);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FMULP
+                3 => {
+                    // FCOMPP (only valid with rm==1): compare then pop twice.
+                    if rm == 1 {
+                        with_fpu(|f| {
+                            let st0 = f.st(0);
+                            let st1 = f.st(1);
+                            f.set_compare(st0, st1);
+                            f.pop();
+                            f.pop();
+                        });
+                    } else {
+                        self.fpu_ud(start_eip, op);
+                    }
+                }
+                4 => with_fpu(|f| {
+                    let v = f.st(i) - f.st(0);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FSUBP (ST(i)=ST(i)-ST(0))
+                5 => with_fpu(|f| {
+                    let v = f.st(0) - f.st(i);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FSUBRP
+                6 => with_fpu(|f| {
+                    let v = f.st(i) / f.st(0);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FDIVP
+                7 => with_fpu(|f| {
+                    let v = f.st(0) / f.st(i);
+                    f.set_st(i, v);
+                    f.pop();
+                }), // FDIVRP
+                _ => self.fpu_ud(start_eip, op),
+            },
+            // DF: FNSTSW AX, FUCOMIP/FCOMIP (rare).
+            0xDF => match (reg, rm) {
+                (4, 0) => {
+                    // FNSTSW AX
+                    let sw = with_fpu(|f| f.status_word());
+                    self.set_reg16(EAX, sw as u32);
+                }
+                _ => {
+                    // FCOMIP/FUCOMIP ST(0),ST(i): compare and set EFLAGS, pop.
+                    if reg == 5 || reg == 6 {
+                        let (c0, c2, c3) = with_fpu(|f| {
+                            let st0 = f.st(0);
+                            let sti = f.st(i);
+                            f.set_compare(st0, sti);
+                            f.pop();
+                            let sw = f.status_word();
+                            (sw & SW_C0 != 0, sw & SW_C2 != 0, sw & SW_C3 != 0)
+                        });
+                        // EFLAGS: ZF<-C3, PF<-C2, CF<-C0 (SDM mapping).
+                        self.set_flag(ZF, c3);
+                        self.set_flag(PF, c2);
+                        self.set_flag(CF, c0);
+                    } else {
+                        self.fpu_ud(start_eip, op);
+                    }
+                }
+            },
+            _ => self.fpu_ud(start_eip, op),
+        }
+    }
+
+    /// Read an 80-bit extended-precision float and narrow to f64 (best effort).
+    fn read_f80(&mut self, bus: &mut impl Bus, lin: u32) -> f64 {
+        let m_lo = self.read_mem(bus, lin, 4) as u64;
+        let m_hi = self.read_mem(bus, lin.wrapping_add(4), 4) as u64;
+        let se = self.read_mem(bus, lin.wrapping_add(8), 2) as u16;
+        let mantissa = m_lo | (m_hi << 32);
+        let sign = (se >> 15) & 1;
+        let exp = (se & 0x7FFF) as i32;
+        if exp == 0 && mantissa == 0 {
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        // value = (-1)^sign * mantissa/2^63 * 2^(exp-16383)
+        let frac = mantissa as f64 / (1u64 << 63) as f64;
+        let val = frac * 2f64.powi(exp - 16383);
+        if sign == 1 { -val } else { val }
+    }
+
+    /// Write an f64 as an 80-bit extended-precision float (best effort).
+    fn write_f80(&mut self, bus: &mut impl Bus, lin: u32, v: f64) {
+        let (mantissa, se) = f64_to_f80(v);
+        self.write_mem(bus, lin, 4, mantissa as u32);
+        self.write_mem(bus, lin.wrapping_add(4), 4, (mantissa >> 32) as u32);
+        self.write_mem(bus, lin.wrapping_add(8), 2, se as u32);
+    }
+
+    /// Raise the documented #UD seam for an unimplemented FPU encoding.
+    #[inline]
+    fn fpu_ud(&mut self, start_eip: u32, op: u8) {
+        self.eip = start_eip;
+        self.raise(Exception::InvalidOpcode, 0, op);
+    }
+
     /// Public wrapper so [`do_shift`] can set SZP (the inherent helper is
     /// private to `state.rs`); recomputes the same SF/ZF/PF subset.
     fn set_szp_pub(&mut self, res: u32, size: u8) {
@@ -1781,6 +2300,48 @@ impl Cpu {
         self.set_flag(SF, r & sign != 0);
         self.set_flag(PF, (r as u8).count_ones() % 2 == 0);
     }
+}
+
+/// Convert an x87 register value to a 32-bit integer with round-to-nearest
+/// (the default rounding mode). NaN/out-of-range collapse to the "integer
+/// indefinite" value, as a real FPU would store on an unmasked invalid-op.
+#[inline]
+fn fpu_to_i32(v: f64) -> i32 {
+    let r = v.round_ties_even();
+    if r.is_nan() || r > i32::MAX as f64 || r < i32::MIN as f64 {
+        i32::MIN // integer indefinite
+    } else {
+        r as i32
+    }
+}
+
+/// Convert an x87 register value to a 64-bit integer (round-to-nearest).
+#[inline]
+fn fpu_to_i64(v: f64) -> i64 {
+    let r = v.round_ties_even();
+    if r.is_nan() || r >= 9.223_372_036_854_776e18 || r < -9.223_372_036_854_776e18 {
+        i64::MIN
+    } else {
+        r as i64
+    }
+}
+
+/// Encode an f64 as an 80-bit extended float: returns (64-bit mantissa with the
+/// explicit integer bit, 16-bit sign+exponent). Best effort — normal finite
+/// values only; zero/sub-normal collapse to a clean zero.
+fn f64_to_f80(v: f64) -> (u64, u16) {
+    if v == 0.0 {
+        let sign = if v.is_sign_negative() { 0x8000 } else { 0 };
+        return (0, sign);
+    }
+    let sign = if v < 0.0 { 0x8000u16 } else { 0 };
+    let a = v.abs();
+    let e = a.log2().floor() as i32; // unbiased exponent
+    let exp80 = (e + 16383) as u16 & 0x7FFF;
+    // mantissa normalized to [1,2): a / 2^e, scaled into the explicit-1 64-bit field.
+    let frac = a / 2f64.powi(e); // in [1,2)
+    let mantissa = (frac * (1u64 << 63) as f64) as u64;
+    (mantissa, sign | exp80)
 }
 
 /// Sign-extend a value of `size` bytes to a full 32-bit word.
@@ -2256,6 +2817,256 @@ mod tests {
         assert_eq!(xb.cpu.reg32(EBX), 8);
         assert_eq!(xb.cpu.reg32(ECX), 8);
         assert!(!xb.cpu.flag(ZF));
+    }
+
+    // ============================ x87 FPU tests ============================
+    //
+    // The FPU register stack lives in a thread-local (see `super::fpu`), shared
+    // across tests on the same thread; each test calls `reset_fpu()` first to
+    // start from a clean FNINIT state.
+    use super::super::fpu::{reset_fpu, with_fpu, SW_C0, SW_C2, SW_C3};
+
+    #[test]
+    fn fld_fstp_round_trips_m32() {
+        reset_fpu();
+        // mov dword[0x1000]=3.5(f32 bits=0x40600000) ; fld dword[0x1000] ;
+        // fstp dword[0x1004]
+        let mut xb = harness(&[
+            0xD9, 0x05, 0x00, 0x10, 0x00, 0x00, // fld dword [0x1000]
+            0xD9, 0x1D, 0x04, 0x10, 0x00, 0x00, // fstp dword [0x1004]
+        ]);
+        let bits = 3.5f32.to_bits();
+        xb.mem.ram_write8(0x1000, bits & 0xFF);
+        xb.mem.ram_write8(0x1001, (bits >> 8) & 0xFF);
+        xb.mem.ram_write8(0x1002, (bits >> 16) & 0xFF);
+        xb.mem.ram_write8(0x1003, (bits >> 24) & 0xFF);
+        run(&mut xb, 2);
+        let out = xb.mem.ram_read8(0x1004)
+            | (xb.mem.ram_read8(0x1005) << 8)
+            | (xb.mem.ram_read8(0x1006) << 16)
+            | (xb.mem.ram_read8(0x1007) << 24);
+        assert_eq!(f32::from_bits(out), 3.5);
+    }
+
+    #[test]
+    fn fld_fstp_round_trips_m64() {
+        reset_fpu();
+        // fld qword[0x1000] ; fstp qword[0x1008]
+        let mut xb = harness(&[
+            0xDD, 0x05, 0x00, 0x10, 0x00, 0x00, // fld qword [0x1000]
+            0xDD, 0x1D, 0x08, 0x10, 0x00, 0x00, // fstp qword [0x1008]
+        ]);
+        let bits = 12.75f64.to_bits();
+        for i in 0..8u32 {
+            xb.mem.ram_write8(0x1000 + i, ((bits >> (i * 8)) & 0xFF) as u32);
+        }
+        run(&mut xb, 2);
+        let mut out = 0u64;
+        for i in 0..8u32 {
+            out |= (xb.mem.ram_read8(0x1008 + i) as u64) << (i * 8);
+        }
+        assert_eq!(f64::from_bits(out), 12.75);
+    }
+
+    #[test]
+    fn fadd_fmul_fdiv_m64() {
+        reset_fpu();
+        // fld qword[0x1000] (=10) ; fadd qword[0x1008] (=4) -> 14
+        // then fmul by 2 -> 28, fdiv by 7 -> 4
+        let mut xb = harness(&[
+            0xDD, 0x05, 0x00, 0x10, 0x00, 0x00, // fld qword [0x1000]
+            0xDC, 0x05, 0x08, 0x10, 0x00, 0x00, // fadd qword [0x1008]
+            0xDC, 0x0D, 0x10, 0x10, 0x00, 0x00, // fmul qword [0x1010]
+            0xDC, 0x35, 0x18, 0x10, 0x00, 0x00, // fdiv qword [0x1018]
+        ]);
+        let put = |xb: &mut Xbox, addr: u32, v: f64| {
+            let b = v.to_bits();
+            for i in 0..8u32 {
+                xb.mem.ram_write8(addr + i, ((b >> (i * 8)) & 0xFF) as u32);
+            }
+        };
+        put(&mut xb, 0x1000, 10.0);
+        put(&mut xb, 0x1008, 4.0);
+        put(&mut xb, 0x1010, 2.0);
+        put(&mut xb, 0x1018, 7.0);
+        run(&mut xb, 4);
+        let got = with_fpu(|f| f.st(0));
+        assert_eq!(got, 4.0, "(10+4)*2/7 = 4");
+    }
+
+    #[test]
+    fn fild_fistp_integer_round_trip() {
+        reset_fpu();
+        // fild dword[0x1000] (=42) ; fistp dword[0x1004]
+        let mut xb = harness(&[
+            0xDB, 0x05, 0x00, 0x10, 0x00, 0x00, // fild dword [0x1000]
+            0xDB, 0x1D, 0x04, 0x10, 0x00, 0x00, // fistp dword [0x1004]
+        ]);
+        xb.mem.ram_write8(0x1000, 42);
+        run(&mut xb, 2);
+        let out = xb.mem.ram_read8(0x1004)
+            | (xb.mem.ram_read8(0x1005) << 8)
+            | (xb.mem.ram_read8(0x1006) << 16)
+            | (xb.mem.ram_read8(0x1007) << 24);
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn fcom_fnstsw_sets_condition_bits() {
+        reset_fpu();
+        // Load 1.0 (less than mem 2.0): fld1 ; fcom qword[0x1000] ; fnstsw ax
+        // ST(0)=1.0 < 2.0 -> C0 set, C3 clear.
+        let mut xb = harness(&[
+            0xD9, 0xE8, // fld1
+            0xDC, 0x15, 0x00, 0x10, 0x00, 0x00, // fcom qword [0x1000]
+            0xDF, 0xE0, // fnstsw ax
+        ]);
+        let b = 2.0f64.to_bits();
+        for i in 0..8u32 {
+            xb.mem.ram_write8(0x1000 + i, ((b >> (i * 8)) & 0xFF) as u32);
+        }
+        run(&mut xb, 3);
+        let ax = xb.cpu.reg16(EAX) as u16;
+        assert_eq!(ax & SW_C0, SW_C0, "less -> C0 set");
+        assert_eq!(ax & SW_C3, 0, "less -> C3 clear");
+        assert_eq!(ax & SW_C2, 0, "ordered -> C2 clear");
+
+        // Equal case: fld1 ; fld1 ; fcompp ; fnstsw ax -> C3 set.
+        reset_fpu();
+        let mut xb = harness(&[
+            0xD9, 0xE8, // fld1
+            0xD9, 0xE8, // fld1
+            0xDE, 0xD9, // fcompp
+            0xDF, 0xE0, // fnstsw ax
+        ]);
+        run(&mut xb, 4);
+        let ax = xb.cpu.reg16(EAX) as u16;
+        assert_eq!(ax & SW_C3, SW_C3, "equal -> C3 set");
+        assert_eq!(ax & SW_C0, 0, "equal -> C0 clear");
+    }
+
+    #[test]
+    fn fcom_greater_clears_all() {
+        reset_fpu();
+        // fld qword[0x1000] (=5) ; fcom qword[0x1008] (=2) -> all C clear
+        let mut xb = harness(&[
+            0xDD, 0x05, 0x00, 0x10, 0x00, 0x00, // fld qword [0x1000]
+            0xDC, 0x15, 0x08, 0x10, 0x00, 0x00, // fcom qword [0x1008]
+            0xDF, 0xE0, // fnstsw ax
+        ]);
+        let put = |xb: &mut Xbox, addr: u32, v: f64| {
+            let b = v.to_bits();
+            for i in 0..8u32 {
+                xb.mem.ram_write8(addr + i, ((b >> (i * 8)) & 0xFF) as u32);
+            }
+        };
+        put(&mut xb, 0x1000, 5.0);
+        put(&mut xb, 0x1008, 2.0);
+        run(&mut xb, 3);
+        let ax = xb.cpu.reg16(EAX) as u16;
+        assert_eq!(ax & (SW_C0 | SW_C2 | SW_C3), 0, "greater -> C0=C2=C3=0");
+    }
+
+    #[test]
+    fn fldcw_fnstcw_round_trip() {
+        reset_fpu();
+        // mov [0x1000]=0x027F ; fldcw [0x1000] ; fnstcw [0x1004]
+        let mut xb = harness(&[
+            0xD9, 0x2D, 0x00, 0x10, 0x00, 0x00, // fldcw [0x1000]
+            0xD9, 0x3D, 0x04, 0x10, 0x00, 0x00, // fnstcw [0x1004]
+        ]);
+        xb.mem.ram_write8(0x1000, 0x7F);
+        xb.mem.ram_write8(0x1001, 0x02);
+        run(&mut xb, 2);
+        let cw = xb.mem.ram_read8(0x1004) | (xb.mem.ram_read8(0x1005) << 8);
+        assert_eq!(cw, 0x027F);
+        assert_eq!(with_fpu(|f| f.control_word()), 0x027F);
+    }
+
+    #[test]
+    fn fninit_resets_fpu() {
+        reset_fpu();
+        // Dirty the control word, push values, then FNINIT (DB E3).
+        with_fpu(|f| {
+            f.set_control_word(0x1234);
+            f.push(9.0);
+        });
+        let mut xb = harness(&[0xDB, 0xE3]); // fninit
+        run(&mut xb, 1);
+        assert_eq!(with_fpu(|f| f.control_word()), super::super::fpu::CW_DEFAULT);
+        assert_eq!(with_fpu(|f| f.tag_word()), 0xFFFF, "stack empty");
+    }
+
+    #[test]
+    fn fxch_swaps_top() {
+        reset_fpu();
+        // fld1 (ST0=1) ; fldz (ST0=0,ST1=1) ; fxch ST(1) -> ST0=1
+        let mut xb = harness(&[
+            0xD9, 0xE8, // fld1
+            0xD9, 0xEE, // fldz
+            0xD9, 0xC9, // fxch st(1)
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(with_fpu(|f| f.st(0)), 1.0);
+        assert_eq!(with_fpu(|f| f.st(1)), 0.0);
+    }
+
+    #[test]
+    fn faddp_pops_and_adds() {
+        reset_fpu();
+        // fld1 ; fld1 ; faddp st(1),st0 -> ST0 = 2, stack depth 1
+        let mut xb = harness(&[
+            0xD9, 0xE8, // fld1
+            0xD9, 0xE8, // fld1
+            0xDE, 0xC1, // faddp st(1),st  (DE C1)
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(with_fpu(|f| f.st(0)), 2.0);
+    }
+
+    #[test]
+    fn fsqrt_and_fabs_fchs() {
+        reset_fpu();
+        // fld qword[0x1000] (=9) ; fsqrt -> 3 ; fchs -> -3 ; fabs -> 3
+        let mut xb = harness(&[
+            0xDD, 0x05, 0x00, 0x10, 0x00, 0x00, // fld qword [0x1000]
+            0xD9, 0xFA, // fsqrt
+            0xD9, 0xE0, // fchs
+            0xD9, 0xE1, // fabs
+        ]);
+        let b = 9.0f64.to_bits();
+        for i in 0..8u32 {
+            xb.mem.ram_write8(0x1000 + i, ((b >> (i * 8)) & 0xFF) as u32);
+        }
+        run(&mut xb, 4);
+        assert_eq!(with_fpu(|f| f.st(0)), 3.0);
+    }
+
+    #[test]
+    fn fcom_fnstsw_sahf_branch() {
+        reset_fpu();
+        // The real game idiom: fld1 ; fcom mem(=2) ; fnstsw ax ; sahf ; jb +5.
+        // 1.0 < 2.0 -> C0 set -> CF set after SAHF -> JB taken (skip the mov).
+        let mut xb = harness(&[
+            0xD9, 0xE8, // fld1
+            0xDC, 0x15, 0x00, 0x10, 0x00, 0x00, // fcom qword [0x1000]
+            0xDF, 0xE0, // fnstsw ax
+            0x9E, // sahf
+            0x72, 0x05, // jb +5
+            0xB8, 0xAA, 0x00, 0x00, 0x00, // mov eax,0xAA (should be skipped)
+        ]);
+        let b = 2.0f64.to_bits();
+        for i in 0..8u32 {
+            xb.mem.ram_write8(0x1000 + i, ((b >> (i * 8)) & 0xFF) as u32);
+        }
+        // Note: FNSTSW writes AX; SAHF then loads AH into flags. AH holds the
+        // status word's high byte, where C0 lives at bit 0 of that byte (bit 8
+        // of the word) -> maps to CF. Step through fld1/fcom/fnstsw/sahf and
+        // verify CF; then step the JB and confirm the mov was skipped.
+        run(&mut xb, 4);
+        assert!(xb.cpu.flag(CF), "C0 -> CF via SAHF");
+        run(&mut xb, 1); // jb +5 — taken
+        assert_ne!(xb.cpu.reg32(EAX) & 0xFF, 0xAA, "JB taken, mov skipped");
     }
 
     #[test]
