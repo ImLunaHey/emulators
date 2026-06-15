@@ -823,6 +823,7 @@ const ORD_NT_READ_FILE: u32 = 219;
 const ORD_NT_CLOSE: u32 = 187;
 const ORD_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 218;
 const ORD_EX_QUERY_NON_VOLATILE_SETTING: u32 = 24;
+const ORD_RTL_EQUAL_STRING: u32 = 279;
 const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
 const ORD_KE_INITIALIZE_INTERRUPT: u32 = 109;
 const ORD_KE_CONNECT_INTERRUPT: u32 = 98;
@@ -856,6 +857,8 @@ fn nonvolatile_value(index: u32) -> u32 {
 const SAFE_NOOP: &[u32] = &[
     47,  // HalRegisterShutdownNotification
     113, // KeInitializeTimerEx
+    67,  // IoCreateSymbolicLink (drive-letter mount — accept)
+    69,  // IoDeleteSymbolicLink
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
     100, // KeDisconnectInterrupt
@@ -1195,6 +1198,34 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
             Dispatch::Handled("NtQueryVolumeInformationFile")
+        }
+
+        // BOOLEAN RtlEqualString(PSTRING S1, PSTRING S2, BOOLEAN CaseInsensitive).
+        // STRING = { USHORT Length; USHORT MaximumLength; PCHAR Buffer }.
+        ORD_RTL_EQUAL_STRING => {
+            let s1 = arg(cpu, mem, 0);
+            let s2 = arg(cpu, mem, 1);
+            let ci = arg(cpu, mem, 2) != 0;
+            let read = |p: u32| -> (u32, u32) {
+                (mem.ram_read16(p) & 0xFFFF, mem.ram_read32(p.wrapping_add(4)))
+            };
+            let (l1, b1) = read(s1);
+            let (l2, b2) = read(s2);
+            let equal = if l1 != l2 {
+                false
+            } else {
+                (0..l1).all(|i| {
+                    let mut c1 = mem.ram_read8(b1.wrapping_add(i)) as u8;
+                    let mut c2 = mem.ram_read8(b2.wrapping_add(i)) as u8;
+                    if ci {
+                        c1 = c1.to_ascii_uppercase();
+                        c2 = c2.to_ascii_uppercase();
+                    }
+                    c1 == c2
+                })
+            };
+            stdcall_return(cpu, mem, equal as u32, 12);
+            Dispatch::Handled("RtlEqualString")
         }
 
         // ---- Reboot / firmware ----
