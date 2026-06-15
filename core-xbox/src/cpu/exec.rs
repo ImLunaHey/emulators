@@ -2836,8 +2836,35 @@ impl Cpu {
                 }),
                 _ => self.fpu_ud(start_eip, op),
             },
-            // DA: FCMOVcc (rare) — leave as #UD beyond what we model.
-            0xDA => self.fpu_ud(start_eip, op),
+            // DA: FCMOVcc (conditional move on integer EFLAGS) + FUCOMPP.
+            0xDA => {
+                let cond = match reg {
+                    0 => self.flag(CF),                  // FCMOVB  (below)
+                    1 => self.flag(ZF),                  // FCMOVE  (equal)
+                    2 => self.flag(CF) || self.flag(ZF), // FCMOVBE
+                    3 => self.flag(PF),                  // FCMOVU  (unordered)
+                    5 if rm == 1 => {
+                        // FUCOMPP (DA E9): compare ST(0),ST(1); pop twice.
+                        with_fpu(|f| {
+                            let (a, b) = (f.st(0), f.st(1));
+                            f.set_compare(a, b);
+                            f.pop();
+                            f.pop();
+                        });
+                        return;
+                    }
+                    _ => {
+                        self.fpu_ud(start_eip, op);
+                        return;
+                    }
+                };
+                if cond {
+                    with_fpu(|f| {
+                        let v = f.st(i);
+                        f.set_st(0, v);
+                    });
+                }
+            }
             // DB: FNINIT / FNCLEX / FUCOMI etc.
             0xDB => match (reg, rm) {
                 (4, 2) => with_fpu(|f| f.clear_exceptions()), // FNCLEX
