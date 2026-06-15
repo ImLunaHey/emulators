@@ -52,6 +52,9 @@ pub mod gpu;
 // --- Crash screen (rendered when the CPU storms exceptions).
 pub mod crash;
 
+// --- XISO / XDVDFS disc parsing (mount + identify a game disc).
+pub mod xiso;
+
 // --- Top-level orchestrator (the god-struct + Bus impl).
 pub mod xbox;
 

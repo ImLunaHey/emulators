@@ -28,6 +28,13 @@ pub struct Xbox {
     /// Set once we've painted the crash screen for the current fault, so we don't
     /// rebuild it every frame.
     crash_shown: bool,
+
+    /// A mounted game disc, if [`Xbox::load_rom`] was given an XDVDFS image. When
+    /// present, [`Xbox::run_frame`] shows a "disc mounted" info screen instead of
+    /// stepping the CPU (the foundation can't boot the game, but it can identify
+    /// it — see [`crate::xiso`]).
+    disc: Option<crate::xiso::DiscInfo>,
+    disc_shown: bool,
 }
 
 impl Default for Xbox {
@@ -45,6 +52,8 @@ impl Xbox {
             frames: 0,
             keys: 0,
             crash_shown: false,
+            disc: None,
+            disc_shown: false,
         }
     }
 
@@ -57,12 +66,15 @@ impl Xbox {
         self.reset();
     }
 
-    /// Load a game image (an Xbox XBE/XISO). No loader exists yet — the bytes are
-    /// dropped — so this is a seam that keeps the host wiring identical to the
-    /// other cores. A real implementation parses the XBE/mounts the XISO and
-    /// hands control to the kernel.
-    pub fn load_rom(&mut self, _bytes: Vec<u8>) {
-        // TODO: XBE parser / XISO mount + kernel handoff.
+    /// Load a game image. If it's an XDVDFS (Xbox) disc, mount it and identify
+    /// the title — [`Xbox::run_frame`] then shows a "disc mounted" info screen.
+    /// (Actually *booting* the game needs the kernel/NV2A layers the foundation
+    /// doesn't have; this proves the disc loader works on a full-size image.)
+    pub fn load_rom(&mut self, bytes: Vec<u8>) {
+        self.disc = crate::xiso::probe(&bytes);
+        self.disc_shown = false;
+        // (bytes drop here; the foundation only needs the parsed header. A real
+        // loader would keep the image mapped for the filesystem/DVD emulation.)
     }
 
     /// Reset the CPU to the x86 reset vector.
@@ -123,6 +135,20 @@ impl Xbox {
     /// panicking, exactly like the other cores' first phase.
     pub fn run_frame(&mut self) {
         let _ = Self::CYCLES_PER_FRAME; // documented budget; not yet cycle-accurate
+
+        // A mounted disc takes priority: identify it on screen. The foundation
+        // can't boot it, so there's no CPU to step here.
+        if self.disc.is_some() {
+            if !self.disc_shown {
+                let lines = disc_lines(self.disc.as_ref().unwrap());
+                crash::render(&mut self.gpu, &lines);
+                self.disc_shown = true;
+            }
+            self.gpu.frames = self.gpu.frames.wrapping_add(1);
+            self.frames = self.frames.wrapping_add(1);
+            return;
+        }
+
         if self.cpu.fault.is_none() {
             for _ in 0..Self::STEP_BUDGET {
                 if self.cpu.fault.is_some() || self.cpu.halted {
@@ -198,6 +224,27 @@ fn crash_lines(fault: &crate::cpu::Fault) -> Vec<String> {
         format!("CS-EIP {:04X}-{:08X}", fault.cs, fault.eip),
         format!("OPCODE {:02X}", fault.opcode),
         "FOUNDATION CORE - NO BIOS HLE".to_string(),
+    ]
+}
+
+/// Build the "disc mounted" info screen text from a parsed disc.
+fn disc_lines(d: &crate::xiso::DiscInfo) -> Vec<String> {
+    let title = if d.title.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        d.title.to_uppercase()
+    };
+    vec![
+        "XBOX DISC MOUNTED".to_string(),
+        format!("TITLE  {}", title),
+        format!(
+            "ID     {} {}",
+            d.publisher().to_uppercase(),
+            d.game_number()
+        ),
+        format!("ENTRY  {:08X} {}", d.entry, d.entry_key.to_uppercase()),
+        format!("FILES  {}", d.files.len()),
+        "NO EXECUTION - FOUNDATION CORE".to_string(),
     ]
 }
 
