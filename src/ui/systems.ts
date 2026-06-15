@@ -31,6 +31,36 @@ export const SYSTEM_LABEL: Record<SystemId, string> = {
   snes: 'SNES', n64: 'N64', gg: 'GG', sms: 'SMS', genesis: 'GEN', ps1: 'PS1', xbox: 'XBOX',
 };
 
+// Per-console display metadata for the launcher's console grid. `accent` is the
+// tile's signature color (a hex string used for the gradient + glow); `tagline`
+// is a short descriptor shown under the name. The key order here also defines
+// the order consoles appear on the home screen.
+export interface SystemPresentation {
+  accent: string;
+  tagline: string;
+}
+export const SYSTEM_PRESENTATION: Record<SystemId, SystemPresentation> = {
+  gba: { accent: '#7c5cff', tagline: 'Game Boy Advance' },
+  nds: { accent: '#e0e0e6', tagline: 'Nintendo DS' },
+  gb: { accent: '#9bbc0f', tagline: 'Game Boy' },
+  gbc: { accent: '#ff5fa2', tagline: 'Game Boy Color' },
+  nes: { accent: '#e4000f', tagline: 'Nintendo' },
+  snes: { accent: '#6f4fd8', tagline: 'Super Nintendo' },
+  n64: { accent: '#2cb84e', tagline: 'Nintendo 64' },
+  gg: { accent: '#1f7ae0', tagline: 'Game Gear' },
+  sms: { accent: '#e07b1f', tagline: 'Master System' },
+  genesis: { accent: '#3a6df0', tagline: 'Sega Genesis' },
+  ps1: { accent: '#c9c9d4', tagline: 'PlayStation' },
+  xbox: { accent: '#9cd530', tagline: 'Xbox' },
+};
+
+/** Every system id, in the canonical home-screen display order. */
+export const ALL_SYSTEMS: readonly SystemId[] = Object.keys(SYSTEM_PRESENTATION) as SystemId[];
+
+export function systemPresentation(id: string): SystemPresentation {
+  return SYSTEM_PRESENTATION[id as SystemId] ?? { accent: '#5fd0ff', tagline: systemLabel(id) };
+}
+
 // Systems with a working core. Everything else is addable but "coming soon".
 // Xbox is a foundation core: it boots a supplied BIOS far enough to single-step
 // x86 and shows a diagnostic crash screen, but does not run commercial games yet.

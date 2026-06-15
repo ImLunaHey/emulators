@@ -1,206 +1,114 @@
-import { useEffect, useRef, useState } from 'react';
-import { WasmHome } from '../../core/pkg/gba_core.js';
-import { useEmu } from './EmuContext';
-import { listRoms, deleteRom, type RomMeta } from './romStore';
+import { useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { useRomList } from './hooks/useRomList';
+import { deleteRom, setSelectedRom, type RomMeta } from './romStore';
 import { ingestFiles } from './romIngest';
-import { systemLabel, isPlayable, ACCEPT } from './systems';
-import { usePersistedBool } from './usePersistedState';
+import { ACCEPT, ALL_SYSTEMS, type SystemId } from './systems';
 import { useToast } from './Toast';
+import { ConsoleGrid } from './ConsoleGrid';
+import { ConsoleShelf } from './ConsoleShelf';
 
-// The console home launcher — the home screen is *rendered by the Rust core*
-// (core/src/home.rs → WasmHome). This component is the thin host shell: it
-// blits the launcher's framebuffer to a canvas, feeds it input, owns storage
-// (the IndexedDB game list + the add-game file dialog), and reports the chosen
-// game back up so App can swap to the player.
-
-// Active-high, GBA-layout button bits the Rust home screen reads.
-const K_A = 1 << 0;
-const K_B = 1 << 1;
-const K_SELECT = 1 << 2;
-const K_RIGHT = 1 << 4;
-const K_LEFT = 1 << 5;
-const K_UP = 1 << 6;
-const K_DOWN = 1 << 7;
+// The launcher home screen — a console-first, two-level browser:
+//   Level 1: a grid of every console (ConsoleGrid) with per-system game counts.
+//   Level 2: one console's library (ConsoleShelf), filtered to that system.
+// Selecting a game calls onPlay(romId, system) — the contract App relies on to
+// swap in the right player core. The add-ROM file dialog stays reachable from
+// both levels and via drag-and-drop anywhere on the page.
 
 export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string) => void }) {
-  const { emu } = useEmu();
   const toast = useToast();
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const qc = useQueryClient();
+  const { data: roms = [] } = useRomList();
   const fileRef = useRef<HTMLInputElement>(null);
-  const homeRef = useRef<WasmHome | null>(null);
-  const keysRef = useRef(0);
-  const romsRef = useRef<RomMeta[]>([]);
-  const [ready, setReady] = useState(false);
-  const [crisp, setCrisp] = usePersistedBool('settings:crispPixels', true);
+  const [active, setActive] = useState<SystemId | null>(null);
+  const [dragging, setDragging] = useState(false);
 
-  // Route a launcher "play:<id>" to App with the game's system so it picks the
-  // right core (GBA vs NDS).
-  const play = (id: string) => onPlay(id, romsRef.current.find((r) => r.id === id)?.system ?? 'gba');
+  // Game counts per system, for the console tiles.
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const r of roms) c[r.system] = (c[r.system] ?? 0) + 1;
+    return c;
+  }, [roms]);
 
-  // Push the installed-game list into the launcher (id + display title).
-  const refresh = async () => {
-    const roms = await listRoms();
-    romsRef.current = roms;
-    const home = homeRef.current;
-    if (!home) return;
-    // Push embedded icons (NDS banners) first — they're keyed by id and read
-    // during the set_games render.
-    for (const r of roms) {
-      if (r.icon && r.icon.length === 32 * 32 * 4) home.set_icon(r.id, r.icon);
-    }
-    const ids = roms.map((r) => r.id).join('\n');
-    const titles = roms.map((r) => r.title || r.filename || 'Untitled').join('\n');
-    const systems = roms.map((r) => systemLabel(r.system)).join('\n');
-    const playables = roms.map((r) => (isPlayable(r.system) ? '1' : '0')).join('\n');
-    home.set_games(ids, titles, systems, playables);
+  // Total library size — drives the global empty state vs. the grid.
+  const total = roms.length;
+
+  // Games for the open console (level 2).
+  const shelfRoms = useMemo(
+    () => (active ? roms.filter((r) => r.system === active) : []),
+    [roms, active],
+  );
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ['rom-list'] });
+
+  const launch = (rom: RomMeta) => {
+    setSelectedRom(rom.id);
+    onPlay(rom.id, rom.system);
   };
-
-  // Keyboard → button mask.
-  useEffect(() => {
-    const map: Record<string, number> = {
-      ArrowRight: K_RIGHT, ArrowLeft: K_LEFT, ArrowUp: K_UP, ArrowDown: K_DOWN,
-      Enter: K_A, ' ': K_A, z: K_A, Z: K_A,
-      Tab: K_SELECT, x: K_B, X: K_B,
-    };
-    const down = (e: KeyboardEvent) => { const b = map[e.key]; if (b) { e.preventDefault(); keysRef.current |= b; } };
-    const up = (e: KeyboardEvent) => { const b = map[e.key]; if (b) keysRef.current &= ~b; };
-    window.addEventListener('keydown', down);
-    window.addEventListener('keyup', up);
-    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); };
-  }, []);
-
-  // Build the launcher once wasm is ready, then run the render/input loop.
-  useEffect(() => {
-    let raf = 0;
-    let alive = true;
-    emu.ready.then(async () => {
-      if (!alive) return;
-      const home = new WasmHome();
-      homeRef.current = home;
-      home.set_crisp(crisp);
-      await refresh();
-      setReady(true);
-
-      const canvas = canvasRef.current!;
-      const w = home.width();
-      const h = home.height();
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d')!;
-
-      const loop = () => {
-        if (!alive) return;
-        const mask = keysRef.current | readGamepad();
-        const action = home.run_frame(mask);
-        ctx.putImageData(new ImageData(new Uint8ClampedArray(home.framebuffer()), w, h), 0, 0);
-        if (action.startsWith('play:')) {
-          play(action.slice(5));
-          return; // stop the loop; App unmounts us
-        }
-        handleAction(action);
-        raf = requestAnimationFrame(loop);
-      };
-      raf = requestAnimationFrame(loop);
-    });
-    return () => {
-      alive = false;
-      cancelAnimationFrame(raf);
-      homeRef.current?.free();
-      homeRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const onAddFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const res = await ingestFiles(files);
     if (res.added) toast.success(`Added ${res.added} game${res.added === 1 ? '' : 's'}`);
     if (res.failed) toast.error(`${res.failed} import${res.failed === 1 ? '' : 's'} failed`);
-    if (!res.added && !res.failed) toast.error('No .gba ROMs found in selection');
-    await refresh();
+    if (!res.added && !res.failed) toast.error('No recognized ROMs in selection');
+    refresh();
   };
 
-  // Tap a tile on the canvas → select + launch (or open the + dialog).
-  const onCanvasPointer = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const home = homeRef.current;
-    const canvas = canvasRef.current;
-    if (!home || !canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = Math.floor(((e.clientX - rect.left) / rect.width) * home.width());
-    const y = Math.floor(((e.clientY - rect.top) / rect.height) * home.height());
-    const action = home.pointer(x, y);
-    if (action.startsWith('play:')) play(action.slice(5));
-    else handleAction(action);
+  const onDelete = async (rom: RomMeta, displayName: string) => {
+    if (!confirm(`Remove "${displayName}" from your library?`)) return;
+    await deleteRom(rom.id);
+    toast.info(`Removed ${displayName}`);
+    refresh();
   };
 
-  // Mouse wheel scrolls the game grid.
-  const onCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    const home = homeRef.current;
-    const canvas = canvasRef.current;
-    if (!home || !canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    home.scroll_by(Math.round((e.deltaY / rect.height) * home.height()));
-  };
-
-  // Non-play launcher actions (add / coming-soon toast / Rust settings).
-  const handleAction = (action: string) => {
-    if (action === 'add') fileRef.current?.click();
-    else if (action.startsWith('soon:')) toast.info(`${action.slice(5)} — coming soon`);
-    else if (action === 'crisp:1') setCrisp(true);
-    else if (action === 'crisp:0') setCrisp(false);
-    else if (action === 'clearall') clearAllGames();
-  };
-
-  const clearAllGames = async () => {
-    const roms = await listRoms();
-    for (const r of roms) await deleteRom(r.id);
-    await refresh();
-    toast.info(`Removed ${roms.length} game${roms.length === 1 ? '' : 's'}`);
-  };
-
-  // On-screen control: hold a button to set its bit (Rust edge-detects it).
-  const hold = (bit: number) => ({
-    onPointerDown: (e: React.PointerEvent) => { e.preventDefault(); keysRef.current |= bit; },
-    onPointerUp: () => { keysRef.current &= ~bit; },
-    onPointerLeave: () => { keysRef.current &= ~bit; },
-    onPointerCancel: () => { keysRef.current &= ~bit; },
-  });
-
-  const dpadBtn = 'w-11 h-11 grid place-items-center rounded-lg bg-[var(--color-accent-deep)] text-[var(--color-accent)] text-lg select-none active:brightness-150';
+  const openPicker = () => fileRef.current?.click();
 
   return (
     <div
-      className="relative w-full min-h-screen flex flex-col items-center justify-center gap-4 p-4"
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={(e) => { e.preventDefault(); onAddFiles(e.dataTransfer.files); }}
+      className="relative w-full max-w-[1100px] mx-auto px-3 sm:px-5 py-4"
+      onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
+      onDrop={(e) => { e.preventDefault(); setDragging(false); onAddFiles(e.dataTransfer.files); }}
     >
-      <canvas
-        ref={canvasRef}
-        onPointerDown={onCanvasPointer}
-        onWheel={onCanvasWheel}
-        className="w-full max-w-[960px] aspect-[3/2] rounded-lg shadow-lg cursor-pointer touch-none"
-        style={{ imageRendering: crisp ? 'pixelated' : 'auto' }}
-      />
-      {!ready && <div className="absolute text-xs opacity-50">loading…</div>}
+      {active === null ? (
+        <>
+          <header className="flex items-end justify-between gap-3 mb-6">
+            <div>
+              <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Library</h1>
+              <p className="text-xs text-[var(--color-muted)] mt-1">
+                {total === 0
+                  ? 'Pick a console to get started, or drop a ROM anywhere.'
+                  : `${total} game${total === 1 ? '' : 's'} across ${
+                      ALL_SYSTEMS.filter((s) => (counts[s] ?? 0) > 0).length
+                    } console${ALL_SYSTEMS.filter((s) => (counts[s] ?? 0) > 0).length === 1 ? '' : 's'} · choose a console`}
+              </p>
+            </div>
+            <button type="button" onClick={openPicker} className="btn btn-primary shrink-0">+ Add ROM</button>
+          </header>
 
-      {/* On-screen controls (touch / no-keyboard). */}
-      <div className="flex items-center gap-6 select-none">
-        <div className="grid grid-cols-3 grid-rows-3 gap-1 w-[140px]">
-          <span />
-          <button aria-label="Up" className={dpadBtn} {...hold(K_UP)}>▲</button>
-          <span />
-          <button aria-label="Left" className={dpadBtn} {...hold(K_LEFT)}>◀</button>
-          <span />
-          <button aria-label="Right" className={dpadBtn} {...hold(K_RIGHT)}>▶</button>
-          <span />
-          <button aria-label="Down" className={dpadBtn} {...hold(K_DOWN)}>▼</button>
-          <span />
+          <ConsoleGrid counts={counts} onSelect={setActive} />
+        </>
+      ) : (
+        <ConsoleShelf
+          system={active}
+          roms={shelfRoms}
+          onBack={() => setActive(null)}
+          onPlay={launch}
+          onDelete={onDelete}
+          onAdd={openPicker}
+        />
+      )}
+
+      {/* Drag-and-drop overlay — appears while a file is dragged over the page. */}
+      {dragging && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm pointer-events-none">
+          <div className="px-6 py-4 rounded-xl border-2 border-dashed border-[var(--color-accent-strong)]
+                          bg-[var(--color-elevated)] text-sm font-medium">
+            Drop ROMs to add them to your library
+          </div>
         </div>
-        <div className="flex flex-col gap-2">
-          <button className="btn btn-primary !px-5" {...hold(K_A)}>Open</button>
-          <button className="btn !px-5" onClick={() => fileRef.current?.click()}>+ Add</button>
-        </div>
-      </div>
+      )}
 
       <input
         ref={fileRef}
@@ -212,25 +120,4 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
       />
     </div>
   );
-}
-
-// Standard-mapping gamepad → the same button mask (d-pad + A).
-function readGamepad(): number {
-  const pads = navigator.getGamepads?.() ?? [];
-  let mask = 0;
-  for (const p of pads) {
-    if (!p) continue;
-    const b = p.buttons;
-    if (b[12]?.pressed) mask |= K_UP;
-    if (b[13]?.pressed) mask |= K_DOWN;
-    if (b[14]?.pressed) mask |= K_LEFT;
-    if (b[15]?.pressed) mask |= K_RIGHT;
-    if (b[0]?.pressed) mask |= K_A;
-    const ax = p.axes;
-    if (ax[0] < -0.5) mask |= K_LEFT;
-    if (ax[0] > 0.5) mask |= K_RIGHT;
-    if (ax[1] < -0.5) mask |= K_UP;
-    if (ax[1] > 0.5) mask |= K_DOWN;
-  }
-  return mask;
 }
