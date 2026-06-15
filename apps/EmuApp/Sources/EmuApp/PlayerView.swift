@@ -26,7 +26,14 @@ struct PlayerWindow: View {
             hub.title = "Couldn't read \(url.lastPathComponent)"
             return
         }
-        if let b = bios.data(for: request.system) { hub.setBios(b, for: request.system) }
+        // Prefer an already-loaded BIOS; otherwise a --bios/EMU_BIOS path.
+        if let b = bios.data(for: request.system) {
+            hub.setBios(b, for: request.system)
+        } else if let bp = LaunchConfig.current.biosPath,
+                  let bd = try? Data(contentsOf: URL(fileURLWithPath: bp)) {
+            bios.set(bd, for: request.system)
+            hub.setBios(bd, for: request.system)
+        }
         hub.launch(system: request.system, rom: data, title: request.title)
     }
 }
