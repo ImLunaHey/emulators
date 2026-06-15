@@ -11,6 +11,14 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
     case gameGear = 5
     case gbc = 6
     case xbox = 7
+    case snes = 8
+    case genesis = 9
+    case pce = 10
+    case atari2600 = 11
+    case ngpc = 12
+    case wonderswan = 13
+    case virtualboy = 14
+    case n64 = 15
 
     var id: UInt32 { rawValue }
 
@@ -24,6 +32,14 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
         case .gameGear: return "Game Gear"
         case .gbc: return "GBC"
         case .xbox: return "Xbox"
+        case .snes: return "SNES"
+        case .genesis: return "Genesis"
+        case .pce: return "PC Engine"
+        case .atari2600: return "Atari 2600"
+        case .ngpc: return "NGPC"
+        case .wonderswan: return "WonderSwan"
+        case .virtualboy: return "Virtual Boy"
+        case .n64: return "N64"
         }
     }
 
@@ -37,6 +53,14 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
         case .gameGear: return "Sega Game Gear"
         case .gbc: return "Game Boy Color"
         case .xbox: return "Microsoft Xbox"
+        case .snes: return "Super Nintendo"
+        case .genesis: return "Sega Genesis / Mega Drive"
+        case .pce: return "PC Engine / TurboGrafx-16"
+        case .atari2600: return "Atari 2600 (VCS)"
+        case .ngpc: return "Neo Geo Pocket Color"
+        case .wonderswan: return "Bandai WonderSwan Color"
+        case .virtualboy: return "Nintendo Virtual Boy"
+        case .n64: return "Nintendo 64"
         }
     }
 
@@ -51,6 +75,38 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
         case .gameGear: return "#1f7ae0"
         case .gbc: return "#ff5fa2"
         case .xbox: return "#9cd530"
+        case .snes: return "#8b7fd4"
+        case .genesis: return "#1a6dd6"
+        case .pce: return "#f2a900"
+        case .atari2600: return "#b8531f"
+        case .ngpc: return "#2bb7c4"
+        case .wonderswan: return "#3aa856"
+        case .virtualboy: return "#d4233b"
+        case .n64: return "#2e9e4f"
+        }
+    }
+
+    /// SF Symbol used as the tile's console artwork (a representative icon — see
+    /// note in `ConsoleTile`; swap in real product photos by dropping PNGs into
+    /// the asset catalog and returning their name here).
+    var symbol: String {
+        switch self {
+        case .gba: return "gamecontroller.fill"
+        case .ps1: return "gamecontroller.fill"
+        case .nds: return "rectangle.split.1x2.fill"
+        case .nes: return "tv.fill"
+        case .sms: return "tv.fill"
+        case .gameGear: return "gamecontroller"
+        case .gbc: return "gamecontroller.fill"
+        case .xbox: return "gamecontroller.fill"
+        case .snes: return "gamecontroller.fill"
+        case .genesis: return "tv.fill"
+        case .pce: return "tv.fill"
+        case .atari2600: return "gamecontroller.fill"
+        case .ngpc: return "gamecontroller"
+        case .wonderswan: return "rectangle.portrait.fill"
+        case .virtualboy: return "eyes.inverse"
+        case .n64: return "gamecontroller.fill"
         }
     }
 
@@ -68,6 +124,14 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
         case .gameGear: return ["gg"]
         case .gbc: return ["gb", "gbc"]
         case .xbox: return ["xbe", "xiso"]
+        case .snes: return ["smc", "sfc"]
+        case .genesis: return ["md", "gen", "smd"]
+        case .pce: return ["pce"]
+        case .atari2600: return ["a26"]
+        case .ngpc: return ["ngc", "ngp"]
+        case .wonderswan: return ["ws", "wsc"]
+        case .virtualboy: return ["vb", "vboy"]
+        case .n64: return ["n64", "z64", "v64"]
         }
     }
 
@@ -100,7 +164,8 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
 
     /// All systems in canonical display order for the console grid.
     static var displayOrder: [EmuSystem] {
-        [.gba, .nds, .gbc, .nes, .sms, .gameGear, .ps1, .xbox]
+        [.gba, .nds, .gbc, .snes, .nes, .n64, .genesis, .sms, .gameGear,
+         .pce, .ps1, .xbox, .atari2600, .ngpc, .wonderswan, .virtualboy]
     }
 }
 
@@ -200,6 +265,111 @@ extension EmuSystem {
             m |= bit(.r1, 11)   // Black
             m |= bit(.l2, 12)   // Left trigger
             m |= bit(.r2, 13)   // Right trigger
+            return m
+        case .snes:
+            // B Y Select Start Up Down Left Right A X L R
+            var m: UInt32 = 0
+            m |= bit(.south, 0)  // B
+            m |= bit(.west, 1)   // Y
+            m |= bit(.select, 2)
+            m |= bit(.start, 3)
+            m |= bit(.up, 4)
+            m |= bit(.down, 5)
+            m |= bit(.left, 6)
+            m |= bit(.right, 7)
+            m |= bit(.east, 8)   // A
+            m |= bit(.north, 9)  // X
+            m |= bit(.l1, 10)
+            m |= bit(.r1, 11)
+            return m
+        case .genesis:
+            // Up Down Left Right A B C Start (+ X Y Z Mode for 6-button)
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.west, 4)   // A
+            m |= bit(.south, 5)  // B
+            m |= bit(.east, 6)   // C
+            m |= bit(.start, 7)
+            m |= bit(.l1, 8)     // X
+            m |= bit(.north, 9)  // Y
+            m |= bit(.r1, 10)    // Z
+            m |= bit(.select, 11) // Mode
+            return m
+        case .pce:
+            // Up Down Left Right I II Select Run
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.east, 4)   // I
+            m |= bit(.south, 5)  // II
+            m |= bit(.select, 6)
+            m |= bit(.start, 7)  // Run
+            return m
+        case .atari2600:
+            // Joystick + fire, plus console switches.
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.south, 4)  // Fire
+            m |= bit(.start, 5)  // Reset
+            m |= bit(.select, 6) // Select
+            return m
+        case .ngpc:
+            // D-pad + A B + Option.
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.south, 4)  // A
+            m |= bit(.east, 5)   // B
+            m |= bit(.start, 6)  // Option
+            return m
+        case .wonderswan:
+            // X-pad (used as the d-pad) + A B + Start.
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.east, 4)   // A
+            m |= bit(.south, 5)  // B
+            m |= bit(.start, 6)
+            return m
+        case .virtualboy:
+            // Right d-pad + A B + L/R triggers + Start/Select.
+            var m: UInt32 = 0
+            m |= bit(.up, 0)
+            m |= bit(.down, 1)
+            m |= bit(.left, 2)
+            m |= bit(.right, 3)
+            m |= bit(.east, 4)   // A
+            m |= bit(.south, 5)  // B
+            m |= bit(.l1, 6)
+            m |= bit(.r1, 7)
+            m |= bit(.start, 8)
+            m |= bit(.select, 9)
+            return m
+        case .n64:
+            // A B Z Start, d-pad, L R, C-buttons (mapped to face north/west).
+            var m: UInt32 = 0
+            m |= bit(.east, 0)   // A
+            m |= bit(.south, 1)  // B
+            m |= bit(.l2, 2)     // Z
+            m |= bit(.start, 3)
+            m |= bit(.up, 4)
+            m |= bit(.down, 5)
+            m |= bit(.left, 6)
+            m |= bit(.right, 7)
+            m |= bit(.l1, 8)     // L
+            m |= bit(.r1, 9)     // R
             return m
         }
     }

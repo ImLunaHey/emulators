@@ -37,7 +37,7 @@ struct ScreenView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ScreenNSView {
         let v = ScreenNSView()
-        hub.attach(layer: v.content)
+        hub.attach(layer: v.content, view: v)
         return v
     }
 

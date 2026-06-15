@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 /// window. ROMs can also be added globally (button or drag-and-drop); each is
 /// auto-routed to the right console by extension + content sniffing.
 struct LibraryView: View {
-    @EnvironmentObject var hub: EmuHub
+    @EnvironmentObject var bios: BiosStore
     @EnvironmentObject var library: Library
     @Environment(\.openWindow) private var openWindow
     @State private var selected: EmuSystem?
@@ -18,7 +18,7 @@ struct LibraryView: View {
         ZStack {
             Color(red: 0.05, green: 0.05, blue: 0.07).ignoresSafeArea()
             if let sys = selected {
-                ConsoleDetail(system: sys, onBack: { selected = nil }, launch: launch, pickBios: pickBios)
+                ConsoleDetail(system: sys, onBack: { selected = nil }, launch: launchURL, pickBios: pickBios)
             } else {
                 ConsoleGrid(select: { selected = $0 }, onAdd: addROMs, status: status)
             }
@@ -33,7 +33,10 @@ struct LibraryView: View {
         .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
         }
-        .onAppear { DispatchQueue.main.async { autoloadFromEnv() } }
+        .onAppear {
+            library.seedDefaults()
+            DispatchQueue.main.async { autoloadFromEnv() }
+        }
     }
 
     /// Debug hook: auto-launch a ROM at startup via EMU_AUTOLOAD (+ optional
@@ -49,29 +52,37 @@ struct LibraryView: View {
             system = Self.resolveSystem(url)
         }
         guard let sys = system,
-              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return }
-        hub.launch(system: sys, rom: data, title: url.deletingPathExtension().lastPathComponent)
-        openWindow(id: "player")
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        openWindow(value: LaunchRequest(
+            system: sys, path: url.path,
+            title: url.deletingPathExtension().lastPathComponent))
     }
 
     // ---- actions ----
-    private func launch(_ url: URL, _ declared: EmuSystem) {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return }
-        let system = EmuSystem.sniff(data, fallback: declared) ?? declared
-        let title = url.deletingPathExtension().lastPathComponent
-        hub.launch(system: system, rom: data, title: title)
+    /// Open a game in its own player window (a new window each call — several
+    /// can run at once). The player window loads the bytes itself.
+    private func launchURL(_ url: URL, _ declared: EmuSystem) {
+        // Sniff the head to disambiguate ambiguous discs (e.g. Xbox .iso).
+        let system: EmuSystem
+        if let head = try? Data(contentsOf: url, options: .mappedIfSafe) {
+            system = EmuSystem.sniff(head, fallback: declared) ?? declared
+        } else {
+            system = declared
+        }
         library.add(url, system: system)
-        openWindow(id: "player")
+        openWindow(value: LaunchRequest(
+            system: system, path: url.path,
+            title: url.deletingPathExtension().lastPathComponent))
     }
 
     private func openROM(for system: EmuSystem) {
         guard let url = Self.pickFile() else { return }
-        launch(url, system)
+        launchURL(url, system)
     }
 
     private func pickBios(for system: EmuSystem) {
         guard let url = Self.pickFile(), let data = try? Data(contentsOf: url) else { return }
-        hub.setBios(data, for: system)
+        bios.set(data, for: system)
     }
 
     // ---- global add (auto-route to the right console) ----
@@ -223,7 +234,19 @@ private struct ConsoleTile: View {
                     startPoint: .topLeading, endPoint: .bottomTrailing
                 )
             )
+            // Console artwork: a large, faded system glyph watermark in the
+            // corner. (SF Symbol stand-in — drop a real product photo into an
+            // asset catalog and switch to Image(system.assetName) to upgrade.)
+            .overlay(alignment: .bottomTrailing) {
+                Image(systemName: system.symbol)
+                    .font(.system(size: 52, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.22))
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 36)
+                    .allowsHitTesting(false)
+            }
             .cornerRadius(16)
+            .clipped()
             .overlay(
                 RoundedRectangle(cornerRadius: 16)
                     .stroke(.white.opacity(hover ? 0.5 : 0.12), lineWidth: 1)
@@ -240,7 +263,7 @@ private struct ConsoleTile: View {
 // MARK: - Console detail (level 2)
 
 private struct ConsoleDetail: View {
-    @EnvironmentObject var hub: EmuHub
+    @EnvironmentObject var bios: BiosStore
     @EnvironmentObject var library: Library
     let system: EmuSystem
     let onBack: () -> Void
@@ -279,7 +302,7 @@ private struct ConsoleDetail: View {
                 }
                 if system.needsBios {
                     Button { pickBios(system) } label: {
-                        Label(hub.hasBios(system) ? "BIOS loaded ✓" : "Load BIOS…",
+                        Label(bios.has(system) ? "BIOS loaded ✓" : "Load BIOS…",
                               systemImage: "memorychip")
                     }
                 }
@@ -288,7 +311,7 @@ private struct ConsoleDetail: View {
             .padding(.horizontal, 28)
             .padding(.vertical, 16)
 
-            if system.needsBios && !hub.hasBios(system) {
+            if system.needsBios && !bios.has(system) {
                 Text(system == .xbox
                      ? "Tip: a flash BIOS isn't required just to mount a disc and read its title."
                      : "This system needs a BIOS to boot.")

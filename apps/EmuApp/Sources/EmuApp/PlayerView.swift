@@ -1,8 +1,39 @@
+import AppKit
 import SwiftUI
 
-/// The "Player" window: the live game screen plus a thin status bar. The render
-/// loop in `EmuHub` writes frames straight into the screen layer, so this view
-/// only reacts to play/stop and metadata changes.
+/// Hosts one game in its own window: owns a private `EmuHub` (render loop +
+/// session) and loads the ROM named by the `LaunchRequest`. Input is gated on
+/// window focus inside the hub, so the keyboard/controller only drives the
+/// frontmost game when several are open at once.
+struct PlayerWindow: View {
+    let request: LaunchRequest?
+    @EnvironmentObject var bios: BiosStore
+    @StateObject private var hub = EmuHub()
+    @State private var launched = false
+
+    var body: some View {
+        PlayerView()
+            .environmentObject(hub)
+            .onAppear { launchIfNeeded() }
+            .onDisappear { hub.stop() }
+    }
+
+    private func launchIfNeeded() {
+        guard !launched, let request else { return }
+        launched = true
+        let url = URL(fileURLWithPath: request.path)
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            hub.title = "Couldn't read \(url.lastPathComponent)"
+            return
+        }
+        if let b = bios.data(for: request.system) { hub.setBios(b, for: request.system) }
+        hub.launch(system: request.system, rom: data, title: request.title)
+    }
+}
+
+/// The game screen plus a thin status bar. The render loop in `EmuHub` writes
+/// frames straight into the screen layer, so this view only reacts to play/stop
+/// and metadata changes.
 struct PlayerView: View {
     @EnvironmentObject var hub: EmuHub
 

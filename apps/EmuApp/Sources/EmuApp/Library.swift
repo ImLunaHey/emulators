@@ -26,6 +26,24 @@ final class Library: ObservableObject {
         save()
     }
 
+    /// One-time: pre-populate the Xbox shelf with the Halo discs if they're on
+    /// disk, so they show up in the launcher without a manual add.
+    func seedDefaults() {
+        let defaults = UserDefaults.standard
+        let flag = "seeded.halo.v1"
+        guard !defaults.bool(forKey: flag) else { return }
+        let candidates = [
+            "/Users/luna/Downloads/Halo - Combat Evolved (USA).xiso.iso",
+            "/Users/luna/Downloads/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko)/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko).xiso.iso",
+        ]
+        var seededAny = false
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            add(URL(fileURLWithPath: path), system: .xbox)
+            seededAny = true
+        }
+        if seededAny { defaults.set(true, forKey: flag) }
+    }
+
     private func save() {
         var dict: [String: [String]] = [:]
         for (sys, urls) in recentsBySystem { dict[String(sys.rawValue)] = urls.map(\.path) }

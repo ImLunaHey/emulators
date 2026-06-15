@@ -26,7 +26,20 @@ final class EmuHub: ObservableObject {
     private var bios: [EmuSystem: Data] = [:]
 
     // ---- screen wiring ----
-    func attach(layer: CALayer) { screenLayer = layer }
+    /// The view hosting our screen layer; used to tell whether this window is the
+    /// key window (so only the focused game consumes input when several run).
+    private weak var hostView: NSView?
+    func attach(layer: CALayer, view: NSView) {
+        screenLayer = layer
+        hostView = view
+    }
+
+    /// True when this hub's window is frontmost (or, before the view attaches,
+    /// when it's the only window — single-window behaviour is unchanged).
+    private var inputFocused: Bool {
+        guard let win = hostView?.window else { return true }
+        return win.isKeyWindow
+    }
 
     // ---- BIOS ----
     func setBios(_ data: Data, for system: EmuSystem) { bios[system] = data }
@@ -69,7 +82,9 @@ final class EmuHub: ObservableObject {
     // ---- frame ----
     private func tick() {
         guard let e = emu else { return }
-        e.setKeys(e.system.keyMask(input.currentButtons()))
+        // Only the focused window drives input; background games keep emulating
+        // with no buttons pressed.
+        e.setKeys(inputFocused ? e.system.keyMask(input.currentButtons()) : 0)
         e.runFrame()
         present(e)
         let n = e.drainAudio(into: &audioBuf)
@@ -125,6 +140,9 @@ final class EmuHub: ObservableObject {
             guard let self else { return ev }
             // Don't swallow Cmd-shortcuts (Cmd-Q, etc.).
             if ev.modifierFlags.contains(.command) { return ev }
+            // Only the focused game's hub handles keys (the monitor is app-wide,
+            // so every open game would otherwise react to one keypress).
+            if !self.inputFocused { return ev }
             switch ev.type {
             case .keyDown:
                 self.input.handleKey(ev, down: true)
