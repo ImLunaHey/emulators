@@ -14,12 +14,20 @@
     "build:wasm:sms": "wasm-pack build core-sms --target web --out-dir pkg --release",
     "build:wasm:gbc": "wasm-pack build core-gbc --target web --out-dir pkg --release",
     "build:wasm:xbox": "wasm-pack build core-xbox --target web --out-dir pkg --release",
+    "build:wasm:snes": "wasm-pack build core-snes --target web --out-dir pkg --release",
+    "build:wasm:genesis": "wasm-pack build core-genesis --target web --out-dir pkg --release",
+    "build:wasm:pce": "wasm-pack build core-pce --target web --out-dir pkg --release",
+    "build:wasm:atari2600": "wasm-pack build core-atari2600 --target web --out-dir pkg --release",
+    "build:wasm:ngpc": "wasm-pack build core-ngpc --target web --out-dir pkg --release",
+    "build:wasm:wonderswan": "wasm-pack build core-wonderswan --target web --out-dir pkg --release",
+    "build:wasm:virtualboy": "wasm-pack build core-virtualboy --target web --out-dir pkg --release",
+    "build:wasm:n64": "wasm-pack build core-n64 --target web --out-dir pkg --release",
     "build": "tsc && vite build",
     "preview": "npm run build && wrangler dev",
     "gen:cheats": "tsx scripts/gen-cheats.ts",
     "test": "cargo test --manifest-path core/Cargo.toml",
     "lint": "oxlint src",
-    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build:wasm:sms && npm run build:wasm:gbc && npm run build:wasm:ps1 && npm run build:wasm:xbox && npm run build && wrangler deploy"
+    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build:wasm:sms && npm run build:wasm:gbc && npm run build:wasm:ps1 && npm run build:wasm:xbox && npm run build:wasm:snes && npm run build:wasm:genesis && npm run build:wasm:pce && npm run build:wasm:atari2600 && npm run build:wasm:ngpc && npm run build:wasm:wonderswan && npm run build:wasm:virtualboy && npm run build:wasm:n64 && npm run build && wrangler deploy"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.40.0",

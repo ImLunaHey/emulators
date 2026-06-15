@@ -13,6 +13,14 @@ import { SmsPlayer } from './SmsPlayer';
 import { GbcPlayer } from './GbcPlayer';
 import { Ps1Player } from './Ps1Player';
 import { XboxPlayer } from './XboxPlayer';
+import { SnesPlayer } from './SnesPlayer';
+import { GenesisPlayer } from './GenesisPlayer';
+import { PcePlayer } from './PcePlayer';
+import { Atari2600Player } from './Atari2600Player';
+import { NgpcPlayer } from './NgpcPlayer';
+import { WonderSwanPlayer } from './WonderSwanPlayer';
+import { VirtualBoyPlayer } from './VirtualBoyPlayer';
+import { N64Player } from './N64Player';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -61,6 +69,22 @@ export function App() {
               <Ps1Player romId={playing.id} onExit={() => setPlaying(null)} />
             ) : playing.system === 'xbox' ? (
               <XboxPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'snes' ? (
+              <SnesPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'genesis' ? (
+              <GenesisPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'pce' ? (
+              <PcePlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'atari2600' ? (
+              <Atari2600Player romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'ngpc' ? (
+              <NgpcPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'wonderswan' ? (
+              <WonderSwanPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'virtualboy' ? (
+              <VirtualBoyPlayer romId={playing.id} onExit={() => setPlaying(null)} />
+            ) : playing.system === 'n64' ? (
+              <N64Player romId={playing.id} onExit={() => setPlaying(null)} />
             ) : (
               <PlayerPage romId={playing.id} onExit={() => setPlaying(null)} />
             )
