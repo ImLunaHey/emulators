@@ -28,7 +28,7 @@ use crate::cpu::state::{EAX, ESP};
 use crate::cpu::Cpu;
 use crate::hle_table;
 use crate::mem::Mem;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// Outcome of handling one kernel-import CALL.
@@ -292,6 +292,74 @@ pub fn reset() {
     *KDATA.lock().unwrap() = None;
     FILES.lock().unwrap().clear();
     DISC.lock().unwrap().clear();
+    REBOOT.store(false, Ordering::SeqCst);
+    *PERSISTED.lock().unwrap() = None;
+    *LAUNCH_DATA.lock().unwrap() = None;
+}
+
+// ---------------------------------------------------------------------------
+// Quick-reboot / relaunch (XLaunchNewImage).
+//
+// A game can persist a launch-data page (MmPersistContiguousMemory) and call
+// HalReturnToFirmware(QuickReboot). The real kernel reboots, preserves that
+// page, re-exposes it through the LaunchDataPage DATA export, and re-launches
+// default.xbe — on the second boot the game sees the page and proceeds instead
+// of rebooting again. We emulate exactly that handoff.
+// ---------------------------------------------------------------------------
+
+static REBOOT: AtomicBool = AtomicBool::new(false);
+/// Regions marked to survive a quick-reboot: (base, size).
+static PERSISTED: Mutex<Option<Vec<(u32, u32)>>> = Mutex::new(None);
+/// Base of the most-recently persisted page — the launch-data page.
+static LAUNCH_DATA: Mutex<Option<u32>> = Mutex::new(None);
+const ORD_LAUNCH_DATA_PAGE: u32 = 164;
+
+/// Consume a pending reboot request (set by HalReturnToFirmware).
+pub fn take_reboot() -> bool {
+    REBOOT.swap(false, Ordering::SeqCst)
+}
+
+/// Move the mounted disc image out of the kernel (so it survives reset()).
+pub fn take_disc() -> Vec<u8> {
+    std::mem::take(&mut *DISC.lock().unwrap())
+}
+
+/// Read the launch-data page base recorded before a reboot.
+pub fn take_launch_data() -> Option<u32> {
+    *LAUNCH_DATA.lock().unwrap()
+}
+
+/// Capture the bytes of all persisted regions (call before reset wipes RAM).
+pub fn snapshot_persisted(mem: &Mem) -> Vec<(u32, Vec<u8>)> {
+    let g = PERSISTED.lock().unwrap();
+    let mut out = Vec::new();
+    if let Some(list) = g.as_ref() {
+        for &(base, size) in list {
+            let mut bytes = Vec::with_capacity(size as usize);
+            for i in 0..size {
+                bytes.push(mem.ram_read8(base.wrapping_add(i)) as u8);
+            }
+            out.push((base, bytes));
+        }
+    }
+    out
+}
+
+/// Write the captured persisted bytes back into RAM (after a re-boot).
+pub fn restore_persisted(mem: &mut Mem, snap: Vec<(u32, Vec<u8>)>) {
+    for (base, bytes) in snap {
+        for (i, b) in bytes.iter().enumerate() {
+            mem.ram_write8(base.wrapping_add(i as u32), *b as u32);
+        }
+    }
+}
+
+/// Point the LaunchDataPage DATA export at the preserved launch page so the
+/// relaunched image detects it was launched (rather than cold-booted).
+pub fn set_launch_data_slot(mem: &mut Mem, page: u32) {
+    let slot = data_export_addr(ORD_LAUNCH_DATA_PAGE, mem);
+    mem.ram_write32(slot, page);
+    *LAUNCH_DATA.lock().unwrap() = Some(page);
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +790,7 @@ const ORD_KE_INITIALIZE_INTERRUPT: u32 = 109;
 const ORD_KE_CONNECT_INTERRUPT: u32 = 98;
 const ORD_MM_CLAIM_GPU_INSTANCE_MEMORY: u32 = 168;
 const ORD_HAL_READ_WRITE_PCI_SPACE: u32 = 46;
+const ORD_HAL_RETURN_TO_FIRMWARE: u32 = 49;
 const ORD_AV_SEND_TV_ENCODER_OPTION: u32 = 2;
 const ORD_AV_SET_DISPLAY_MODE: u32 = 3;
 
@@ -812,8 +881,17 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             Dispatch::Handled("MmGetPhysicalAddress")
         }
         ORD_MM_PERSIST_CONTIGUOUS_MEMORY => {
-            // VOID MmPersistContiguousMemory(PVOID, ULONG, BOOLEAN) — affects
-            // whether a region survives a quick-reboot; nothing to do here.
+            // VOID MmPersistContiguousMemory(PVOID Base, ULONG Size, BOOLEAN
+            // Persist) — mark a region to survive a quick-reboot (the launch-data
+            // page). Record it so the reboot path preserves + exposes it.
+            let base = arg(cpu, mem, 0);
+            let size = arg(cpu, mem, 1);
+            let persist = arg(cpu, mem, 2);
+            if persist != 0 {
+                let mut g = PERSISTED.lock().unwrap();
+                g.get_or_insert_with(Vec::new).push((base, size));
+                *LAUNCH_DATA.lock().unwrap() = Some(base);
+            }
             stdcall_return(cpu, mem, 0, 12);
             Dispatch::Handled("MmPersistContiguousMemory")
         }
@@ -1005,6 +1083,32 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+
+        // ---- Reboot / firmware ----
+        ORD_HAL_RETURN_TO_FIRMWARE => {
+            if std::env::var("XBOX_TRACE_KERNEL").is_ok() {
+                if let Some(page) = *LAUNCH_DATA.lock().unwrap() {
+                    let ty = mem.ram_read32(page);
+                    let tid = mem.ram_read32(page.wrapping_add(4));
+                    let mut path = String::new();
+                    for i in 0..520u32 {
+                        let b = mem.ram_read8(page.wrapping_add(8 + i)) as u8;
+                        if b == 0 { break; }
+                        path.push(b as char);
+                    }
+                    let flags = mem.ram_read32(page.wrapping_add(528));
+                    eprintln!("[hle] reboot: launchType={ty} titleId={tid:08X} flags={flags:08X} path={path:?}");
+                } else {
+                    eprintln!("[hle] reboot: no launch-data page persisted");
+                }
+            }
+            // The game persisted launch data and asked to reboot+relaunch
+            // (XLaunchNewImage). Signal the orchestrator to re-boot; halt this
+            // thread so nothing runs until it does.
+            REBOOT.store(true, Ordering::SeqCst);
+            cpu.halted = true;
+            Dispatch::Handled("HalReturnToFirmware")
         }
 
         // ---- Display / TV encoder (Av*) ----

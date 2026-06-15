@@ -54,6 +54,10 @@ pub struct Xbox {
 
     /// NV2A GPU (pushbuffer + scanout).
     nv2a: crate::nv2a::Nv2a,
+
+    /// Number of quick-reboot relaunches performed (XLaunchNewImage). Capped so a
+    /// game stuck rebooting can't loop forever.
+    reboots: u32,
 }
 
 impl Default for Xbox {
@@ -79,6 +83,7 @@ impl Xbox {
             kernel_ordinals: Vec::new(),
             last_kernel_ordinal: None,
             nv2a: crate::nv2a::Nv2a::new(),
+            reboots: 0,
         }
     }
 
@@ -89,6 +94,8 @@ impl Xbox {
     const HLE_SPAN: u32 = 0x4000;
     /// Initial stack pointer — high in RAM, clear of the loaded image.
     const STACK_TOP: u32 = 0x0300_0000;
+    /// Cap on quick-reboot relaunches to break a reboot loop.
+    const MAX_REBOOTS: u32 = 8;
 
     /// Load a flash/BIOS image (256 KB retail, or a larger mirrored dump — the
     /// tail is used) and reset to the x86 reset vector (`0xFFFF_FFF0`, inside the
@@ -130,6 +137,40 @@ impl Xbox {
             // Couldn't boot: fall back to the identify-only screen.
             self.disc = Some(info);
             self.disc_shown = false;
+        }
+    }
+
+    /// Perform a quick-reboot relaunch (HalReturnToFirmware + XLaunchNewImage):
+    /// preserve the persisted launch page across a fresh boot of `default.xbe`,
+    /// then re-expose it through LaunchDataPage so the game detects the relaunch.
+    fn do_reboot(&mut self) {
+        self.reboots += 1;
+        // Capture relaunch state before reset() wipes RAM + the disc + globals.
+        let launch_page = crate::hle::take_launch_data();
+        let snap = crate::hle::snapshot_persisted(&self.mem);
+        let disc = crate::hle::take_disc();
+        // Re-extract default.xbe from the (preserved) disc image.
+        let xbe = match crate::xiso::probe(&disc) {
+            Some(info) if info.xbe_size > 0 => {
+                let start = info.xbe_offset;
+                let end = start.saturating_add(info.xbe_size).min(disc.len());
+                if start < end {
+                    disc[start..end].to_vec()
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+        let title = self.boot_title.clone();
+        if !self.boot_xbe(&xbe, &title) {
+            return;
+        }
+        // Re-insert the disc and restore the persisted launch page.
+        crate::hle::set_disc(disc);
+        crate::hle::restore_persisted(&mut self.mem, snap);
+        if let Some(page) = launch_page {
+            crate::hle::set_launch_data_slot(&mut self.mem, page);
         }
     }
 
@@ -320,6 +361,12 @@ impl Xbox {
                         crate::hle::preempt(&mut self.cpu);
                     }
                 }
+            }
+            // A game asked to quick-reboot+relaunch (XLaunchNewImage): re-boot
+            // default.xbe with the persisted launch page intact so its second
+            // boot proceeds instead of showing the boot screen.
+            if crate::hle::take_reboot() && self.reboots < Self::MAX_REBOOTS {
+                self.do_reboot();
             }
             // If the GPU has produced a color surface, scan it out to the screen;
             // otherwise show the live boot diagnostic.
