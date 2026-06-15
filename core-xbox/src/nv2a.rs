@@ -21,6 +21,12 @@ mod off {
     // PFIFO.
     pub const PFIFO_INTR_0: u32 = 0x00_2100;
     pub const PFIFO_INTR_EN_0: u32 = 0x00_2140;
+    // PFIFO CACHE1 DMA engine state (games poll these to see the pushbuffer
+    // drain / the FIFO go idle).
+    pub const PFIFO_CACHE1_STATUS: u32 = 0x00_3214;
+    pub const PFIFO_CACHE1_DMA_PUSH: u32 = 0x00_3220;
+    pub const PFIFO_CACHE1_DMA_PUT: u32 = 0x00_3240;
+    pub const PFIFO_CACHE1_DMA_GET: u32 = 0x00_3244;
     // PTIMER.
     pub const PTIMER_INTR_0: u32 = 0x00_9100;
     pub const PTIMER_INTR_EN_0: u32 = 0x00_9140;
@@ -61,6 +67,7 @@ pub struct Nv2a {
     pfifo_intr: u32,
     pfifo_intr_en: u32,
     pmc_intr_en: u32,
+    cache1_dma_push: u32,
     /// PCRTC scanout base (the framebuffer the display reads).
     crtc_start: u32,
     /// Frames signalled (vblank count).
@@ -71,6 +78,8 @@ pub struct Nv2a {
     pub surface_offset: u32,
     pub surface_pitch: u32,
     clear_color: u32,
+    clip_x: u16,
+    clip_y: u16,
     clip_w: u16,
     clip_h: u16,
     pub width: u16,
@@ -124,12 +133,15 @@ impl Nv2a {
             pfifo_intr: 0,
             pfifo_intr_en: 0,
             pmc_intr_en: 0,
+            cache1_dma_push: 0,
             crtc_start: 0,
             vblank_count: 0,
             has_surface: false,
             surface_offset: 0,
             surface_pitch: 0,
             clear_color: 0,
+            clip_x: 0,
+            clip_y: 0,
             clip_w: 640,
             clip_h: 480,
             width: 640,
@@ -180,6 +192,13 @@ impl Nv2a {
             off::PCRTC_START => self.crtc_start,
             off::DMA_GET => self.get,
             off::DMA_PUT => self.put,
+            // PFIFO CACHE1: we execute the pushbuffer synchronously, so the FIFO
+            // is always idle/empty and fully drained — report that so the game's
+            // "wait for GPU" loops complete.
+            off::PFIFO_CACHE1_STATUS => 0x10, // LOW_MARK: cache empty
+            off::PFIFO_CACHE1_DMA_PUSH => self.cache1_dma_push & !0x10, // STATE not busy
+            off::PFIFO_CACHE1_DMA_PUT => self.put,
+            off::PFIFO_CACHE1_DMA_GET => self.get,
             _ => 0,
         }
     }
@@ -204,6 +223,14 @@ impl Nv2a {
             off::PFIFO_INTR_0 => self.pfifo_intr &= !val,
             off::PFIFO_INTR_EN_0 => self.pfifo_intr_en = val,
             off::PCRTC_START => self.crtc_start = val,
+            off::PFIFO_CACHE1_DMA_PUSH => self.cache1_dma_push = val,
+            // The pushbuffer can also be kicked via the PFIFO DMA_PUT register.
+            off::PFIFO_CACHE1_DMA_PUT => {
+                self.put = val;
+                self.execute(ram);
+                self.get = val;
+            }
+            off::PFIFO_CACHE1_DMA_GET => self.get = val,
             _ => {}
         }
     }
@@ -256,8 +283,14 @@ impl Nv2a {
     /// Handle one PGRAPH method (surface setup + clear, for now).
     fn method(&mut self, ram: &mut [u8], method: u32, data: u32) {
         match method {
-            m::SET_SURFACE_CLIP_HORIZONTAL => self.clip_w = (data >> 16) as u16,
-            m::SET_SURFACE_CLIP_VERTICAL => self.clip_h = (data >> 16) as u16,
+            m::SET_SURFACE_CLIP_HORIZONTAL => {
+                self.clip_x = (data & 0xFFFF) as u16;
+                self.clip_w = (data >> 16) as u16;
+            }
+            m::SET_SURFACE_CLIP_VERTICAL => {
+                self.clip_y = (data & 0xFFFF) as u16;
+                self.clip_h = (data >> 16) as u16;
+            }
             m::SET_SURFACE_PITCH => self.surface_pitch = data & 0xFFFF,
             m::SET_SURFACE_COLOR_OFFSET => {
                 self.surface_offset = data & (crate::regions::RAM_SIZE as u32 - 1)
@@ -276,21 +309,25 @@ impl Nv2a {
     /// Fill the color surface's clip rect with the clear value, and adopt it as
     /// the displayed surface.
     fn clear_color_buffer(&mut self, ram: &mut [u8]) {
+        let x0 = self.clip_x as u32;
+        let y0 = self.clip_y as u32;
+        let w = self.clip_w.max(1) as u32;
+        let h = self.clip_h.max(1) as u32;
         let pitch = if self.surface_pitch == 0 {
-            (self.clip_w as u32) * 4
+            (x0 + w) * 4
         } else {
             self.surface_pitch
         };
-        let w = self.clip_w.max(1);
-        let h = self.clip_h.max(1);
-        for y in 0..h as u32 {
+        for y in y0..y0 + h {
             let row = self.surface_offset.wrapping_add(y * pitch);
-            for x in 0..w as u32 {
+            for x in x0..x0 + w {
                 wr32(ram, row.wrapping_add(x * 4), self.clear_color);
             }
         }
-        self.width = w;
-        self.height = h;
+        // The displayed surface grows to the largest cleared extent (so a small
+        // sub-rect clear after a full-screen clear doesn't shrink the screen).
+        self.width = self.width.max((x0 + w) as u16);
+        self.height = self.height.max((y0 + h) as u16);
         self.has_surface = true;
     }
 

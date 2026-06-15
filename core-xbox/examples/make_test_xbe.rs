@@ -26,6 +26,23 @@ fn put32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+/// NV2A "increasing methods" command header (count=1, subchannel 0).
+fn hdr(method: u32) -> u32 {
+    (1u32 << 18) | method
+}
+
+/// Emit a clip-rect + clear-to-color into the pushbuffer.
+fn clip_clear(w: &mut Vec<u32>, x: u32, width: u32, y: u32, height: u32, color: u32) {
+    w.push(hdr(0x0200)); // SET_SURFACE_CLIP_HORIZONTAL
+    w.push(x | (width << 16));
+    w.push(hdr(0x0204)); // SET_SURFACE_CLIP_VERTICAL
+    w.push(y | (height << 16));
+    w.push(hdr(0x1D90)); // SET_COLOR_CLEAR_VALUE (ARGB)
+    w.push(color);
+    w.push(hdr(0x1D94)); // CLEAR_SURFACE (color buffer)
+    w.push(0xF0);
+}
+
 /// `MOV dword [disp32], imm32` = C7 05 <disp32> <imm32>.
 fn mov_mem_imm(code: &mut Vec<u8>, disp: u32, imm: u32) {
     code.push(0xC7);
@@ -38,24 +55,25 @@ fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/clear.xbe".into());
 
     // The pushbuffer: NV2A "increasing methods" command words (count=1, subch=0):
-    //   header = (1<<18) | method ; followed by the data word.
-    let hdr = |method: u32| (1u32 << 18) | method;
-    let cmds: [u32; 12] = [
-        hdr(0x020C), 640 * 4,        // SET_SURFACE_PITCH
-        hdr(0x0210), SURFACE,        // SET_SURFACE_COLOR_OFFSET
-        hdr(0x0200), 640 << 16,      // SET_SURFACE_CLIP_HORIZONTAL (width 640)
-        hdr(0x0204), 480 << 16,      // SET_SURFACE_CLIP_VERTICAL  (height 480)
-        hdr(0x1D90), 0xFF6C_D84C,    // SET_COLOR_CLEAR_VALUE — Xbox green (ARGB)
-        hdr(0x1D94), 0x0000_00F0,    // CLEAR_SURFACE (color buffer)
-    ];
+    //   header = (1<<18) | method ; followed by the data word. We compose a boot
+    //   screen out of several clip+clear rectangles.
+    let mut words: Vec<u32> = Vec::new();
+    words.push(hdr(0x020C));
+    words.push(640 * 4); // SET_SURFACE_PITCH
+    words.push(hdr(0x0210));
+    words.push(SURFACE); // SET_SURFACE_COLOR_OFFSET
+    clip_clear(&mut words, 0, 640, 0, 480, 0xFF10_1820); // dark background
+    clip_clear(&mut words, 0, 640, 0, 80, 0xFF6C_D84C); // top bar (Xbox green)
+    clip_clear(&mut words, 220, 200, 180, 120, 0xFFE8_E8E8); // center panel
+    clip_clear(&mut words, 0, 640, 440, 40, 0xFF20_50C0); // bottom bar (blue)
 
     // x86: write the pushbuffer into RAM, set GET then PUT (kicks the GPU), spin.
     let mut code = Vec::new();
-    for (i, &w) in cmds.iter().enumerate() {
+    for (i, &w) in words.iter().enumerate() {
         mov_mem_imm(&mut code, PBUF + (i as u32) * 4, w);
     }
     mov_mem_imm(&mut code, DMA_GET, PBUF);
-    mov_mem_imm(&mut code, DMA_PUT, PBUF + cmds.len() as u32 * 4);
+    mov_mem_imm(&mut code, DMA_PUT, PBUF + words.len() as u32 * 4);
     code.push(0xEB); // JMP rel8
     code.push(0xFE); // -2 (spin)
 

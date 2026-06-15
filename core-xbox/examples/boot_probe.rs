@@ -107,16 +107,16 @@ fn main() {
     }
     // Report whether a frame was rendered (top-left pixel + dims).
     let fb = xb.framebuffer();
-    if fb.len() >= 4 {
-        println!(
-            "  screen {}x{}  top-left RGBA = {:02X} {:02X} {:02X} {:02X}",
-            xb.width(),
-            xb.height(),
-            fb[0],
-            fb[1],
-            fb[2],
-            fb[3]
-        );
+    let (w, h) = (xb.width() as usize, xb.height() as usize);
+    if fb.len() >= w * h * 4 && w > 0 {
+        let px = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            format!("{:02X}{:02X}{:02X}", fb[i], fb[i + 1], fb[i + 2])
+        };
+        println!("  screen {w}x{h}");
+        println!("    top   (320,40)  = #{}", px(320.min(w - 1), 40.min(h - 1)));
+        println!("    center(320,240) = #{}", px(320.min(w - 1), 240.min(h - 1)));
+        println!("    bottom(320,460) = #{}", px(320.min(w - 1), 460.min(h - 1)));
     }
     // Dump the bytes around the current EIP (to decode a spin loop).
     let eip = xb.cpu.eip;
