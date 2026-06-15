@@ -12,6 +12,7 @@ pub mod apu;
 pub mod bus;
 pub mod cart;
 pub mod cpu;
+pub mod crash;
 pub mod input;
 pub mod mapper;
 pub mod nes;

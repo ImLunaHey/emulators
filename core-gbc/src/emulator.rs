@@ -21,6 +21,16 @@ use crate::regions as R;
 /// T-cycles in one frame at the base clock (154 lines × 456 dots).
 const FRAME_CYCLES: u32 = 70224;
 
+/// A detected core fault, captured for the crash screen. Raised when the SM83
+/// executes an illegal opcode that hard-locks real hardware.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// The illegal opcode byte.
+    pub opcode: u8,
+    /// PC of the illegal instruction.
+    pub pc: u16,
+}
+
 /// The Game Boy Color machine. One owner of every subsystem.
 pub struct Gbc {
     pub cpu: Cpu,
@@ -46,6 +56,10 @@ pub struct Gbc {
     /// Latched pressed-button state, applied to the joypad each step so the
     /// joypad interrupt fires within the bus.
     pub keys: u8,
+
+    /// Set once the CPU executes an illegal opcode. While set, `run_frame`
+    /// freezes the CPU and keeps presenting the crash screen.
+    pub fault: Option<Fault>,
 }
 
 impl Default for Gbc {
@@ -70,6 +84,7 @@ impl Gbc {
             io_raw: [0; R::IO_SIZE],
             frame_count: 0,
             keys: 0,
+            fault: None,
         }
     }
 
@@ -80,6 +95,7 @@ impl Gbc {
     pub fn load_rom(&mut self, bytes: &[u8]) {
         self.cart.load_rom(bytes);
         let cgb = self.cart.header.is_cgb();
+        self.fault = None;
         self.cpu = Cpu::new();
         self.ppu = crate::ppu::Ppu::new();
         self.ppu.cgb_mode = cgb;
@@ -140,16 +156,46 @@ impl Gbc {
     /// the CPU/timer/serial rates (twice the work per frame) but not the PPU/APU
     /// output clock.
     pub fn run_frame(&mut self) {
+        // Once faulted, freeze: run no CPU, just keep the crash screen present.
+        if self.fault.is_some() {
+            self.present_crash();
+            self.frame_count = self.frame_count.wrapping_add(1);
+            return;
+        }
+
         self.ppu.frame_ready = false;
         let mut budget = FRAME_CYCLES;
         // Safety bound so a runaway never spins forever.
         let mut guard = 0u32;
         while !self.ppu.frame_ready && budget > 0 && guard < 4_000_000 {
             guard += 1;
+            // An illegal opcode hard-locks real hardware: latch the fault and
+            // draw the crash screen for this and every subsequent frame.
+            if let Some((opcode, pc)) = self.cpu.illegal_op {
+                self.fault = Some(Fault { opcode, pc });
+                self.present_crash();
+                self.frame_count = self.frame_count.wrapping_add(1);
+                return;
+            }
             let used = self.step();
             budget = budget.saturating_sub(used);
         }
         self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    /// Draw the crash readout into the PPU framebuffer. Called once when a fault
+    /// is first detected and every frame thereafter so the panel stays present.
+    fn present_crash(&mut self) {
+        let f = match self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "GBC CORE FAULT".to_string(),
+            format!("ILLEGAL OP {:02X}", f.opcode),
+            format!("PC {:04X}", f.pc),
+        ];
+        crate::crash::render(&mut self.ppu.framebuffer, 160, 144, &lines);
     }
 
     // ---- battery save passthrough ----
@@ -467,5 +513,49 @@ mod tests {
         let mut gbc = Gbc::new();
         gbc.request_interrupt(Interrupt::VBlank);
         assert_eq!(gbc.read8(R::REG_IF) & 0x01, 0x01);
+    }
+
+    #[test]
+    fn illegal_opcode_faults_and_draws_crash_screen() {
+        let mut gbc = Gbc::new();
+        gbc.load_rom(&boot_rom(true));
+        // Point the CPU at WRAM and plant an illegal opcode (0xD3) there.
+        gbc.cpu.pc = 0xC000;
+        gbc.write8(0xC000, 0xD3);
+
+        // Stepping the illegal opcode signals the CPU-level fault.
+        gbc.step();
+        assert!(gbc.cpu.illegal_op.is_some(), "CPU should signal illegal op");
+
+        // A frame run promotes it to a latched core fault and paints the panel.
+        gbc.run_frame();
+        let fault = gbc.fault.expect("fault should be latched");
+        assert_eq!(fault.opcode, 0xD3);
+        assert_eq!(fault.pc, 0xC000);
+
+        // The framebuffer must contain non-background pixels (the white text).
+        const BG: [u8; 4] = [0x10, 0x10, 0x60, 0xFF];
+        let has_fg = gbc
+            .framebuffer()
+            .chunks_exact(4)
+            .any(|px| px != BG);
+        assert!(has_fg, "crash screen should draw text over the background");
+    }
+
+    #[test]
+    fn fault_freezes_and_keeps_crash_present() {
+        let mut gbc = Gbc::new();
+        gbc.load_rom(&boot_rom(true));
+        gbc.cpu.pc = 0xC000;
+        gbc.write8(0xC000, 0xD3);
+        gbc.run_frame();
+        assert!(gbc.fault.is_some());
+
+        // Subsequent frames keep the crash screen and never run the CPU.
+        let pc_before = gbc.cpu.pc;
+        gbc.run_frame();
+        assert_eq!(gbc.cpu.pc, pc_before, "CPU should be frozen after a fault");
+        const BG: [u8; 4] = [0x10, 0x10, 0x60, 0xFF];
+        assert!(gbc.framebuffer().chunks_exact(4).any(|px| px != BG));
     }
 }

@@ -85,6 +85,15 @@ pub fn arm_execute<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
         return;
     }
 
+    // Architecturally-UNDEFINED slot: 011x xxxx ... xxx1 (bits 27-25 = 011 and
+    // bit 4 set). The real ARM7TDMI takes the undefined-instruction exception
+    // here rather than treating it as an LDR/STR; we vector to 0x04 and bump the
+    // exception counter so a fault loop is detectable.
+    if (instr & 0x0E000010) == 0x06000010 {
+        cpu.undefined_instruction("UNDEF INSTR");
+        return;
+    }
+
     // Single data transfer LDR/STR: 01xx
     if (instr & 0x0C000000) == 0x04000000 {
         arm_single_transfer(cpu, bus, instr);

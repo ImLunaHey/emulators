@@ -19,6 +19,9 @@ pub mod cpu;
 pub mod memory;
 pub mod nds;
 
+// --- Crash screen (rendered into the top framebuffer on a detected fault loop).
+pub mod crash;
+
 // --- Subsystems (ported one-file-per-agent against the foundation). The 3D
 // GPU (`gx`) is deferred and intentionally absent.
 pub mod bios;

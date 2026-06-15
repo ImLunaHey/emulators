@@ -61,6 +61,11 @@ pub struct Cpu {
     /// fails to increment PC on the next fetch (reads the byte after HALT
     /// twice). Tracked here for `cpu::exec` to honor.
     pub halt_bug: bool,
+
+    /// Set by `cpu::exec` when an illegal SM83 opcode (one that hard-locks real
+    /// hardware) is executed: `Some((opcode, instruction_pc))`. The orchestrator
+    /// promotes this to a `Gbc` fault and presents the crash screen.
+    pub illegal_op: Option<(u8, u16)>,
 }
 
 impl Default for Cpu {
@@ -89,6 +94,7 @@ impl Cpu {
             ime_pending: false,
             power: Power::Running,
             halt_bug: false,
+            illegal_op: None,
         }
     }
 

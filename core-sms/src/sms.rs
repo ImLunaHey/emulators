@@ -41,6 +41,18 @@ pub enum System {
 /// Z80 cycles per scanline: 3.58 MHz / (262 lines × 60 Hz) ≈ 228.
 const CYCLES_PER_LINE: u32 = 228;
 
+/// A detected CPU deadlock, captured for the crash screen. The Z80 has no clean
+/// illegal-opcode trap (undocumented opcodes legally execute), so the trigger is
+/// a HALT executed with interrupts disabled (IFF1 = 0): the maskable INT can
+/// never wake it, so the CPU is wedged forever.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// Program counter at the moment the deadlock was detected.
+    pub pc: u16,
+    /// Frame number when the fault was detected.
+    pub frame: u64,
+}
+
 pub struct Sms {
     pub cpu: Cpu,
     pub vdp: Vdp,
@@ -61,6 +73,11 @@ pub struct Sms {
     /// Accumulated PSG clocks owed (PSG runs ~clock/16; we fold the /16 into
     /// the period, so we feed it CPU cycles directly).
     audio_owed: u32,
+
+    /// Set once a CPU deadlock (HALT-with-interrupts-disabled that persists for
+    /// a whole frame) is detected. While set, [`Sms::run_frame`] freezes the CPU
+    /// and re-presents the crash screen each frame.
+    pub fault: Option<Fault>,
 }
 
 impl Sms {
@@ -80,6 +97,7 @@ impl Sms {
                 .unwrap(),
             prev_pause: false,
             audio_owed: 0,
+            fault: None,
         }
     }
 
@@ -104,6 +122,7 @@ impl Sms {
         for b in self.ram.iter_mut() {
             *b = 0;
         }
+        self.fault = None;
     }
 
     pub fn set_keys(&mut self, bits: u32) {
@@ -176,12 +195,51 @@ impl Sms {
     /// Run one full video frame: step the CPU line-by-line, advancing the VDP
     /// and PSG, until a full frame's worth of scanlines has elapsed.
     pub fn run_frame(&mut self) {
+        // Once faulted, freeze: keep presenting the crash screen, run no code.
+        if self.fault.is_some() {
+            self.present_crash();
+            return;
+        }
         if self.cart.is_none() {
             return;
         }
+
+        // Deadlock detection. The Z80 has no clean illegal-opcode trap, so we
+        // watch for a HALT with interrupts disabled (IFF1 = 0): the maskable INT
+        // can never wake it. To stay conservative we require the state to PERSIST
+        // for a whole frame — if the CPU was halted-with-DI on entry and nothing
+        // (NMI / nothing) cleared `halted` by frame's end, it is genuinely wedged
+        // (a normal idle game HALTs with interrupts ENABLED, so never trips this).
+        let wedged_before = self.cpu.halted && !self.cpu.iff1;
+
         for _ in 0..SCANLINES {
             self.run_scanline();
         }
+
+        if wedged_before && self.cpu.halted && !self.cpu.iff1 {
+            self.fault = Some(Fault {
+                pc: self.cpu.pc,
+                frame: self.vdp.frame,
+            });
+            self.present_crash();
+        }
+    }
+
+    /// Draw the crash screen into the VDP framebuffer from the latched
+    /// [`Fault`]. Called every frame once faulted so the panel stays presented.
+    /// Rendered into the full SMS frame; the Game Gear path then crops it.
+    fn present_crash(&mut self) {
+        let f = match self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "SMS CORE FAULT".to_string(),
+            "HALT WITH DI".to_string(),
+            format!("PC {:04X}", f.pc),
+            format!("FRAME {}", f.frame),
+        ];
+        crate::crash::render(&mut self.vdp.framebuffer[..], SMS_W, SMS_H, &lines);
     }
 
     fn run_scanline(&mut self) {
@@ -381,6 +439,53 @@ mod tests {
         sms.set_keys(crate::io::KEY_UP);
         // Port $DC bit0 should be low (pressed).
         assert_eq!(sms.port_in(0xDC) & 0x01, 0);
+    }
+
+    #[test]
+    fn halt_with_di_faults_and_paints_crash() {
+        // ROM at $0000: DI; HALT. With interrupts disabled the maskable INT can
+        // never wake the HALT — a permanent deadlock. The first frame enters the
+        // halt; the second frame (halted-with-DI on entry, still so at the end)
+        // detects the deadlock, latches a Fault, and paints the crash screen.
+        let mut rom = vec![0u8; 0x4000];
+        rom[0] = 0xF3; // DI
+        rom[1] = 0x76; // HALT
+        let mut sms = Sms::new(System::Sms);
+        sms.load_rom(&rom);
+
+        assert!(sms.fault.is_none());
+        sms.run_frame(); // enters HALT
+        sms.run_frame(); // detects the wedge
+        assert!(sms.fault.is_some(), "HALT-with-DI must latch a fault");
+
+        // The crash screen painted a dark-blue background + white text, so the
+        // framebuffer must contain non-background pixels (the white glyphs) and
+        // must NOT be all-zero.
+        let fb = sms.framebuffer();
+        let bg = [0x10u8, 0x10, 0x60, 0xFF];
+        let has_white = fb.chunks_exact(4).any(|p| p == [0xFF, 0xFF, 0xFF, 0xFF]);
+        let all_bg = fb.chunks_exact(4).all(|p| p == bg);
+        assert!(has_white, "crash screen must draw white text pixels");
+        assert!(!all_bg, "framebuffer must not be only the background");
+    }
+
+    #[test]
+    fn halt_with_interrupts_enabled_does_not_fault() {
+        // EI; HALT is the normal SMS idle pattern — a frame IRQ wakes it. With
+        // IFF1 set this must NOT trip the deadlock detector even if the CPU is
+        // sitting in HALT across frame boundaries.
+        let mut rom = vec![0u8; 0x4000];
+        rom[0] = 0xFB; // EI
+        rom[1] = 0x76; // HALT
+        let mut sms = Sms::new(System::Sms);
+        sms.load_rom(&rom);
+        sms.run_frame();
+        sms.run_frame();
+        sms.run_frame();
+        assert!(
+            sms.fault.is_none(),
+            "HALT with interrupts enabled is normal idle, must not fault"
+        );
     }
 
     #[test]

@@ -33,6 +33,22 @@ use crate::Save;
 const CYCLES_PER_FRAME: u32 = 280896;
 const CYC_PER_LINE: i64 = 1232;
 
+/// Exceptions taken within a single frame above which we declare a fault loop.
+/// A real frame takes a handful (IRQs, SWIs); a CPU re-faulting every few
+/// instructions on undefined opcodes takes tens of thousands — a crash, not a
+/// running game. Matches the PS1 core's threshold.
+const FAULT_THRESHOLD: u64 = 10_000;
+
+/// A detected fault loop (an undefined-instruction / abort exception storm),
+/// captured for the crash screen.
+#[derive(Debug, Clone)]
+pub struct Fault {
+    /// Decode PC of the faulting instruction at detection time.
+    pub pc: u32,
+    /// Short uppercase mnemonic of the exception kind (crash-font safe).
+    pub kind: &'static str,
+}
+
 pub struct Gba {
     pub mem: Mem,
     pub cpu: Cpu,
@@ -72,6 +88,11 @@ pub struct Gba {
     // (pc, addr, size, val). The log is capped; oldest entries drop first.
     pub watch: Option<(u32, u32)>,
     pub watch_log: Vec<(u32, u32, u8, u32)>,
+
+    /// Set once a fault loop is detected (an undefined-instruction / abort
+    /// exception storm). While set, [`Gba::run_frame`] freezes the CPU and
+    /// re-presents the crash screen every frame.
+    pub fault: Option<Fault>,
 }
 
 impl Default for Gba {
@@ -113,6 +134,7 @@ impl Gba {
             halt_requested: false,
             watch: None,
             watch_log: Vec::new(),
+            fault: None,
         }
     }
 
@@ -212,7 +234,14 @@ impl Gba {
 
     // ---- the frame loop (ported from emulator.ts runFrame, interpreter-only) ----
     pub fn run_frame(&mut self) {
+        // Once faulted, freeze: keep presenting the crash screen, run no code.
+        if self.fault.is_some() {
+            self.present_crash();
+            return;
+        }
+
         self.keypad.tick_turbo();
+        let exc_before = self.cpu.exceptions;
         // Take the CPU out once for the whole frame so `self` can serve as its
         // bus inside the batch loop. Nothing reachable between batches (PPU /
         // timers / DMA / SIO / cheats) touches `self.cpu`, so a single
@@ -287,6 +316,34 @@ impl Gba {
             apply_cheats(self, &cheats);
             self.cheats = cheats;
         }
+
+        // Fault-loop detection: a storm of undefined-instruction / abort
+        // exceptions this frame means the CPU is wedged re-faulting; capture the
+        // cause and switch to the crash screen (presented now and every frame
+        // hereafter).
+        if self.cpu.exceptions.wrapping_sub(exc_before) > FAULT_THRESHOLD {
+            self.fault = Some(Fault {
+                pc: self.cpu.last_exc_pc,
+                kind: self.cpu.last_exc_kind,
+            });
+            self.present_crash();
+        }
+    }
+
+    /// Draw the crash screen into the PPU framebuffer from the latched
+    /// [`Fault`]. Called on first detection and every frame thereafter so the
+    /// panel stays presented (the host blits `framebuffer()` each frame).
+    fn present_crash(&mut self) {
+        let f = match &self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "GBA CORE FAULT".to_string(),
+            f.kind.to_string(),
+            format!("PC {:08X}", f.pc),
+        ];
+        crate::crash::render(&mut self.ppu.frame, 240, 160, &lines);
     }
 
     // ---- DMA triggers: take dma+irq out, run with `self` as the bus ----
@@ -679,5 +736,62 @@ impl Bus for Gba {
         let handled = bios.handle_swi(comment, cpu, self);
         self.bios = bios;
         handled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::mode;
+
+    /// Install a returning UNDEFINED-instruction vector in the BIOS so the guest
+    /// re-faults forever: at 0x04 (the UND vector) place `SUBS PC, LR, #4`, which
+    /// returns to the faulting instruction (UND LR = faulting_addr + 4), so the
+    /// undefined opcode is re-executed every time → an exception storm.
+    fn install_returning_und_vector(g: &mut Gba) {
+        let wr32 = |bios: &mut [u8], off: usize, v: u32| {
+            bios[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        wr32(&mut g.mem.bios[..], 0x04, 0xE25E_F004); // SUBS PC, LR, #4
+    }
+
+    #[test]
+    fn undefined_instruction_storm_raises_crash_screen() {
+        let mut g = Gba::new();
+        g.load_rom(&[0u8; 0x100]);
+        install_returning_und_vector(&mut g);
+
+        // Run an undefined ARM instruction at IWRAM in System mode (so the UND
+        // exception's banked SPSR/return is clean). Encoding 0xE6000010 matches
+        // the architectural undefined slot: cond=E, bits27-25=011, bit4=1.
+        let und = 0xE600_0010u32;
+        Bus::write32(&mut g, 0x0300_0000, und);
+        g.cpu.state.cpsr = mode::SYS;
+        g.cpu.state.r[15] = 0x0300_0000;
+        g.cpu.state.r[13] = 0x0300_7F00;
+        g.cpu.branched = false;
+
+        assert!(g.fault.is_none(), "no fault before running");
+        g.run_frame();
+
+        // The storm tripped the detector and latched a fault.
+        assert!(g.fault.is_some(), "undefined-instruction storm must fault");
+        let f = g.fault.as_ref().unwrap();
+        assert_eq!(f.kind, "UNDEF INSTR");
+        assert_eq!(f.pc, 0x0300_0000, "faulting PC captured");
+
+        // The crash screen was rendered: the framebuffer holds the dark-blue
+        // panel (non-zero) plus white text pixels (not the default black/zero).
+        let fb = g.framebuffer();
+        assert_eq!(fb.len(), 240 * 160 * 4);
+        let bg = fb[0..4] == [0x10, 0x10, 0x60, 0xFF];
+        assert!(bg, "framebuffer cleared to crash background");
+        let has_white = fb.chunks_exact(4).any(|p| p == [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(has_white, "crash screen drew white text pixels");
+
+        // Once faulted the CPU is frozen: another frame just re-presents.
+        let exc = g.cpu.exceptions;
+        g.run_frame();
+        assert_eq!(g.cpu.exceptions, exc, "CPU frozen after fault");
     }
 }

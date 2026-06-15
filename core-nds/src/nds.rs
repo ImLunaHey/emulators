@@ -41,6 +41,19 @@ pub enum Core {
     Arm7,
 }
 
+/// A detected ARM9 fault loop (an unhandled-exception storm), captured for the
+/// crash screen. Once set, [`Nds::run_frame`] freezes both CPUs and keeps the
+/// crash panel presented.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// Exception cause of the storm (a `crate::cpu::exec::exc::*` code).
+    pub code: u32,
+    /// ARM9 PC at the most recent exception entry.
+    pub pc: u32,
+    /// Frame number when the fault was detected.
+    pub frame: u32,
+}
+
 pub struct Nds {
     /// Single backing copy of every block both CPUs can touch.
     pub mem: SharedMemory,
@@ -166,6 +179,10 @@ pub struct Nds {
     /// is the one whose DMA/IRQ the transfer drives, and the non-owner's cart
     /// register accesses read open-bus. Default 0 = ARM9 owns (boot default).
     pub exmemcnt: u32,
+
+    /// Set once an ARM9 fault loop is detected (an unhandled-exception storm).
+    /// While set, `run_frame` runs no CPU code and re-presents the crash screen.
+    pub fault: Option<Fault>,
 }
 
 impl Default for Nds {
@@ -215,6 +232,7 @@ impl Nds {
             keyinput: 0x03FF,
             ext_keyinput: 0x007F,
             exmemcnt: 0,
+            fault: None,
         };
         // Seed the BIOS IRQ-handler-pointer literal from CP15's reset DTCM
         // placement (matches the TS Cp15 constructor calling it). `cp15`,
@@ -1369,8 +1387,21 @@ impl Nds {
     // (`bios_service_wait` at VBlank, `nitro_os_tick` once per frame, and at
     // frame end). The SWI seam inside `Cpu::step` independently swaps the live
     // state into `state9`/`state7` for the duration of each HLE call.
+    /// ARM9 exception entries within a single frame above which we declare a
+    /// fault loop. A healthy frame takes only a handful (a VBlank IRQ or two); a
+    /// CPU wedged re-faulting every few instructions takes tens of thousands —
+    /// a crash, not a running game. Mirrors the PS1 core's exception-storm
+    /// threshold (the ARM is exception-based, like the MIPS).
+    const FAULT_THRESHOLD: u64 = 10_000;
+
     pub fn run_frame(&mut self) {
         use crate::ppu::ppu::{DOTS_PER_LINE, LINES_PER_FRAME};
+
+        // Once faulted, freeze: keep the crash panel presented, run no CPU code.
+        if self.fault.is_some() {
+            self.present_crash();
+            return;
+        }
 
         /// Instruction steps per dot, ARM9 (ARM9 runs at ~2x the dot clock).
         const ARM9_STEPS_PER_DOT: u32 = 2;
@@ -1389,6 +1420,9 @@ impl Nds {
         let mut cpu7 = std::mem::replace(&mut self.cpu7, Cpu::new(Core::Arm7));
         cpu9.state = std::mem::take(&mut self.state9);
         cpu7.state = std::mem::take(&mut self.state7);
+
+        // Snapshot the ARM9 exception count to measure this frame's delta below.
+        let exc_before = cpu9.exceptions;
 
         let mut dots_done = 0u32;
         let mut a7_carry = 0u32;
@@ -1480,10 +1514,28 @@ impl Nds {
         self.state7 = std::mem::take(&mut cpu7.state);
         self.nitro_os_tick();
 
+        // Fault-loop detection: a storm of ARM9 exception entries this frame
+        // means the CPU is wedged re-faulting (e.g. an undefined-instruction
+        // vector with no valid handler, looping forever). Capture the cause +
+        // PC and switch to the crash screen.
+        if cpu9.exceptions.wrapping_sub(exc_before) > Self::FAULT_THRESHOLD {
+            self.fault = Some(Fault {
+                code: cpu9.last_exc,
+                pc: cpu9.last_exc_pc,
+                frame: self.ppu.frame_count,
+            });
+        }
+
         // Restore the executors (the assist may have raised an IRQ; the next
         // frame re-samples the lines from the IRQ controller).
         self.cpu9 = cpu9;
         self.cpu7 = cpu7;
+
+        // On first detection, present the crash panel now (subsequent frames
+        // short-circuit at the top of `run_frame`).
+        if self.fault.is_some() {
+            self.present_crash();
+        }
 
         // Mix one frame of audio (~735 stereo samples @ 44.1 kHz) for the host.
         const AUDIO_FRAMES: usize = 735;
@@ -1494,6 +1546,26 @@ impl Nds {
             self.audio_buf.clear(); // host fell behind — drop the backlog
         }
         self.audio_buf.extend_from_slice(&tmp);
+    }
+
+    /// Draw the crash screen into the TOP-screen framebuffer from the latched
+    /// [`Fault`]. Called once on detection and every frame thereafter so the
+    /// panel stays presented while both CPUs are frozen.
+    fn present_crash(&mut self) {
+        use crate::cpu::exec::exc_name;
+        use crate::ppu::ppu::{SCREEN_H, SCREEN_W};
+        let f = match self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "NDS CORE FAULT".to_string(),
+            exc_name(f.code).to_string(),
+            format!("PC {:08X}", f.pc),
+            format!("FRAME {}", f.frame),
+        ];
+        let fb = self.ppu.top_framebuffer_mut();
+        crate::crash::render(fb, SCREEN_W, SCREEN_H, &lines);
     }
 
     /// Drain mixed audio since the last call (interleaved stereo f32, 44.1 kHz).
@@ -2297,5 +2369,72 @@ mod tests {
         nds.set_touch(false, 0, 0);
         assert_eq!(nds.spi.touch_x, None);
         assert_ne!(nds.read8_arm9(0x0400_0136) & 0x40, 0, "pen up");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Crash screen — a forced ARM9 exception storm trips the fault watcher and
+    // paints the crash panel into the top framebuffer.
+    //
+    // The ARM9 program is a single permanently-UNDEFINED instruction (the
+    // ARMv5 "UDF" encoding). Executing it takes the undefined-instruction
+    // vector, which on our HLE-booted high-vector region holds no valid
+    // handler — the CPU re-faults every step. Across one frame that is tens of
+    // thousands of exception entries: an unhandled-exception storm = a fault
+    // loop, which sets `fault` and renders the crash screen.
+    // ════════════════════════════════════════════════════════════════════
+    #[test]
+    fn run_frame_undef_storm_trips_crash_screen() {
+        // ARM9: a permanently-undefined UDF (0xE7F000F0) at the entry point. No
+        // valid UND handler exists at the high vector, so each execution re-takes
+        // the exception → a storm within a single frame.
+        let arm9_bytes = 0xE7F0_00F0u32.to_le_bytes().to_vec();
+        // ARM7: busy-loop so its core has something to step.
+        let arm7_bytes = 0xEAFF_FFFEu32.to_le_bytes().to_vec();
+
+        let rom = smoke_synth_cart(&arm9_bytes, 0x0200_0000, &arm7_bytes, 0x0380_0000);
+        let mut nds = Nds::new();
+        nds.load_rom(&rom);
+        assert!(nds.fault.is_none(), "no fault before running");
+
+        // Install a broken UND handler at the ARM9 high vector (0xFFFF_0004):
+        // another UDF. Taking the undefined-instruction exception jumps here,
+        // which is *itself* undefined, so the CPU re-faults immediately — the
+        // canonical unhandled-exception fault loop. (The handler never returns;
+        // it just keeps re-entering the vector, tens of thousands of times per
+        // frame.)
+        nds.write32_arm9(0xFFFF_0004, 0xE7F0_00F0);
+
+        // One frame is enough to rack up the exception storm.
+        nds.run_frame();
+
+        let fault = nds.fault.expect("undef storm must set a fault");
+        assert_eq!(
+            fault.code,
+            crate::cpu::exec::exc::UNDEF,
+            "captured cause should be the undefined-instruction exception"
+        );
+
+        // The top framebuffer must hold the crash panel: every pixel is either
+        // the dark-blue background or white text — and at least some are the
+        // white text (proving glyphs were drawn, not just a cleared screen).
+        let fb = nds.top_framebuffer();
+        assert_eq!(fb.len(), 256 * 192 * 4);
+        let bg = [0x10u8, 0x10, 0x60, 0xFF];
+        let fg = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let mut text_pixels = 0usize;
+        for px in fb.chunks_exact(4) {
+            assert!(
+                px == bg || px == fg,
+                "crash framebuffer pixels must be bg or fg, got {px:?}"
+            );
+            if px == fg {
+                text_pixels += 1;
+            }
+        }
+        assert!(text_pixels > 0, "crash screen must have drawn white text");
+
+        // Re-running stays faulted (both CPUs frozen) and keeps presenting it.
+        nds.run_frame();
+        assert!(nds.fault.is_some(), "fault is sticky once set");
     }
 }

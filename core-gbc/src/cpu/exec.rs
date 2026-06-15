@@ -92,8 +92,21 @@ impl Cpu {
             Power::Running => {}
         }
 
+        // PC of the instruction about to be fetched, so an illegal opcode can
+        // report where it locked up.
+        let instr_pc = self.pc;
+        let had_illegal = self.illegal_op.is_some();
         let opcode = self.fetch8(bus);
-        self.execute(opcode, bus)
+        let cycles = self.execute(opcode, bus);
+        // If `execute` just newly raised the illegal-opcode signal, tag it with
+        // this instruction's PC for the crash readout (don't clobber an earlier
+        // one on later instructions).
+        if !had_illegal {
+            if let Some((op, _)) = self.illegal_op {
+                self.illegal_op = Some((op, instr_pc));
+            }
+        }
+        cycles
     }
 
     // ---- flag helpers ----
@@ -491,8 +504,14 @@ impl Cpu {
             // ---- CB prefix ----
             0xCB => self.execute_cb(bus),
 
-            // ---- illegal opcodes (no operation on hardware) ----
-            0xD3 | 0xDB | 0xDD | 0xE3 | 0xE4 | 0xEB | 0xEC | 0xED | 0xF4 | 0xFC | 0xFD => 4,
+            // ---- illegal opcodes (hard-lock real hardware) ----
+            // These have no defined behavior and freeze the SM83. Signal a
+            // fault for the orchestrator to surface on the crash screen. The
+            // instruction PC is filled in by `step`.
+            0xD3 | 0xDB | 0xDD | 0xE3 | 0xE4 | 0xEB | 0xEC | 0xED | 0xF4 | 0xFC | 0xFD => {
+                self.illegal_op = Some((op, 0));
+                4
+            }
         }
     }
 

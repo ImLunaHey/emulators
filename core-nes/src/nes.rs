@@ -13,10 +13,20 @@ use crate::bus::Bus;
 use crate::cart::{Cart, CartError, Mirroring};
 use crate::cpu::Cpu;
 use crate::input::Controllers;
-use crate::ppu::{Ppu, PpuBus, FB_LEN};
+use crate::ppu::{Ppu, PpuBus, FB_LEN, SCREEN_H, SCREEN_W};
 
 /// PPU dots per CPU cycle (NTSC).
 const DOTS_PER_CPU: u32 = 3;
+
+/// A latched CPU fault, captured for the crash screen. The 6502's JAM/KIL
+/// illegal opcodes hard-halt the processor; we detect one and freeze.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// The JAM/KIL opcode that halted the CPU.
+    pub opcode: u8,
+    /// Program counter of the halting opcode.
+    pub pc: u16,
+}
 
 pub struct Nes {
     pub cpu: Cpu,
@@ -30,6 +40,10 @@ pub struct Nes {
 
     /// True while an OAM DMA ($4014) is being serviced this step.
     oam_dma_page: Option<u8>,
+
+    /// Set once the CPU executes a JAM/KIL illegal opcode. While set,
+    /// [`Nes::run_frame`] freezes the CPU and re-presents the crash screen.
+    pub fault: Option<Fault>,
 }
 
 impl Default for Nes {
@@ -48,6 +62,7 @@ impl Nes {
             controllers: Controllers::new(),
             ram: vec![0u8; 0x800].into_boxed_slice().try_into().unwrap(),
             oam_dma_page: None,
+            fault: None,
         }
     }
 
@@ -58,6 +73,7 @@ impl Nes {
         self.ppu = Ppu::new();
         self.apu = Apu::new();
         self.cpu = Cpu::new();
+        self.fault = None;
         // Reset reads the reset vector through the bus.
         let mut cpu = std::mem::take(&mut self.cpu);
         cpu.reset(self);
@@ -90,6 +106,11 @@ impl Nes {
         if self.cart.is_none() {
             return;
         }
+        // Already faulted: freeze the CPU and keep presenting the crash screen.
+        if self.fault.is_some() {
+            self.present_crash();
+            return;
+        }
         let start_frame = self.ppu.frame;
         // Safety valve: a frame is ~29780 CPU cycles; cap to avoid a runaway
         // loop if rendering is disabled (then `frame` still advances via the
@@ -98,7 +119,34 @@ impl Nes {
         while self.ppu.frame == start_frame && guard < 200_000 {
             self.step_instruction();
             guard += 1;
+            // The CPU latches a JAM/KIL illegal opcode (hard halt). Capture the
+            // fault, draw the crash screen, and stop running this frame.
+            if let Some((opcode, pc)) = self.cpu.jam {
+                self.fault = Some(Fault { opcode, pc });
+                self.present_crash();
+                return;
+            }
         }
+    }
+
+    /// Draw the crash screen into the PPU framebuffer from the latched
+    /// [`Fault`]. Called every frame once faulted so the panel stays presented.
+    fn present_crash(&mut self) {
+        let f = match self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "NES CORE FAULT".to_string(),
+            format!("ILLEGAL OP {:02X}", f.opcode),
+            format!("PC {:04X}", f.pc),
+        ];
+        crate::crash::render(
+            &mut self.ppu.framebuffer[..],
+            SCREEN_W,
+            SCREEN_H,
+            &lines,
+        );
     }
 
     /// Step one CPU instruction and clock the PPU/APU for its cycles.
@@ -320,6 +368,40 @@ mod tests {
         let f0 = nes.frame_count();
         nes.run_frame();
         assert_eq!(nes.frame_count(), f0 + 1);
+    }
+
+    #[test]
+    fn jam_opcode_faults_and_draws_crash_screen() {
+        // A JAM/KIL illegal opcode (0x02) at the reset vector should hard-halt
+        // the CPU: latch a fault and paint the crash screen.
+        let rom = build_nrom(|prg| {
+            prg[0x0000] = 0x02; // JAM
+        });
+        let mut nes = Nes::new();
+        nes.load_rom(&rom).unwrap();
+        // Enable rendering so the frame loop is exercised; the JAM should
+        // short-circuit it before a frame completes.
+        nes.write8(0x2001, 0x18);
+        assert!(nes.fault.is_none());
+        nes.run_frame();
+
+        // Fault captured with the opcode and the PC of the JAM ($8000).
+        let f = nes.fault.expect("JAM should set a fault");
+        assert_eq!(f.opcode, 0x02);
+        assert_eq!(f.pc, 0x8000);
+
+        // The framebuffer is the dark-blue crash background plus white text:
+        // it must contain at least one non-background (white text) pixel.
+        let fb = nes.framebuffer();
+        let bg = [0x10u8, 0x10, 0x60, 0xFF];
+        let has_text = fb.chunks_exact(4).any(|px| px != bg);
+        assert!(has_text, "crash screen should have non-background text pixels");
+
+        // Re-running keeps the CPU frozen and re-presents the crash screen.
+        let f0 = nes.frame_count();
+        nes.run_frame();
+        assert_eq!(nes.frame_count(), f0, "CPU should be frozen after fault");
+        assert!(nes.fault.is_some());
     }
 
     #[test]

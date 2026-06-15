@@ -132,6 +132,17 @@ impl Ppu {
         }
     }
 
+    /// Mutable view of the TOP-screen framebuffer (same POWCNT1 bit-15 swap as
+    /// `top_framebuffer`). Used by the crash screen to draw straight into the
+    /// buffer the host presents for the top display.
+    pub fn top_framebuffer_mut(&mut self) -> &mut [u8] {
+        if (self.powcnt1 & 0x8000) != 0 {
+            &mut self.fb_a[..]
+        } else {
+            &mut self.fb_b[..]
+        }
+    }
+
     /// The 256x192 RGBA8888 framebuffer for the BOTTOM screen (see
     /// `top_framebuffer` for the POWCNT1 bit-15 swap semantics).
     pub fn bottom_framebuffer(&self) -> &[u8] {

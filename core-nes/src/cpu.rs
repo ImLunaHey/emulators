@@ -56,6 +56,11 @@ pub struct Cpu {
     pub nmi_pending: bool,
     pub irq_line: bool,
 
+    /// Latched on executing a JAM/KIL illegal opcode (which hard-halts a real
+    /// 6502). Holds `(opcode, pc_of_opcode)`; the orchestrator polls this to
+    /// raise a core fault and present the crash screen.
+    pub jam: Option<(u8, u16)>,
+
     pub cycles: u64,
 }
 
@@ -76,6 +81,7 @@ impl Cpu {
             status: FLAG_I | FLAG_U,
             nmi_pending: false,
             irq_line: false,
+            jam: None,
             cycles: 0,
         }
     }
@@ -536,8 +542,19 @@ impl Cpu {
             0x63 => self.rmw_alu(bus, Izx, RmwAlu::Rra, 8),
             0x73 => self.rmw_alu(bus, Izy, RmwAlu::Rra, 8),
 
-            // Any remaining undocumented opcode: treat as a 2-cycle NOP. (KIL
-            // opcodes would actually jam the CPU; test ROMs don't hit them.)
+            // JAM / KIL: undocumented opcodes that hard-halt a real 6502 (data
+            // bus floats, PC stops advancing). Latch the fault and rewind PC to
+            // the opcode so the CPU stays wedged on it; the orchestrator turns
+            // this into a core fault + crash screen.
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2
+            | 0xD2 | 0xF2 => {
+                let jam_pc = self.pc.wrapping_sub(1);
+                self.jam = Some((op, jam_pc));
+                self.pc = jam_pc;
+                2
+            }
+
+            // Any remaining undocumented opcode: treat as a 2-cycle NOP.
             _ => 2,
         }
     }

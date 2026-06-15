@@ -77,6 +77,40 @@ pub struct Cpu {
     /// instruction redirected PC (branch/BX/LDR-PC/...). The interpreter has
     /// no real prefetch buffer, so this just suppresses the auto-advance.
     pub branched: bool,
+
+    /// Total *real* exception-vector entries taken since reset (UND / SWI that
+    /// fell through HLE / IRQ / FIQ). `run_frame` watches the per-frame delta:
+    /// a CPU wedged re-faulting every few instructions racks up tens of
+    /// thousands per frame — an unhandled-exception storm = a fault loop, which
+    /// drives the crash screen. Normal frames take only a handful (a VBlank IRQ
+    /// or two), so the threshold never trips on healthy code.
+    pub exceptions: u64,
+    /// Architectural cause of the most recent exception entry (one of the
+    /// `EXC_*` codes). Captured for the crash readout's CAUSE line.
+    pub last_exc: u32,
+    /// PC at the most recent exception entry (the saved return address). The
+    /// crash readout's PC line.
+    pub last_exc_pc: u32,
+}
+
+/// Exception-cause codes for [`Cpu::last_exc`] (our own small enum, since the
+/// ARM has no COP0 CAUSE register — the vector offset encodes the kind).
+pub mod exc {
+    pub const UNDEF: u32 = 1;
+    pub const SWI: u32 = 2;
+    pub const IRQ: u32 = 3;
+    pub const FIQ: u32 = 4;
+}
+
+/// Short uppercase mnemonic for an exception cause (font covers A-Z/0-9 only).
+pub fn exc_name(code: u32) -> &'static str {
+    match code {
+        exc::UNDEF => "UNDEF INSTR",
+        exc::SWI => "SWI",
+        exc::IRQ => "IRQ",
+        exc::FIQ => "FIQ",
+        _ => "UNKNOWN",
+    }
 }
 
 impl Cpu {
@@ -91,7 +125,18 @@ impl Cpu {
             fiq_line: false,
             wake_line: false,
             branched: false,
+            exceptions: 0,
+            last_exc: 0,
+            last_exc_pc: 0,
         }
+    }
+
+    /// Record a real exception entry for the fault-loop watcher + crash readout.
+    #[inline]
+    fn note_exception(&mut self, code: u32, pc: u32) {
+        self.exceptions = self.exceptions.wrapping_add(1);
+        self.last_exc = code;
+        self.last_exc_pc = pc;
     }
 
     #[inline]
@@ -267,6 +312,7 @@ impl Cpu {
             s.r[15].wrapping_sub(4)
         };
         s.enter_exception(mode::SVC, vector, ret, false);
+        self.note_exception(exc::SWI, ret);
         self.flush_pipeline();
     }
 
@@ -281,6 +327,7 @@ impl Cpu {
             s.r[15].wrapping_sub(4)
         };
         s.enter_exception(mode::UND, vector, ret, false);
+        self.note_exception(exc::UNDEF, ret);
         self.flush_pipeline();
     }
 
@@ -291,6 +338,7 @@ impl Cpu {
         let vector = self.exc_vector(0x18);
         let ret = self.state.r[15].wrapping_add(4);
         self.state.enter_exception(mode::IRQ, vector, ret, false);
+        self.note_exception(exc::IRQ, ret);
         self.flush_pipeline();
     }
 
@@ -300,6 +348,7 @@ impl Cpu {
         let vector = self.exc_vector(0x1C);
         let ret = self.state.r[15].wrapping_add(4);
         self.state.enter_exception(mode::FIQ, vector, ret, true);
+        self.note_exception(exc::FIQ, ret);
         self.flush_pipeline();
     }
 

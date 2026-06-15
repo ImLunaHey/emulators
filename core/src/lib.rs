@@ -16,6 +16,7 @@ pub mod arm;
 pub mod bios;
 pub mod cheats;
 pub mod cpu;
+pub mod crash;
 pub mod dma;
 pub mod eeprom;
 pub mod flash;

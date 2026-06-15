@@ -29,6 +29,18 @@ pub struct Cpu {
     // executed instruction redirected PC (set by flush_pipeline / cleared each
     // step) and to honor a post-savestate pipeline clear.
     prefetched_valid: bool,
+
+    // ---- fault-loop detection (crash screen) ----
+    // Count of CPU exceptions taken on the undefined-instruction / abort path
+    // since reset. The frame loop watches the per-frame rate: a "storm" of these
+    // (the CPU re-faulting every few instructions, never making progress) is a
+    // crash, not a running game. ARM is exception-based like the PS1's MIPS, so
+    // this mirrors the PS1 core's exception-storm approach.
+    pub exceptions: u64,
+    // Decode PC + short mnemonic of the most recent such exception, latched for
+    // the crash screen readout.
+    pub last_exc_pc: u32,
+    pub last_exc_kind: &'static str,
 }
 
 impl Default for Cpu {
@@ -45,6 +57,9 @@ impl Cpu {
             irq_line: false,
             branched: false,
             prefetched_valid: false,
+            exceptions: 0,
+            last_exc_pc: 0,
+            last_exc_kind: "UNDEF INSTR",
         }
     }
 
@@ -60,6 +75,9 @@ impl Cpu {
         self.state.bank_r13[3] = 0x0300_7FE0; // SVC
         self.state.r[15] = 0x0800_0000;
         self.prefetched_valid = false;
+        self.exceptions = 0;
+        self.last_exc_pc = 0;
+        self.last_exc_kind = "UNDEF INSTR";
         self.install_bios_stub(mem);
     }
 
@@ -188,6 +206,28 @@ impl Cpu {
             s.r[15].wrapping_sub(4)
         };
         s.enter_exception(mode::SVC, 0x08, ret, false);
+        self.flush_pipeline();
+    }
+
+    // Take the ARM UNDEFINED-INSTRUCTION exception: the decoder reached an
+    // opcode it can't execute. The real ARM7TDMI vectors to 0x04 in Undefined
+    // mode (LR = address of the instruction + insn_size). We additionally bump
+    // `exceptions` + latch the cause so the frame loop can spot a fault loop (a
+    // storm of these) and show the crash screen. `kind` is a short uppercase
+    // mnemonic for the readout (the crash font is A-Z/0-9/space only).
+    pub fn undefined_instruction(&mut self, kind: &'static str) {
+        let s = &mut self.state;
+        let in_thumb = (s.cpsr & FLAG_T) != 0;
+        // r[15] currently holds the architectural visible PC (decode + prefetch
+        // offset). The faulting instruction is at decode = r[15] - prefetch_off;
+        // LR for UND is that address + insn_size.
+        let (prefetch_off, insn_size) = if in_thumb { (4u32, 2u32) } else { (8u32, 4u32) };
+        let decode = s.r[15].wrapping_sub(prefetch_off);
+        let ret = decode.wrapping_add(insn_size);
+        self.last_exc_pc = decode;
+        self.last_exc_kind = kind;
+        self.exceptions = self.exceptions.wrapping_add(1);
+        s.enter_exception(mode::UND, 0x04, ret, false);
         self.flush_pipeline();
     }
 

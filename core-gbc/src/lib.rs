@@ -33,6 +33,9 @@ pub mod ppu;
 pub mod serial;
 pub mod timer;
 
+// --- Crash screen (fault readout drawn into the framebuffer).
+pub mod crash;
+
 // --- Top-level orchestrator.
 pub mod emulator;
 

@@ -512,7 +512,11 @@ pub fn thumb_execute<B: Bus + ?Sized>(cpu: &mut Cpu, bus: &mut B, instr: u32) {
                 return;
             }
             if cond == 0xE {
-                return; // undefined
+                // Undefined: the real ARM7TDMI takes the undefined-instruction
+                // exception (vector 0x04). Bump the counter so the frame loop
+                // can detect a fault loop.
+                cpu.undefined_instruction("UNDEF INSTR");
+                return;
             }
             if !cpu.state.check_cond(cond) {
                 return;

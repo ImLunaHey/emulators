@@ -178,6 +178,15 @@ pub fn arm_execute(cpu: &mut Cpu, nds: &mut Nds, instr: u32) {
         return;
     }
 
+    // Permanently UNDEFINED encoding (ARMv5 "UDF" space): bits 27:20 = 0111_1111
+    // and bits 7:4 = 1111. No toolchain emits this as a valid instruction, so a
+    // game hitting it has jumped into garbage / corrupted its code — take the
+    // real undefined-instruction exception (the fault-loop watcher counts it).
+    if (instr & 0x0FF0_00F0) == 0x07F0_00F0 {
+        cpu.undefined_instruction();
+        return;
+    }
+
     // Block data transfer LDM/STM: 100x.
     if (instr & 0x0E00_0000) == 0x0800_0000 {
         arm_block_transfer(cpu, nds, instr);
