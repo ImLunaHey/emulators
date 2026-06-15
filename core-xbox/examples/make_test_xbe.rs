@@ -33,11 +33,11 @@ fn hdr(method: u32) -> u32 {
 
 /// Emit an immediate-mode flat triangle (screen-space coords) into the
 /// pushbuffer: BEGIN(triangles), 3 × (diffuse, posX, posY), END.
-fn triangle(w: &mut Vec<u32>, verts: [(f32, f32); 3], color: u32) {
+fn triangle(w: &mut Vec<u32>, verts: [(f32, f32, u32); 3]) {
     w.push(hdr(0x17FC)); // SET_BEGIN_END
     w.push(4); // TRIANGLES
-    for (x, y) in verts {
-        w.push(hdr(0x194C)); // diffuse color
+    for (x, y, color) in verts {
+        w.push(hdr(0x194C)); // diffuse color (per vertex -> Gouraud)
         w.push(color);
         w.push(hdr(0x1880)); // vertex X
         w.push(x.to_bits());
@@ -83,8 +83,16 @@ fn main() {
     clip_clear(&mut words, 0, 640, 0, 80, 0xFF6C_D84C); // top bar (Xbox green)
     clip_clear(&mut words, 220, 200, 180, 120, 0xFFE8_E8E8); // center panel
     clip_clear(&mut words, 0, 640, 440, 40, 0xFF20_50C0); // bottom bar (blue)
-    // A red triangle drawn through the primitive pipeline, over the panel.
-    triangle(&mut words, [(320.0, 180.0), (250.0, 320.0), (390.0, 320.0)], 0xFFD0_2020);
+    // A Gouraud-shaded RGB triangle through the primitive pipeline, over the
+    // panel (red apex, green + blue base) — shows vertex-color interpolation.
+    triangle(
+        &mut words,
+        [
+            (320.0, 170.0, 0xFFFF_3030),
+            (240.0, 330.0, 0xFF30_FF30),
+            (400.0, 330.0, 0xFF30_30FF),
+        ],
+    );
 
     // x86: write the pushbuffer into RAM, set GET then PUT (kicks the GPU), spin.
     let mut code = Vec::new();

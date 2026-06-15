@@ -407,20 +407,27 @@ impl Nv2a {
         if area.abs() < 1e-3 {
             return;
         }
-        let color = a.color;
+        // Per-channel barycentric interpolation of the three vertex colors.
+        let chan = |color: u32, sh: u32| ((color >> sh) & 0xFF) as f32;
         for y in miny..=maxy {
             for x in minx..=maxx {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 let w0 = edge(b.x, b.y, c.x, c.y, px, py);
                 let w1 = edge(c.x, c.y, a.x, a.y, px, py);
                 let w2 = edge(a.x, a.y, b.x, b.y, px, py);
-                // Inside if all edge functions share the winding sign.
                 let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
                     || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-                if inside {
-                    let off = self.surface_offset.wrapping_add(y as u32 * pitch + x as u32 * 4);
-                    wr32(ram, off, color);
+                if !inside {
+                    continue;
                 }
+                let (l0, l1, l2) = (w0 / area, w1 / area, w2 / area);
+                let mix = |sh: u32| {
+                    (l0 * chan(a.color, sh) + l1 * chan(b.color, sh) + l2 * chan(c.color, sh))
+                        .clamp(0.0, 255.0) as u32
+                };
+                let color = 0xFF00_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0);
+                let off = self.surface_offset.wrapping_add(y as u32 * pitch + x as u32 * 4);
+                wr32(ram, off, color);
             }
         }
     }
