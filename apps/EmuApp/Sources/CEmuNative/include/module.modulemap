@@ -1,0 +1,4 @@
+module CEmuNative {
+    header "emu_native.h"
+    export *
+}
