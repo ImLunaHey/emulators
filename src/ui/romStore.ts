@@ -1,7 +1,10 @@
-// IndexedDB-backed ROM library. Individual ROM files are 8-32 MB each
-// (far larger than localStorage's ~5 MB quota), so we shelve them in
-// IndexedDB and remember the user's selection. The user uploads their
-// own .gba files; nothing ROM-related is ever shipped from the server.
+// IndexedDB-backed ROM library. A row holds either the ROM bytes (the legacy /
+// fallback path, for browsers without the File System Access API) OR an on-disk
+// `FileSystemFileHandle` (preferred) — in the latter case only the handle +
+// metadata live in IndexedDB and the bytes are read straight from disk at launch
+// time, so huge media (a 4.7 GB Xbox disc) never gets copied into browser
+// storage. The user supplies their own ROMs; nothing is shipped from the server.
+import { ensureReadPermission } from './fsaccess';
 
 const DB_NAME = 'gba-recomp-roms';
 const STORE = 'roms';
@@ -59,18 +62,34 @@ export async function listRoms(): Promise<RomMeta[]> {
   });
 }
 
+/** Read a stored row by id (full record, including any bytes/handle). */
+function getRow(id: string): Promise<any | undefined> {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readonly');
+        const req = tx.objectStore(STORE).get(id);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }),
+  );
+}
+
+/** Get a ROM's bytes. For a disk-handle row this reads the file from disk on
+ * demand (re-requesting read permission if needed — call from a user gesture);
+ * for a legacy bytes row it returns the stored blob. */
 export async function getRomBytes(id: string): Promise<Uint8Array | null> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const store = tx.objectStore(STORE);
-    const req = store.get(id);
-    req.onsuccess = () => {
-      const row = req.result as { bytes?: Uint8Array } | undefined;
-      resolve(row?.bytes ?? null);
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const row = await getRow(id);
+  if (!row) return null;
+  const handle = row.handle as FileSystemFileHandle | undefined;
+  if (handle) {
+    if (!(await ensureReadPermission(handle))) {
+      throw new Error(`Permission to read "${row.filename ?? id}" from disk was denied`);
+    }
+    const file = await handle.getFile();
+    return new Uint8Array(await file.arrayBuffer());
+  }
+  return (row.bytes as Uint8Array | undefined) ?? null;
 }
 
 export async function addRom(
@@ -108,6 +127,33 @@ export async function addRom(
     tx.onerror = () => reject(tx.error);
   });
   return { id, filename, title, code, system, size: bytes.length, addedAt: row.addedAt, icon: opts.icon, md5: opts.md5 };
+}
+
+// Add a ROM by on-disk handle (File System Access API). Stores only the handle
+// + metadata — NOT the bytes — so the file stays on disk and is read at launch.
+// The caller parses any header fields (GBA title/code, NDS banner) from a slice
+// and passes them via opts, since we deliberately don't read the whole file here.
+export async function addRomHandle(
+  handle: FileSystemFileHandle,
+  system: string,
+  opts: { title?: string; code?: string; icon?: Uint8Array; md5?: string; size?: number } = {},
+): Promise<RomMeta> {
+  const filename = handle.name;
+  const base = filename.replace(/\.[^.]+$/, '');
+  const title = opts.title || base;
+  const code = opts.code ?? '';
+  const id = slugify(base);
+  const size = opts.size ?? 0;
+  const addedAt = Date.now();
+  const row = { id, filename, title, code, system, size, addedAt, icon: opts.icon, md5: opts.md5, handle };
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(row);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  return { id, filename, title, code, system, size, addedAt, icon: opts.icon, md5: opts.md5 };
 }
 
 // Backfill an existing ROM's md5 (older library entries pre-date the

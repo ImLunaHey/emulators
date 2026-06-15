@@ -2,7 +2,8 @@ import { useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useRomList } from './hooks/useRomList';
 import { deleteRom, setSelectedRom, type RomMeta } from './romStore';
-import { ingestFiles } from './romIngest';
+import { ingestFiles, ingestHandles } from './romIngest';
+import { supportsFsa, pickRomHandles, handleFromDropItem } from './fsaccess';
 import { ACCEPT, ALL_SYSTEMS, type SystemId } from './systems';
 import { useToast } from './Toast';
 import { ConsoleGrid } from './ConsoleGrid';
@@ -46,13 +47,24 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
     onPlay(rom.id, rom.system);
   };
 
-  const onAddFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    const res = await ingestFiles(files);
+  const report = (res: { added: number; failed: number }) => {
     if (res.added) toast.success(`Added ${res.added} game${res.added === 1 ? '' : 's'}`);
     if (res.failed) toast.error(`${res.failed} import${res.failed === 1 ? '' : 's'} failed`);
     if (!res.added && !res.failed) toast.error('No recognized ROMs in selection');
     refresh();
+  };
+
+  const onAddFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    report(await ingestFiles(files));
+  };
+
+  // Add ROMs by on-disk handle (File System Access API) — the file is referenced
+  // in place, not copied into browser storage. Used for the picker and for drops
+  // where the browser exposes a handle; large discs never load until launch.
+  const onAddHandles = async (handles: FileSystemFileHandle[]) => {
+    if (handles.length === 0) return;
+    report(await ingestHandles(handles));
   };
 
   const onDelete = async (rom: RomMeta, displayName: string) => {
@@ -62,14 +74,38 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
     refresh();
   };
 
-  const openPicker = () => fileRef.current?.click();
+  // Prefer the File System Access picker (keeps ROMs on disk); fall back to the
+  // hidden <input> (byte copy) on browsers that don't support it.
+  const openPicker = async () => {
+    if (supportsFsa()) {
+      const handles = await pickRomHandles(ACCEPT.split(','));
+      await onAddHandles(handles);
+      return;
+    }
+    fileRef.current?.click();
+  };
+
+  // A drop can carry on-disk handles (Chromium) — use them so a dropped disc
+  // stays on disk; otherwise fall back to the byte path.
+  const onDropFiles = async (dt: DataTransfer) => {
+    if (supportsFsa() && dt.items.length > 0) {
+      const handles = (
+        await Promise.all(Array.from(dt.items).map((it) => handleFromDropItem(it)))
+      ).filter((h): h is FileSystemFileHandle => h !== null);
+      if (handles.length > 0) {
+        await onAddHandles(handles);
+        return;
+      }
+    }
+    await onAddFiles(dt.files);
+  };
 
   return (
     <div
       className="relative w-full max-w-[1100px] mx-auto px-3 sm:px-5 py-4"
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
-      onDrop={(e) => { e.preventDefault(); setDragging(false); onAddFiles(e.dataTransfer.files); }}
+      onDrop={(e) => { e.preventDefault(); setDragging(false); onDropFiles(e.dataTransfer); }}
     >
       {active === null ? (
         <>
