@@ -139,6 +139,20 @@ pub struct Nv2a {
     /// Frames signalled (vblank count).
     pub vblank_count: u32,
 
+    // ---- Display mode (AvSetDisplayMode): the framebuffer the encoder scans
+    // out. On real hardware the game hands this to AvSetDisplayMode (address +
+    // pitch + format), independent of the PGRAPH render surface. When set, it
+    // gives scanout a concrete surface to present even before PGRAPH establishes
+    // one — so a game that programs the display and writes pixels directly (or
+    // flips to a back buffer we didn't track as the "surface") still shows up.
+    /// Display framebuffer base (guest RAM offset), or 0 if unset.
+    disp_addr: u32,
+    /// Display row pitch in bytes (0 ⇒ width*4).
+    disp_pitch: u32,
+    /// Display dimensions in pixels (0 ⇒ unset).
+    disp_w: u16,
+    disp_h: u16,
+
     // Color surface (filled by PGRAPH method handling).
     pub has_surface: bool,
     pub surface_offset: u32,
@@ -248,6 +262,10 @@ impl Nv2a {
             runout_status: RUNOUT_STATUS_LOW_MARK,
             crtc_start: 0,
             vblank_count: 0,
+            disp_addr: 0,
+            disp_pitch: 0,
+            disp_w: 0,
+            disp_h: 0,
             has_surface: false,
             surface_offset: 0,
             surface_pitch: 0,
@@ -292,6 +310,26 @@ impl Nv2a {
         self.pcrtc_intr |= PCRTC_INTR_VBLANK;
         self.ptimer_intr |= PTIMER_INTR_ALARM;
         self.vblank_count = self.vblank_count.wrapping_add(1);
+    }
+
+    /// Configure the display framebuffer (from `AvSetDisplayMode`): the address,
+    /// pitch, and size the video encoder scans out. `addr` is a guest physical
+    /// address (masked into RAM); `pitch` 0 means width*4. Adopting this lets
+    /// `scanout` present the game's framebuffer even when PGRAPH never produced a
+    /// surface through the methods we model.
+    pub fn set_display(&mut self, addr: u32, pitch: u32, width: u16, height: u16) {
+        self.disp_addr = addr & (crate::regions::RAM_SIZE as u32 - 1);
+        self.disp_pitch = pitch;
+        if width != 0 && height != 0 {
+            self.disp_w = width;
+            self.disp_h = height;
+        }
+        if std::env::var_os("XBOX_TRACE_GPU").is_some() {
+            eprintln!(
+                "[gpu] set_display addr={:#X} pitch={} {}x{}",
+                self.disp_addr, pitch, self.disp_w, self.disp_h
+            );
+        }
     }
 
     /// Read an NV2A register (offset relative to `0xFD00_0000`).
@@ -355,6 +393,23 @@ impl Nv2a {
     /// Write an NV2A register. Interrupt-status writes acknowledge (clear) the
     /// bits written (write-1-to-clear).
     pub fn mmio_write(&mut self, offset: u32, val: u32, _size: u8, ram: &mut [u8]) {
+        if std::env::var_os("XBOX_TRACE_NVWR").is_some() {
+            use std::sync::Mutex;
+            static SEEN: Mutex<Option<std::collections::HashSet<u32>>> = Mutex::new(None);
+            // Only log writes to real NV2A register windows (skip the PRAMIN/RAM
+            // sweep band), and only the first time each distinct offset is seen.
+            let interesting = offset < 0x1_0000
+                || (0x40_0000..0x41_0000).contains(&offset)
+                || (0x60_0000..0x61_0000).contains(&offset)
+                || offset >= 0x80_0000;
+            if interesting {
+                let mut g = SEEN.lock().unwrap();
+                let s = g.get_or_insert_with(std::collections::HashSet::new);
+                if s.insert(offset) {
+                    eprintln!("[nvwr] off={offset:#010X} val={val:#010X}");
+                }
+            }
+        }
         match offset {
             off::DMA_PUT => {
                 self.put = val;
@@ -415,6 +470,12 @@ impl Nv2a {
     ///   - RUNOUT_STATUS.LOW_MARK is set (no error entries),
     ///   - CACHE1_DMA_PUSH.STATE is clear (pusher not mid-run).
     fn kick(&mut self, ram: &mut [u8]) {
+        if std::env::var_os("XBOX_TRACE_FIFO").is_some() {
+            eprintln!(
+                "[fifo] kick get={:#010X} put={:#010X} push0={:#X} dma_push={:#X}",
+                self.get, self.put, self.cache1_push0, self.cache1_dma_push
+            );
+        }
         // The pusher only runs when the driver has enabled pusher access (PUSH0
         // and DMA_PUSH ACCESS) and it isn't suspended on a prior error. If those
         // gates aren't set we still accept PUT but execute nothing — matching
@@ -534,76 +595,48 @@ impl Nv2a {
     }
 
     /// Rasterize the gathered vertices for the current primitive into the color
-    /// surface. Vertices are taken as screen-space (the homebrew submits
-    /// pre-transformed positions); flat-shaded with the first vertex's color.
+    /// surface, using the shared software rasterizer in [`crate::nv2a_render`]
+    /// (top-left fill rule, perspective-correct interpolation). The immediate-mode
+    /// vertices are screen-space (the D3D8/homebrew path submits pre-transformed
+    /// positions), so we drive the pass-through (`XYZRHW`) entry point.
     fn draw_primitives(&mut self, ram: &mut [u8]) {
+        use crate::nv2a_render as r;
         let prim = match self.prim {
-            Some(p) => p,
+            Some(p) => match p {
+                PRIM_TRIANGLES => r::PrimType::Triangles,
+                PRIM_TRIANGLE_STRIP => r::PrimType::TriangleStrip,
+                PRIM_TRIANGLE_FAN => r::PrimType::TriangleFan,
+                PRIM_QUADS => r::PrimType::Quads,
+                _ => return,
+            },
             None => return,
         };
-        let v = self.verts.clone();
-        match prim {
-            PRIM_TRIANGLES => {
-                for t in v.chunks_exact(3) {
-                    self.fill_triangle(ram, t[0], t[1], t[2]);
-                }
-            }
-            PRIM_TRIANGLE_FAN | PRIM_QUADS if v.len() >= 3 => {
-                for i in 1..v.len() - 1 {
-                    self.fill_triangle(ram, v[0], v[i], v[i + 1]);
-                }
-            }
-            PRIM_TRIANGLE_STRIP if v.len() >= 3 => {
-                for i in 0..v.len() - 2 {
-                    self.fill_triangle(ram, v[i], v[i + 1], v[i + 2]);
-                }
-            }
-            _ => {}
+        if self.verts.is_empty() || self.width == 0 || self.height == 0 {
+            return;
         }
-    }
-
-    /// Flat-fill a triangle into the surface (edge-function rasterizer).
-    fn fill_triangle(&mut self, ram: &mut [u8], a: Vertex, b: Vertex, c: Vertex) {
+        let verts: Vec<r::Vert> = self
+            .verts
+            .iter()
+            .map(|v| r::Vert::new([v.x, v.y, 0.0, 1.0], v.color, [0.0, 0.0]))
+            .collect();
         let pitch = if self.surface_pitch == 0 {
             self.width as u32 * 4
         } else {
             self.surface_pitch
         };
-        let (sw, sh) = (self.width as i32, self.height as i32);
-        let minx = a.x.min(b.x).min(c.x).floor().max(0.0) as i32;
-        let maxx = (a.x.max(b.x).max(c.x).ceil() as i32).min(sw - 1);
-        let miny = a.y.min(b.y).min(c.y).floor().max(0.0) as i32;
-        let maxy = (a.y.max(b.y).max(c.y).ceil() as i32).min(sh - 1);
-        let edge = |ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32| {
-            (px - ax) * (by - ay) - (py - ay) * (bx - ax)
-        };
-        let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
-        if area.abs() < 1e-3 {
+        // The rasterizer addresses pixels from the surface base; offset the RAM
+        // slice so (0,0) maps to the surface origin.
+        let base = self.surface_offset as usize;
+        if base >= ram.len() {
             return;
         }
-        // Per-channel barycentric interpolation of the three vertex colors.
-        let chan = |color: u32, sh: u32| ((color >> sh) & 0xFF) as f32;
-        for y in miny..=maxy {
-            for x in minx..=maxx {
-                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                let w0 = edge(b.x, b.y, c.x, c.y, px, py);
-                let w1 = edge(c.x, c.y, a.x, a.y, px, py);
-                let w2 = edge(a.x, a.y, b.x, b.y, px, py);
-                let inside = (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                    || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
-                if !inside {
-                    continue;
-                }
-                let (l0, l1, l2) = (w0 / area, w1 / area, w2 / area);
-                let mix = |sh: u32| {
-                    (l0 * chan(a.color, sh) + l1 * chan(b.color, sh) + l2 * chan(c.color, sh))
-                        .clamp(0.0, 255.0) as u32
-                };
-                let color = 0xFF00_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0);
-                let off = self.surface_offset.wrapping_add(y as u32 * pitch + x as u32 * 4);
-                wr32(ram, off, color);
-            }
-        }
+        let mut target = r::Target {
+            pixels: &mut ram[base..],
+            width: self.width as u32,
+            height: self.height as u32,
+            pitch,
+        };
+        r::draw_triangles_screen(&mut target, None, &verts, prim, r::ShadeMode::Gouraud, None);
     }
 
     /// Fill the color surface's clip rect with the clear value, and adopt it as
@@ -640,29 +673,44 @@ impl Nv2a {
     /// little-endian surface to the host's RGBA8888). Returns the display size,
     /// or `None` if no surface has been produced.
     pub fn scanout(&self, ram: &[u8], fb: &mut Vec<u32>) -> Option<(u16, u16)> {
-        if !self.has_surface {
-            return None;
-        }
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let pitch = if self.surface_pitch == 0 {
-            (w * 4) as u32
+        // Choose the surface to present. Priority:
+        //   1. The PGRAPH render surface, once a clear/draw established it (the
+        //      homebrew path — unchanged behaviour).
+        //   2. The AvSetDisplayMode display framebuffer, if the game programmed
+        //      the encoder (so a game that drives the display directly, or flips
+        //      to a buffer we didn't track via PGRAPH, still presents).
+        let (base, pitch, w, h) = if self.has_surface {
+            let w = self.width as u32;
+            let pitch = if self.surface_pitch == 0 { w * 4 } else { self.surface_pitch };
+            (self.surface_offset, pitch, w, self.height as u32)
+        } else if self.disp_w != 0 && self.disp_h != 0 {
+            // PCRTC_START, when the driver set it, is the live front buffer; fall
+            // back to the AvSetDisplayMode address otherwise.
+            let base = if self.crtc_start != 0 {
+                self.crtc_start & (crate::regions::RAM_SIZE as u32 - 1)
+            } else {
+                self.disp_addr
+            };
+            let w = self.disp_w as u32;
+            let pitch = if self.disp_pitch == 0 { w * 4 } else { self.disp_pitch };
+            (base, pitch, w, self.disp_h as u32)
         } else {
-            self.surface_pitch
+            return None;
         };
-        fb.resize(w * h, 0xFF00_0000);
-        for y in 0..h {
-            let row = self.surface_offset.wrapping_add(y as u32 * pitch);
-            for x in 0..w {
+        let (wz, hz) = (w as usize, h as usize);
+        fb.resize(wz * hz, 0xFF00_0000);
+        for y in 0..hz {
+            let row = base.wrapping_add(y as u32 * pitch);
+            for x in 0..wz {
                 let argb = rd32(ram, row.wrapping_add(x as u32 * 4));
                 // ARGB (0xAARRGGBB) -> host RGBA bytes R,G,B,A (0xAABBGGRR word).
                 let r = (argb >> 16) & 0xFF;
                 let g = (argb >> 8) & 0xFF;
                 let b = argb & 0xFF;
-                fb[y * w + x] = 0xFF00_0000 | (b << 16) | (g << 8) | r;
+                fb[y * wz + x] = 0xFF00_0000 | (b << 16) | (g << 8) | r;
             }
         }
-        Some((self.width, self.height))
+        Some((w as u16, h as u16))
     }
 }
 
@@ -672,6 +720,75 @@ mod tests {
 
     fn hdr(m: u32) -> u32 {
         (1u32 << 18) | m
+    }
+
+    #[test]
+    fn display_mode_scanout_presents_framebuffer() {
+        // No PGRAPH surface, but the game programmed AvSetDisplayMode: scanout
+        // must present that framebuffer (ARGB->RGBA converted).
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let fbaddr = 0x10_0000u32;
+        // Paint a 2x2 framebuffer: pixel(0,0)=ARGB 0xFF112233.
+        wr32(&mut ram, fbaddr, 0xFF11_2233);
+        nv.set_display(fbaddr, 2 * 4, 2, 2);
+        let mut fb = Vec::new();
+        assert_eq!(nv.scanout(&ram, &mut fb), Some((2, 2)));
+        // ARGB 112233 -> host RGBA word FF332211.
+        assert_eq!(fb[0], 0xFF33_2211);
+    }
+
+    #[test]
+    fn scanout_none_without_surface_or_display() {
+        let nv = Nv2a::new();
+        let ram = vec![0u8; 0x1000];
+        let mut fb = Vec::new();
+        assert_eq!(nv.scanout(&ram, &mut fb), None);
+    }
+
+    #[test]
+    fn pcrtc_start_overrides_display_address() {
+        // When PCRTC_START is set (the live front buffer), scanout reads from it
+        // in preference to the AvSetDisplayMode base.
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        let av = 0x04_0000u32;
+        let front = 0x08_0000u32;
+        wr32(&mut ram, av, 0xFFAA_AAAA);
+        wr32(&mut ram, front, 0xFF12_3456);
+        nv.set_display(av, 1 * 4, 1, 1);
+        nv.mmio_write(off::PCRTC_START, front, 4, &mut ram);
+        let mut fb = Vec::new();
+        assert_eq!(nv.scanout(&ram, &mut fb), Some((1, 1)));
+        // Reads the PCRTC front buffer (123456 -> RGBA 563412), not av.
+        assert_eq!(fb[0], 0xFF56_3412);
+    }
+
+    #[test]
+    fn pgraph_surface_takes_priority_over_display() {
+        // A cleared PGRAPH surface must win over a configured display mode, so the
+        // homebrew clear/draw path is unaffected by display programming.
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x20_0000];
+        nv.set_display(0x04_0000, 4, 1, 1);
+        let mut w: Vec<u32> = Vec::new();
+        w.extend([hdr(m::SET_SURFACE_PITCH), 4]);
+        w.extend([hdr(m::SET_SURFACE_COLOR_OFFSET), 0x10_0000]);
+        w.extend([hdr(m::SET_SURFACE_CLIP_HORIZONTAL), 1 << 16]);
+        w.extend([hdr(m::SET_SURFACE_CLIP_VERTICAL), 1 << 16]);
+        w.extend([hdr(m::SET_COLOR_CLEAR_VALUE), 0xFF00_FF00]);
+        w.extend([hdr(m::CLEAR_SURFACE), 0xF0]);
+        let pbuf = 0x1000u32;
+        for (i, &word) in w.iter().enumerate() {
+            let o = pbuf as usize + i * 4;
+            ram[o..o + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        nv.test_get_set(off::DMA_GET, pbuf, &mut ram);
+        nv.test_get_set(off::DMA_PUT, pbuf + w.len() as u32 * 4, &mut ram);
+        let mut fb = Vec::new();
+        assert_eq!(nv.scanout(&ram, &mut fb), Some((1, 1)));
+        // The cleared surface (00FF00 -> RGBA 00FF00), not the display fb.
+        assert_eq!(fb[0], 0xFF00_FF00);
     }
 
     #[test]

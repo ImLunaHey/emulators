@@ -390,6 +390,11 @@ impl Xbox {
                 }
                 self.do_reboot();
             }
+            // Apply any AvSetDisplayMode the game programmed this frame, so the
+            // NV2A scans out the framebuffer the game handed the encoder.
+            if let Some((addr, pitch, w, h)) = crate::hle::take_display_mode() {
+                self.nv2a.set_display(addr, pitch, w, h);
+            }
             // If the GPU has produced a color surface, scan it out to the screen;
             // otherwise show the live boot diagnostic.
             if let Some((w, h)) = self.nv2a.scanout(&self.mem.ram[..], &mut self.gpu.framebuffer) {

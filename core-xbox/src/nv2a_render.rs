@@ -578,7 +578,7 @@ fn draw_impl(
     let depth_enabled = depth.is_some();
     let p = |v: &Vert| project(v, space, transform, viewport);
 
-    let mut tri = |target: &mut Target, depth: &mut Option<&mut [f32]>, a: &Vert, b: &Vert, c: &Vert| {
+    let tri = |target: &mut Target, depth: &mut Option<&mut [f32]>, a: &Vert, b: &Vert, c: &Vert| {
         let (sa, sb, sc) = (p(a), p(b), p(c));
         raster_tri(target, depth, depth_enabled, &sa, &sb, &sc, mode, texture);
     };

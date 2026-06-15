@@ -477,6 +477,7 @@ pub fn reset() {
     SAVED_DATA_ADDR.store(0, Ordering::SeqCst);
     *PERSISTED.lock().unwrap() = None;
     *LAUNCH_DATA.lock().unwrap() = None;
+    *DISPLAY_MODE.lock().unwrap() = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +499,18 @@ static PERSISTED: Mutex<Option<Vec<(u32, u32)>>> = Mutex::new(None);
 /// Base of the most-recently persisted page — the launch-data page.
 static LAUNCH_DATA: Mutex<Option<u32>> = Mutex::new(None);
 const ORD_LAUNCH_DATA_PAGE: u32 = 164;
+
+/// Display mode set by the game via `AvSetDisplayMode` (frame-buffer address,
+/// pitch, width, height), pending application to the NV2A by the orchestrator.
+/// `Some` only when the game programmed a display. See [`take_display_mode`].
+static DISPLAY_MODE: Mutex<Option<(u32, u32, u16, u16)>> = Mutex::new(None);
+
+/// Consume a pending `AvSetDisplayMode` configuration. The orchestrator
+/// (`Xbox::run_frame`) calls this and forwards it to the NV2A so scanout can
+/// present the game's framebuffer.
+pub fn take_display_mode() -> Option<(u32, u32, u16, u16)> {
+    DISPLAY_MODE.lock().unwrap().take()
+}
 
 /// Consume a pending reboot request (set by HalReturnToFirmware).
 pub fn take_reboot() -> bool {
@@ -1574,9 +1587,25 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             Dispatch::Handled("AvSendTVEncoderOption")
         }
         ORD_AV_SET_DISPLAY_MODE => {
-            // AvSetDisplayMode(RegisterBase, Step, Mode, Format, Pitch, FrameBuffer).
-            // The display mode is a no-op for us — the game renders into a PGRAPH
-            // surface we already scan out. Report success.
+            // AvSetDisplayMode(RegisterBase, Step, Mode, Format, Pitch, FrameBuffer)
+            // — hands the encoder the framebuffer the display scans out. Capture
+            // its address/pitch (and the mode's resolution) so the NV2A can
+            // present the game's own framebuffer even when it draws through a path
+            // PGRAPH doesn't fully model. The `Mode` word encodes the resolution;
+            // retail titles use 640x480, so we default there and only override
+            // when the mode clearly selects 720x480 (the other common NTSC mode).
+            let mode = arg(cpu, mem, 2);
+            let pitch = arg(cpu, mem, 4);
+            let framebuffer = arg(cpu, mem, 5);
+            let (w, h) = match mode & 0x0FFF {
+                // AVMODE width field (low bits) maps to a horizontal pixel count;
+                // 0x2D0 = 720, else fall back to 640. Height defaults to 480.
+                w if w == 720 || w == 0x2D0 => (720u16, 480u16),
+                _ => (640u16, 480u16),
+            };
+            if framebuffer != 0 {
+                *DISPLAY_MODE.lock().unwrap() = Some((framebuffer, pitch, w, h));
+            }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 24);
             Dispatch::Handled("AvSetDisplayMode")
         }
@@ -1796,6 +1825,22 @@ mod tests {
         assert_eq!(cpu.reg32(EAX), expect_eax, "EAX");
         assert_eq!(cpu.eip, RET_ADDR, "EIP popped return address");
         assert_eq!(cpu.reg32(ESP), esp0 + 4 + arg_bytes, "ESP cleanup");
+    }
+
+    #[test]
+    fn av_set_display_mode_captures_framebuffer() {
+        // AvSetDisplayMode(RegisterBase, Step, Mode, Format, Pitch, FrameBuffer).
+        let _g = HEAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *DISPLAY_MODE.lock().unwrap() = None;
+        let (mut cpu, mut mem, esp0) =
+            frame(&[0xFD00_0000, 0, 640, 0, 640 * 4, 0x0003_C000]);
+        let out = dispatch(&mut cpu, &mut mem, ORD_AV_SET_DISPLAY_MODE);
+        assert!(matches!(out, Dispatch::Handled("AvSetDisplayMode")));
+        assert_returned(&cpu, esp0, STATUS_SUCCESS, 24);
+        let dm = take_display_mode().expect("display mode captured");
+        assert_eq!(dm, (0x0003_C000, 640 * 4, 640, 480));
+        // Consumed.
+        assert_eq!(take_display_mode(), None);
     }
 
     #[test]
