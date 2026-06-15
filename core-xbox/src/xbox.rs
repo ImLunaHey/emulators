@@ -333,6 +333,17 @@ impl Xbox {
 }
 
 impl Xbox {
+    /// Public view of the boot diagnostic (for headless harnesses).
+    pub fn boot_diagnostic(&self) -> Vec<String> {
+        self.boot_lines()
+    }
+
+    /// The kernel-import ordinals the loaded XBE links against (intel for an HLE
+    /// kernel: these are the OS functions the game will call).
+    pub fn kernel_imports(&self) -> &[u32] {
+        &self.kernel_ordinals
+    }
+
     /// Build the live boot-diagnostic text: title, entry, how far the CPU got,
     /// and where it stopped (kernel import, fault, HLT, or still running).
     fn boot_lines(&self) -> Vec<String> {

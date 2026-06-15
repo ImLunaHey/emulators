@@ -598,6 +598,24 @@ impl Cpu {
                 self.set_reg(EAX, osize, b);
                 self.set_reg(r, osize, a);
             }
+            // CBW / CWDE — sign-extend AL->AX (osize 2) or AX->EAX (osize 4).
+            0x98 => {
+                if osize == 2 {
+                    self.set_reg16(EAX, self.reg8(EAX) as i8 as i16 as u16 as u32);
+                } else {
+                    self.set_reg32(EAX, self.reg16(EAX) as i16 as i32 as u32);
+                }
+            }
+            // CWD / CDQ — sign-extend AX->DX:AX (osize 2) or EAX->EDX:EAX (osize 4).
+            0x99 => {
+                if osize == 2 {
+                    let s = if self.reg16(EAX) & 0x8000 != 0 { 0xFFFF } else { 0 };
+                    self.set_reg16(EDX, s);
+                } else {
+                    let s = if self.reg32(EAX) & 0x8000_0000 != 0 { 0xFFFF_FFFF } else { 0 };
+                    self.set_reg32(EDX, s);
+                }
+            }
 
             // ---- MOV moffs (AL/eAX ↔ [disp]) ----
             0xA0 | 0xA1 | 0xA2 | 0xA3 => {
@@ -889,10 +907,89 @@ impl Cpu {
                 self.write_ea(bus, ea, size, res);
             }
             4 => self.do_mul(bus, ea, size), // MUL (unsigned)
+            5 => self.do_imul1(bus, ea, size), // IMUL (one-operand, signed)
             6 => self.do_div(bus, ea, size, start_eip), // DIV (unsigned)
+            7 => self.do_idiv(bus, ea, size, start_eip), // IDIV (signed)
             _ => {
                 self.eip = start_eip;
                 self.raise(Exception::InvalidOpcode, 0, op);
+            }
+        }
+    }
+
+    /// One-operand signed multiply (IMUL r/m): AL/AX/EAX * src into AX/DX:AX/
+    /// EDX:EAX. CF=OF when the high half isn't the sign-extension of the low half.
+    fn do_imul1(&mut self, bus: &mut impl Bus, ea: Ea, size: u8) {
+        let src = sign_ext(self.read_ea(bus, ea, size), size) as i32 as i64;
+        match size {
+            1 => {
+                let r = (self.reg8(EAX) as i8 as i64) * src;
+                self.set_reg16(EAX, r as u32 & 0xFFFF);
+                let of = r as i8 as i64 != r;
+                self.set_flag(CF, of);
+                self.set_flag(OF, of);
+            }
+            2 => {
+                let r = (self.reg16(EAX) as i16 as i64) * src;
+                self.set_reg16(EAX, r as u32 & 0xFFFF);
+                self.set_reg16(EDX, (r as u32 >> 16) & 0xFFFF);
+                let of = r as i16 as i64 != r;
+                self.set_flag(CF, of);
+                self.set_flag(OF, of);
+            }
+            _ => {
+                let r = (self.reg32(EAX) as i32 as i64) * src;
+                self.set_reg32(EAX, r as u32);
+                self.set_reg32(EDX, (r >> 32) as u32);
+                let of = r as i32 as i64 != r;
+                self.set_flag(CF, of);
+                self.set_flag(OF, of);
+            }
+        }
+    }
+
+    /// Signed divide (IDIV r/m); raises #DE on divide-by-zero or quotient
+    /// overflow.
+    fn do_idiv(&mut self, bus: &mut impl Bus, ea: Ea, size: u8, start_eip: u32) {
+        let d = sign_ext(self.read_ea(bus, ea, size), size) as i32 as i64;
+        if d == 0 {
+            self.eip = start_eip;
+            self.raise(Exception::DivideError, 0, 0);
+            return;
+        }
+        match size {
+            1 => {
+                let n = self.reg16(EAX) as i16 as i64;
+                let (q, r) = (n / d, n % d);
+                if !(-128..=127).contains(&q) {
+                    self.eip = start_eip;
+                    self.raise(Exception::DivideError, 0, 0);
+                    return;
+                }
+                self.set_reg8(EAX, q as u32);
+                self.set_reg8(4, r as u32); // AH
+            }
+            2 => {
+                let n = (((self.reg16(EDX)) << 16) | self.reg16(EAX)) as i32 as i64;
+                let (q, r) = (n / d, n % d);
+                if !(i16::MIN as i64..=i16::MAX as i64).contains(&q) {
+                    self.eip = start_eip;
+                    self.raise(Exception::DivideError, 0, 0);
+                    return;
+                }
+                self.set_reg16(EAX, q as u32);
+                self.set_reg16(EDX, r as u32);
+            }
+            _ => {
+                let n = (((self.reg32(EDX) as u64) << 32) | self.reg32(EAX) as u64) as i64;
+                let (q, r) = (n / d, n % d);
+                if !(i32::MIN as i64..=i32::MAX as i64).contains(&q) {
+                    self.eip = start_eip;
+                    self.raise(Exception::DivideError, 0, 0);
+                    return;
+                }
+                self.set_reg32(EAX, q as u32);
+                self.set_reg32(EDX, r as u32);
             }
         }
     }
