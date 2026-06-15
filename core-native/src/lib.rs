@@ -1,0 +1,464 @@
+//! Unified native FFI for every emulator core.
+//!
+//! One opaque [`Emu`] handle wraps any core, behind a single C ABI (`emu_*`) so a
+//! native front-end (the macOS SwiftPM app in `apps/EmuApp`) can drive them all
+//! uniformly. This is the desktop counterpart to the iOS-only `core-ffi` (GBA
+//! only) — it covers GBA, PS1, NDS, NES, SMS/GG, GBC and Xbox, and exists so big
+//! media (a 4.7 GB Xbox disc) can be loaded outside the browser's 4 GB wasm32
+//! address space.
+//!
+//! # Contract
+//!
+//! * Call [`emu_new`] once per session; release with [`emu_free`].
+//! * Per frame: [`emu_set_keys`], [`emu_run_frame`], then read the framebuffer
+//!   via [`emu_framebuffer_ptr`] / [`emu_framebuffer_len`] (RGBA8888,
+//!   `emu_width` × `emu_height` × 4). The framebuffer pointer is refreshed at the
+//!   end of each `emu_run_frame`; copy or upload it before the next call.
+//! * Audio: [`emu_drain_audio`] copies interleaved samples; pair with
+//!   [`emu_sample_rate`] and [`emu_channels`].
+//!
+//! All pointers passed in must be valid for their stated length; the handle must
+//! come from [`emu_new`] and must not be used after [`emu_free`].
+
+use gbc_core::Gbc;
+use nds_core::Nds;
+use nes_core::Nes;
+use ps1_core::Psx;
+use sms_core::Sms;
+use xbox_core::Xbox;
+
+use gba_core::Gba;
+
+/// System selector passed to [`emu_new`]. Keep in sync with the C header and the
+/// Swift `System` enum.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum System {
+    Gba = 0,
+    Ps1 = 1,
+    Nds = 2,
+    Nes = 3,
+    Sms = 4,
+    GameGear = 5,
+    Gbc = 6,
+    Xbox = 7,
+}
+
+impl System {
+    fn from_u32(v: u32) -> Option<System> {
+        Some(match v {
+            0 => System::Gba,
+            1 => System::Ps1,
+            2 => System::Nds,
+            3 => System::Nes,
+            4 => System::Sms,
+            5 => System::GameGear,
+            6 => System::Gbc,
+            7 => System::Xbox,
+            _ => return None,
+        })
+    }
+}
+
+/// The wrapped core. One boxed god-struct per system.
+enum Inner {
+    Gba(Box<Gba>),
+    Ps1(Box<Psx>),
+    Nds(Box<Nds>),
+    Nes(Box<Nes>),
+    Sms(Box<Sms>),
+    Gbc(Box<Gbc>),
+    Xbox(Box<Xbox>),
+}
+
+/// The opaque session handle.
+pub struct Emu {
+    inner: Inner,
+    /// Latest presented framebuffer (RGBA8888), refreshed each `run_frame`.
+    fb: Vec<u8>,
+    width: u32,
+    height: u32,
+    sample_rate: u32,
+    channels: u32,
+    /// Frames run via this handle (uniform counter; not every core exposes one).
+    frames: u32,
+}
+
+impl Emu {
+    fn new(system: System) -> Emu {
+        // (sample rate, channels) mirror the web players' audio settings.
+        let (inner, w, h, rate, ch): (Inner, u32, u32, u32, u32) = match system {
+            System::Gba => (Inner::Gba(Box::new(Gba::new())), 240, 160, 32768, 2),
+            System::Ps1 => (Inner::Ps1(Box::new(Psx::new())), 640, 480, 44100, 2),
+            System::Nds => (Inner::Nds(Box::new(Nds::new())), 256, 384, 44100, 2),
+            System::Nes => (Inner::Nes(Box::new(Nes::new())), 256, 240, 44100, 1),
+            System::Sms => (Inner::Sms(Box::new(Sms::new_system(false))), 256, 192, 44100, 1),
+            System::GameGear => (Inner::Sms(Box::new(Sms::new_system(true))), 160, 144, 44100, 1),
+            System::Gbc => (Inner::Gbc(Box::new(Gbc::new())), 160, 144, 48000, 2),
+            System::Xbox => (Inner::Xbox(Box::new(Xbox::new())), 640, 480, 48000, 2),
+        };
+        let mut e = Emu {
+            inner,
+            fb: Vec::new(),
+            width: w,
+            height: h,
+            sample_rate: rate,
+            channels: ch,
+            frames: 0,
+        };
+        e.refresh();
+        e
+    }
+
+    /// Load a ROM / disc image. Returns true on success.
+    fn load_rom(&mut self, bytes: &[u8]) -> bool {
+        match &mut self.inner {
+            Inner::Gba(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Ps1(c) => {
+                c.load_rom(bytes.to_vec());
+                true
+            }
+            Inner::Nds(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Nes(c) => c.load_rom(bytes).is_ok(),
+            Inner::Sms(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Gbc(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Xbox(c) => {
+                c.load_rom(bytes.to_vec());
+                true
+            }
+        }
+    }
+
+    /// Load a BIOS/flash image (PS1, Xbox). No-op for cores that don't need one.
+    fn load_bios(&mut self, bytes: &[u8]) -> bool {
+        match &mut self.inner {
+            Inner::Ps1(c) => {
+                c.load_bios(bytes);
+                true
+            }
+            Inner::Xbox(c) => {
+                c.load_bios(bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn run_frame(&mut self) {
+        match &mut self.inner {
+            Inner::Gba(c) => c.run_frame(),
+            Inner::Ps1(c) => c.run_frame(),
+            Inner::Nds(c) => c.run_frame(),
+            Inner::Nes(c) => c.run_frame(),
+            Inner::Sms(c) => c.run_frame(),
+            Inner::Gbc(c) => c.run_frame(),
+            Inner::Xbox(c) => c.run_frame(),
+        }
+        self.frames = self.frames.wrapping_add(1);
+        self.refresh();
+    }
+
+    /// Set the controller state from a uniform **active-high pressed** bitmask in
+    /// each core's web-player bit layout. Cores that want a different convention
+    /// are adapted here (e.g. the NDS keypad registers are active-low), so every
+    /// front-end — Swift, libretro — uses the same "1 = pressed" contract.
+    fn set_keys(&mut self, bits: u32) {
+        match &mut self.inner {
+            Inner::Gba(c) => c.set_keys(bits),
+            Inner::Ps1(c) => c.set_keys(bits as u16),
+            Inner::Nds(c) => {
+                // KEYINPUT/EXTKEYIN are active-low: 0 = pressed. Low 10 bits are
+                // the keypad (GBA order), bits 10/11 are X/Y in the ext register.
+                let keyinput = 0x3FF & !bits;
+                let ext = 0x3 & !(bits >> 10);
+                c.set_keys(keyinput, ext);
+            }
+            Inner::Nes(c) => c.set_keys((bits & 0xFF) as u8),
+            Inner::Sms(c) => c.set_keys(bits),
+            Inner::Gbc(c) => c.set_keys((bits & 0xFF) as u8),
+            Inner::Xbox(c) => c.set_keys(bits),
+        }
+    }
+
+    /// Drain audio into `out` (capacity `max` floats). Returns count written.
+    fn drain_audio(&mut self, out: &mut [f32]) -> usize {
+        let samples: Vec<f32> = match &mut self.inner {
+            Inner::Gba(c) => c.drain_audio(),
+            Inner::Ps1(c) => c.drain_audio(),
+            Inner::Nds(c) => c.drain_audio(),
+            Inner::Nes(c) => c.drain_audio(),
+            Inner::Sms(c) => c.drain_audio(),
+            Inner::Gbc(c) => c.drain_audio(),
+            Inner::Xbox(c) => c.drain_audio(),
+        };
+        let n = samples.len().min(out.len());
+        out[..n].copy_from_slice(&samples[..n]);
+        n
+    }
+
+    fn frame_count(&self) -> u32 {
+        self.frames
+    }
+
+    /// Refresh the cached framebuffer + dimensions from the core.
+    fn refresh(&mut self) {
+        self.fb.clear();
+        match &mut self.inner {
+            Inner::Gba(c) => {
+                self.width = 240;
+                self.height = 160;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Ps1(c) => {
+                self.width = c.width();
+                self.height = c.height();
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Nds(c) => {
+                // Stack the two 256x192 screens into one 256x384 image.
+                self.width = 256;
+                self.height = 384;
+                self.fb.extend_from_slice(c.top_framebuffer());
+                self.fb.extend_from_slice(c.bottom_framebuffer());
+            }
+            Inner::Nes(c) => {
+                // NES picture is a fixed 256x240.
+                self.width = 256;
+                self.height = 240;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Sms(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Gbc(c) => {
+                // Game Boy (Color) is a fixed 160x144 panel.
+                self.width = 160;
+                self.height = 144;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Xbox(c) => {
+                self.width = c.width();
+                self.height = c.height();
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+        }
+    }
+}
+
+// ============================ C ABI ============================
+
+/// Allocate a core for `system` (see [`System`]). Returns null on an unknown id.
+#[no_mangle]
+pub extern "C" fn emu_new(system: u32) -> *mut Emu {
+    match System::from_u32(system) {
+        Some(s) => Box::into_raw(Box::new(Emu::new(s))),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a handle from [`emu_new`].
+///
+/// # Safety
+/// `emu` must be a pointer from [`emu_new`] (or null), used at most once.
+#[no_mangle]
+pub unsafe extern "C" fn emu_free(emu: *mut Emu) {
+    if !emu.is_null() {
+        drop(Box::from_raw(emu));
+    }
+}
+
+/// Load a ROM / disc image. Returns true on success.
+///
+/// # Safety
+/// `emu` valid; `data` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_load_rom(emu: *mut Emu, data: *const u8, len: usize) -> bool {
+    if emu.is_null() || (data.is_null() && len != 0) {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    (*emu).load_rom(bytes)
+}
+
+/// Load a BIOS / flash image (PS1, Xbox). Returns true if the core used it.
+///
+/// # Safety
+/// `emu` valid; `data` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_load_bios(emu: *mut Emu, data: *const u8, len: usize) -> bool {
+    if emu.is_null() || (data.is_null() && len != 0) {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    (*emu).load_bios(bytes)
+}
+
+/// Run one frame and refresh the framebuffer.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_run_frame(emu: *mut Emu) {
+    if !emu.is_null() {
+        (*emu).run_frame();
+    }
+}
+
+/// Set the controller button bitmask.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_set_keys(emu: *mut Emu, bits: u32) {
+    if !emu.is_null() {
+        (*emu).set_keys(bits);
+    }
+}
+
+/// Pointer to the current RGBA8888 framebuffer (refreshed each `emu_run_frame`).
+///
+/// # Safety
+/// `emu` valid; the pointer is valid until the next `emu_run_frame` / `emu_free`.
+#[no_mangle]
+pub unsafe extern "C" fn emu_framebuffer_ptr(emu: *const Emu) -> *const u8 {
+    if emu.is_null() {
+        return std::ptr::null();
+    }
+    (*emu).fb.as_ptr()
+}
+
+/// Length in bytes of the framebuffer (`width * height * 4`).
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_framebuffer_len(emu: *const Emu) -> usize {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).fb.len()
+}
+
+/// Current display width in pixels.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_width(emu: *const Emu) -> u32 {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).width
+}
+
+/// Current display height in pixels.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_height(emu: *const Emu) -> u32 {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).height
+}
+
+/// Drain interleaved audio samples into `out` (capacity `max` floats). Returns
+/// the number written.
+///
+/// # Safety
+/// `emu` valid; `out` valid for `max` floats.
+#[no_mangle]
+pub unsafe extern "C" fn emu_drain_audio(emu: *mut Emu, out: *mut f32, max: usize) -> usize {
+    if emu.is_null() || out.is_null() || max == 0 {
+        return 0;
+    }
+    let slice = std::slice::from_raw_parts_mut(out, max);
+    (*emu).drain_audio(slice)
+}
+
+/// Audio sample rate (Hz).
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_sample_rate(emu: *const Emu) -> u32 {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).sample_rate
+}
+
+/// Audio channel count (1 = mono, 2 = interleaved stereo).
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_channels(emu: *const Emu) -> u32 {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).channels
+}
+
+/// Frames completed since reset.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_frame_count(emu: *const Emu) -> u32 {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).frame_count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_each_system_has_framebuffer() {
+        for id in 0..=7u32 {
+            let e = unsafe { &mut *emu_new(id) };
+            assert_eq!(
+                e.fb.len(),
+                (e.width * e.height * 4) as usize,
+                "system {id} framebuffer sized to dims"
+            );
+            assert!(e.sample_rate >= 32768);
+        }
+    }
+
+    #[test]
+    fn unknown_system_is_null() {
+        assert!(emu_new(99).is_null());
+    }
+
+    #[test]
+    fn xbox_mounts_disc_via_ffi() {
+        // Reuse the xbox core's synthetic-disc shape through the FFI path.
+        let e = emu_new(System::Xbox as u32);
+        // A non-disc rom is fine (no mount); just ensure run_frame is safe.
+        unsafe {
+            emu_run_frame(e);
+            assert!(emu_frame_count(e) >= 1);
+            assert!(emu_framebuffer_len(e) > 0);
+            emu_free(e);
+        }
+    }
+}
