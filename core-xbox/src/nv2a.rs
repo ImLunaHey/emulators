@@ -66,12 +66,42 @@ pub struct Nv2a {
     /// Frames signalled (vblank count).
     pub vblank_count: u32,
 
-    // Color surface (filled by PGRAPH later).
+    // Color surface (filled by PGRAPH method handling).
     pub has_surface: bool,
     pub surface_offset: u32,
     pub surface_pitch: u32,
+    clear_color: u32,
+    clip_w: u16,
+    clip_h: u16,
     pub width: u16,
     pub height: u16,
+}
+
+// PGRAPH (NV20 "Kelvin" 3D class 0x97) method offsets we care about.
+mod m {
+    pub const SET_SURFACE_CLIP_HORIZONTAL: u32 = 0x0200;
+    pub const SET_SURFACE_CLIP_VERTICAL: u32 = 0x0204;
+    pub const SET_SURFACE_PITCH: u32 = 0x020C;
+    pub const SET_SURFACE_COLOR_OFFSET: u32 = 0x0210;
+    pub const SET_COLOR_CLEAR_VALUE: u32 = 0x1D90;
+    pub const CLEAR_SURFACE: u32 = 0x1D94;
+}
+
+#[inline]
+fn rd32(ram: &[u8], addr: u32) -> u32 {
+    let i = addr as usize;
+    if i + 4 <= ram.len() {
+        u32::from_le_bytes([ram[i], ram[i + 1], ram[i + 2], ram[i + 3]])
+    } else {
+        0
+    }
+}
+#[inline]
+fn wr32(ram: &mut [u8], addr: u32, v: u32) {
+    let i = addr as usize;
+    if i + 4 <= ram.len() {
+        ram[i..i + 4].copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 impl Default for Nv2a {
@@ -99,6 +129,9 @@ impl Nv2a {
             has_surface: false,
             surface_offset: 0,
             surface_pitch: 0,
+            clear_color: 0,
+            clip_w: 640,
+            clip_h: 480,
             width: 640,
             height: 480,
         }
@@ -175,16 +208,118 @@ impl Nv2a {
         }
     }
 
-    /// Walk + execute the pushbuffer (GET..PUT). Not yet implemented — PGRAPH
-    /// method execution lands next.
-    fn execute(&mut self, _ram: &mut [u8]) {}
+    /// Walk + execute the pushbuffer (GET..PUT). Parses the NV command FIFO and
+    /// dispatches PGRAPH methods. The pushbuffer lives in guest RAM (paging off,
+    /// so a guest address is a RAM offset).
+    fn execute(&mut self, ram: &mut [u8]) {
+        let trace = std::env::var_os("XBOX_TRACE_GPU").is_some();
+        let put = self.put;
+        let mut get = self.get;
+        let mut guard = 0u32;
+        while get != put && guard < 1_000_000 {
+            guard += 1;
+            let word = rd32(ram, get);
+            get = get.wrapping_add(4);
+            if word & 3 == 1 {
+                get = word & 0xFFFF_FFFC; // jump
+                continue;
+            }
+            if (word & 0xE000_0003) == 0x2000_0000 {
+                get = word & 0x1FFF_FFFF; // old-style jump
+                continue;
+            }
+            let masked = word & 0xE003_0003;
+            if masked != 0 && masked != 0x4000_0000 {
+                break; // call/return/unknown — stop (we don't model these yet)
+            }
+            let increasing = masked == 0;
+            let mut method = word & 0x1FFC;
+            let count = (word >> 18) & 0x7FF;
+            for _ in 0..count {
+                if get == put {
+                    break;
+                }
+                let data = rd32(ram, get);
+                get = get.wrapping_add(4);
+                if trace {
+                    eprintln!("[gpu] method {method:#06X} = {data:#010X}");
+                }
+                self.method(ram, method, data);
+                if increasing {
+                    method += 4;
+                }
+            }
+        }
+        self.get = put;
+    }
 
-    /// Scan the color surface out to `fb`. Returns the display size if there's a
-    /// surface to show, else `None`.
-    pub fn scanout(&self, _ram: &[u8], _fb: &mut Vec<u32>) -> Option<(u16, u16)> {
+    /// Handle one PGRAPH method (surface setup + clear, for now).
+    fn method(&mut self, ram: &mut [u8], method: u32, data: u32) {
+        match method {
+            m::SET_SURFACE_CLIP_HORIZONTAL => self.clip_w = (data >> 16) as u16,
+            m::SET_SURFACE_CLIP_VERTICAL => self.clip_h = (data >> 16) as u16,
+            m::SET_SURFACE_PITCH => self.surface_pitch = data & 0xFFFF,
+            m::SET_SURFACE_COLOR_OFFSET => {
+                self.surface_offset = data & (crate::regions::RAM_SIZE as u32 - 1)
+            }
+            m::SET_COLOR_CLEAR_VALUE => self.clear_color = data,
+            m::CLEAR_SURFACE => {
+                // bit 0x40 = clear color buffer (NV097_CLEAR_SURFACE_COLOR).
+                if data & 0xF0 != 0 {
+                    self.clear_color_buffer(ram);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fill the color surface's clip rect with the clear value, and adopt it as
+    /// the displayed surface.
+    fn clear_color_buffer(&mut self, ram: &mut [u8]) {
+        let pitch = if self.surface_pitch == 0 {
+            (self.clip_w as u32) * 4
+        } else {
+            self.surface_pitch
+        };
+        let w = self.clip_w.max(1);
+        let h = self.clip_h.max(1);
+        for y in 0..h as u32 {
+            let row = self.surface_offset.wrapping_add(y * pitch);
+            for x in 0..w as u32 {
+                wr32(ram, row.wrapping_add(x * 4), self.clear_color);
+            }
+        }
+        self.width = w;
+        self.height = h;
+        self.has_surface = true;
+    }
+
+    /// Scan the color surface out to `fb` (converting the Xbox's ARGB/XRGB
+    /// little-endian surface to the host's RGBA8888). Returns the display size,
+    /// or `None` if no surface has been produced.
+    pub fn scanout(&self, ram: &[u8], fb: &mut Vec<u32>) -> Option<(u16, u16)> {
         if !self.has_surface {
             return None;
         }
-        None
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let pitch = if self.surface_pitch == 0 {
+            (w * 4) as u32
+        } else {
+            self.surface_pitch
+        };
+        fb.resize(w * h, 0xFF00_0000);
+        for y in 0..h {
+            let row = self.surface_offset.wrapping_add(y as u32 * pitch);
+            for x in 0..w {
+                let argb = rd32(ram, row.wrapping_add(x as u32 * 4));
+                // ARGB (0xAARRGGBB) -> host RGBA bytes R,G,B,A (0xAABBGGRR word).
+                let r = (argb >> 16) & 0xFF;
+                let g = (argb >> 8) & 0xFF;
+                let b = argb & 0xFF;
+                fb[y * w + x] = 0xFF00_0000 | (b << 16) | (g << 8) | r;
+            }
+        }
+        Some((self.width, self.height))
     }
 }
