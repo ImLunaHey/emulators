@@ -65,6 +65,15 @@ enum Alu {
     Cmp,
 }
 
+/// The four bit-test sub-operations (BT/BTS/BTR/BTC).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BitOp {
+    Test,
+    Set,
+    Reset,
+    Comp,
+}
+
 const ALU_BY_INDEX: [Alu; 8] = [
     Alu::Add,
     Alu::Or,
@@ -308,6 +317,163 @@ impl Cpu {
         }
     }
 
+    // ============================ string ops ============================
+    /// Read the (E)CX iteration counter for the current address size.
+    #[inline]
+    fn str_count(&self, asize: u8) -> u32 {
+        if asize == 2 { self.reg16(ECX) } else { self.reg32(ECX) }
+    }
+    #[inline]
+    fn set_str_count(&mut self, asize: u8, v: u32) {
+        if asize == 2 {
+            self.set_reg16(ECX, v);
+        } else {
+            self.set_reg32(ECX, v);
+        }
+    }
+    /// Read (E)SI / (E)DI honouring the address size.
+    #[inline]
+    fn str_idx(&self, reg: usize, asize: u8) -> u32 {
+        if asize == 2 { self.reg16(reg) } else { self.reg32(reg) }
+    }
+    #[inline]
+    fn set_str_idx(&mut self, reg: usize, asize: u8, v: u32) {
+        if asize == 2 {
+            self.set_reg16(reg, v);
+        } else {
+            self.set_reg32(reg, v);
+        }
+    }
+    /// Advance (E)SI/(E)DI by the operand size, respecting the direction flag.
+    #[inline]
+    fn str_advance(&mut self, reg: usize, asize: u8, size: u8) {
+        let cur = self.str_idx(reg, asize);
+        let step = size as u32;
+        let next = if self.flag(DF) {
+            cur.wrapping_sub(step)
+        } else {
+            cur.wrapping_add(step)
+        };
+        self.set_str_idx(reg, asize, next);
+    }
+    /// Linear address from DS:(E)SI (source; segment override applies).
+    #[inline]
+    fn src_lin(&self, p: &Prefixes, asize: u8) -> u32 {
+        let seg = p.seg.unwrap_or(DS);
+        self.seg_base[seg].wrapping_add(self.str_idx(ESI, asize))
+    }
+    /// Linear address from ES:(E)DI (destination; never overridden).
+    #[inline]
+    fn dst_lin(&self, asize: u8) -> u32 {
+        self.seg_base[ES].wrapping_add(self.str_idx(EDI, asize))
+    }
+
+    fn string_movs(&mut self, bus: &mut impl Bus, size: u8, asize: u8, p: &Prefixes) {
+        // MOVS: ES:[EDI] <- DS:[ESI], advance both. REP repeats (E)CX times.
+        let rep = p.rep != 0;
+        let mut count = if rep { self.str_count(asize) } else { 1 };
+        while count > 0 {
+            if rep && self.str_count(asize) == 0 {
+                break;
+            }
+            let s = self.src_lin(p, asize);
+            let v = self.read_mem(bus, s, size);
+            let d = self.dst_lin(asize);
+            self.write_mem(bus, d, size, v);
+            self.str_advance(ESI, asize, size);
+            self.str_advance(EDI, asize, size);
+            if rep {
+                self.set_str_count(asize, self.str_count(asize).wrapping_sub(1));
+            }
+            count -= 1;
+        }
+    }
+
+    fn string_stos(&mut self, bus: &mut impl Bus, size: u8, asize: u8, p: &Prefixes) {
+        // STOS: ES:[EDI] <- AL/AX/EAX, advance EDI.
+        let rep = p.rep != 0;
+        let mut count = if rep { self.str_count(asize) } else { 1 };
+        let v = self.reg(EAX, size);
+        while count > 0 {
+            let d = self.dst_lin(asize);
+            self.write_mem(bus, d, size, v);
+            self.str_advance(EDI, asize, size);
+            if rep {
+                self.set_str_count(asize, self.str_count(asize).wrapping_sub(1));
+            }
+            count -= 1;
+        }
+    }
+
+    fn string_lods(&mut self, bus: &mut impl Bus, size: u8, asize: u8, p: &Prefixes) {
+        // LODS: AL/AX/EAX <- DS:[ESI], advance ESI.
+        let rep = p.rep != 0;
+        let mut count = if rep { self.str_count(asize) } else { 1 };
+        while count > 0 {
+            let s = self.src_lin(p, asize);
+            let v = self.read_mem(bus, s, size);
+            self.set_reg(EAX, size, v);
+            self.str_advance(ESI, asize, size);
+            if rep {
+                self.set_str_count(asize, self.str_count(asize).wrapping_sub(1));
+            }
+            count -= 1;
+        }
+    }
+
+    fn string_scas(&mut self, bus: &mut impl Bus, size: u8, asize: u8, p: &Prefixes) {
+        // SCAS: compare AL/AX/EAX with ES:[EDI], advance EDI, set flags.
+        // REPE (F3) repeats while ZF=1, REPNE (F2) while ZF=0; both stop at CX=0.
+        let acc = self.reg(EAX, size);
+        if p.rep == 0 {
+            let d = self.dst_lin(asize);
+            let v = self.read_mem(bus, d, size);
+            self.flags_sub(acc, v, size);
+            self.str_advance(EDI, asize, size);
+            return;
+        }
+        let want_zf = p.rep == 0xF3; // REPE/REPZ
+        while self.str_count(asize) != 0 {
+            let d = self.dst_lin(asize);
+            let v = self.read_mem(bus, d, size);
+            self.flags_sub(acc, v, size);
+            self.str_advance(EDI, asize, size);
+            self.set_str_count(asize, self.str_count(asize).wrapping_sub(1));
+            if self.flag(ZF) != want_zf {
+                break;
+            }
+        }
+    }
+
+    fn string_cmps(&mut self, bus: &mut impl Bus, size: u8, asize: u8, p: &Prefixes) {
+        // CMPS: compare DS:[ESI] with ES:[EDI] (sets flags as SI - DI? Intel:
+        // compares [ESI] to [EDI], i.e. SUB src,dst), advance both.
+        if p.rep == 0 {
+            let s = self.src_lin(p, asize);
+            let a = self.read_mem(bus, s, size);
+            let d = self.dst_lin(asize);
+            let b = self.read_mem(bus, d, size);
+            self.flags_sub(a, b, size);
+            self.str_advance(ESI, asize, size);
+            self.str_advance(EDI, asize, size);
+            return;
+        }
+        let want_zf = p.rep == 0xF3; // REPE/REPZ
+        while self.str_count(asize) != 0 {
+            let s = self.src_lin(p, asize);
+            let a = self.read_mem(bus, s, size);
+            let d = self.dst_lin(asize);
+            let b = self.read_mem(bus, d, size);
+            self.flags_sub(a, b, size);
+            self.str_advance(ESI, asize, size);
+            self.str_advance(EDI, asize, size);
+            self.set_str_count(asize, self.str_count(asize).wrapping_sub(1));
+            if self.flag(ZF) != want_zf {
+                break;
+            }
+        }
+    }
+
     // ============================ branch helpers ============================
     /// Set EIP, masking to 16 bits in real mode.
     #[inline]
@@ -483,6 +649,51 @@ impl Cpu {
                 self.push(bus, v, osize);
             }
 
+            // ---- IMUL r, r/m, imm (0x69 imm-z, 0x6B imm8 sign-extended) ----
+            0x69 | 0x6B => {
+                let (reg, ea) = self.modrm(bus, &p, asize);
+                let src = sign_ext(self.read_ea(bus, ea, osize), osize) as i32 as i64;
+                let imm = if op == 0x6B {
+                    self.fetch_i8(bus) as i32 as i64
+                } else {
+                    sign_ext(self.fetch_imm(bus, osize), osize) as i32 as i64
+                };
+                let full = src * imm;
+                let res = (full as u32) & Cpu::size_mask(osize);
+                let trunc = sign_ext(res, osize) as i32 as i64;
+                let of = trunc != full;
+                self.set_reg(reg as usize, osize, res);
+                self.set_flag(CF, of);
+                self.set_flag(OF, of);
+            }
+
+            // ---- PUSHA / PUSHAD (0x60) ----
+            0x60 => {
+                let sp0 = self.reg(ESP, osize);
+                for r in [EAX, ECX, EDX, EBX] {
+                    let v = self.reg(r, osize);
+                    self.push(bus, v, osize);
+                }
+                self.push(bus, sp0, osize); // original (E)SP
+                for r in [EBP, ESI, EDI] {
+                    let v = self.reg(r, osize);
+                    self.push(bus, v, osize);
+                }
+            }
+            // ---- POPA / POPAD (0x61) ----
+            0x61 => {
+                // pop order: EDI,ESI,EBP,(skip ESP),EBX,EDX,ECX,EAX
+                for r in [EDI, ESI, EBP] {
+                    let v = self.pop(bus, osize);
+                    self.set_reg(r, osize, v);
+                }
+                let _esp = self.pop(bus, osize); // discard the saved (E)SP slot
+                for r in [EBX, EDX, ECX, EAX] {
+                    let v = self.pop(bus, osize);
+                    self.set_reg(r, osize, v);
+                }
+            }
+
             // ---- PUSH/POP segment (one-byte forms) ----
             0x06 => {
                 let v = self.seg_sel[ES] as u32;
@@ -645,6 +856,67 @@ impl Cpu {
                 let imm = self.fetch_imm(bus, osize);
                 let a = self.reg(EAX, osize);
                 self.flags_logic(a & imm, osize);
+            }
+
+            // ---- string ops (MOVS/CMPS/STOS/LODS/SCAS) with REP ----
+            0xA4 | 0xA5 => {
+                let size = if op == 0xA4 { 1 } else { osize };
+                self.string_movs(bus, size, asize, &p);
+            }
+            0xA6 | 0xA7 => {
+                let size = if op == 0xA6 { 1 } else { osize };
+                self.string_cmps(bus, size, asize, &p);
+            }
+            0xAA | 0xAB => {
+                let size = if op == 0xAA { 1 } else { osize };
+                self.string_stos(bus, size, asize, &p);
+            }
+            0xAC | 0xAD => {
+                let size = if op == 0xAC { 1 } else { osize };
+                self.string_lods(bus, size, asize, &p);
+            }
+            0xAE | 0xAF => {
+                let size = if op == 0xAE { 1 } else { osize };
+                self.string_scas(bus, size, asize, &p);
+            }
+
+            // ---- XLAT/XLATB: AL <- [DS:(E)BX + AL] ----
+            0xD7 => {
+                let seg = p.seg.unwrap_or(DS);
+                let bx = if asize == 2 { self.reg16(EBX) } else { self.reg32(EBX) };
+                let off = bx.wrapping_add(self.reg8(EAX));
+                let off = if asize == 2 { off & 0xFFFF } else { off };
+                let lin = self.seg_base[seg].wrapping_add(off);
+                let v = self.read_mem(bus, lin, 1);
+                self.set_reg8(EAX, v);
+            }
+
+            // ---- ENTER imm16, imm8 (0xC8) ----
+            0xC8 => {
+                let alloc = self.fetch_u16(bus);
+                let level = (self.fetch_u8(bus) & 0x1F) as u32;
+                let fp = self.reg(EBP, osize);
+                self.push(bus, fp, osize);
+                let frame_temp = self.reg(ESP, osize);
+                if level > 0 {
+                    for _ in 1..level {
+                        let new_bp = self.reg(EBP, osize).wrapping_sub(osize as u32);
+                        self.set_reg(EBP, osize, new_bp);
+                        let v = self.reg(EBP, osize);
+                        self.push(bus, v, osize);
+                    }
+                    self.push(bus, frame_temp, osize);
+                }
+                self.set_reg(EBP, osize, frame_temp);
+                let new_sp = frame_temp.wrapping_sub(alloc);
+                self.set_reg(ESP, osize, new_sp);
+            }
+            // ---- LEAVE (0xC9): ESP <- EBP ; pop EBP ----
+            0xC9 => {
+                let fp = self.reg(EBP, osize);
+                self.set_reg(ESP, osize, fp);
+                let v = self.pop(bus, osize);
+                self.set_reg(EBP, osize, v);
             }
 
             // ---- MOV r8/r, imm ----
@@ -1194,6 +1466,93 @@ impl Cpu {
         Some(res)
     }
 
+    /// BT/BTS/BTR/BTC with a register bit offset (0F A3/AB/B3/BB). For a memory
+    /// operand the bit index addresses outside the nominal operand size, so we
+    /// resolve the byte holding the bit; for a register the index is masked.
+    fn do_bit(&mut self, bus: &mut impl Bus, p: &Prefixes, asize: u8, osize: u8, bop: BitOp) {
+        let (reg, ea) = self.modrm(bus, p, asize);
+        let bit = self.reg(reg as usize, osize);
+        match ea {
+            Ea::Reg(_) => {
+                self.bit_apply(bus, ea, osize, bit, bop);
+            }
+            Ea::Mem { lin, off } => {
+                // The bit offset selects which byte (signed for register-offset).
+                let bit_i = bit as i32;
+                let byte_off = bit_i.div_euclid(8);
+                let bit_in_byte = bit_i.rem_euclid(8) as u32;
+                let lin = lin.wrapping_add(byte_off as u32);
+                let mem = Ea::Mem { lin, off };
+                self.bit_apply(bus, mem, 1, bit_in_byte, bop);
+            }
+        }
+    }
+
+    /// Apply a single BT-family op at `bit` (masked to the operand size) of the
+    /// operand at `ea`. Sets CF from the tested bit; writes back for S/R/C.
+    fn bit_apply(&mut self, bus: &mut impl Bus, ea: Ea, size: u8, bit: u32, bop: BitOp) {
+        let nbits = size as u32 * 8;
+        let b = bit % nbits;
+        let v = self.read_ea(bus, ea, size);
+        let mask = 1u32 << b;
+        self.set_flag(CF, v & mask != 0);
+        let nv = match bop {
+            BitOp::Test => return,
+            BitOp::Set => v | mask,
+            BitOp::Reset => v & !mask,
+            BitOp::Comp => v ^ mask,
+        };
+        self.write_ea(bus, ea, size, nv & Cpu::size_mask(size));
+    }
+
+    /// SHLD: shift `dst` left by `count`, feeding in the high bits of `src`.
+    fn do_shld(&mut self, dst: u32, src: u32, count: u32, size: u8) -> u32 {
+        let bits = size as u32 * 8;
+        let count = count & 0x1F;
+        let m = Cpu::size_mask(size);
+        let dst = dst & m;
+        if count == 0 {
+            return dst;
+        }
+        if count >= bits {
+            // Officially undefined; do nothing observable but mimic real CPUs by
+            // leaving SZP from a best-effort result. We just return dst.
+            return dst;
+        }
+        let res = ((dst << count) | ((src & m) >> (bits - count))) & m;
+        let cf = (dst >> (bits - count)) & 1 != 0;
+        self.set_szp_pub(res, size);
+        self.set_flag(CF, cf);
+        if count == 1 {
+            let sign = m ^ (m >> 1);
+            self.set_flag(OF, ((res ^ dst) & sign) != 0);
+        }
+        res
+    }
+
+    /// SHRD: shift `dst` right by `count`, feeding in the low bits of `src`.
+    fn do_shrd(&mut self, dst: u32, src: u32, count: u32, size: u8) -> u32 {
+        let bits = size as u32 * 8;
+        let count = count & 0x1F;
+        let m = Cpu::size_mask(size);
+        let dst = dst & m;
+        if count == 0 {
+            return dst;
+        }
+        if count >= bits {
+            return dst;
+        }
+        let res = ((dst >> count) | ((src & m) << (bits - count))) & m;
+        let cf = (dst >> (count - 1)) & 1 != 0;
+        self.set_szp_pub(res, size);
+        self.set_flag(CF, cf);
+        if count == 1 {
+            let sign = m ^ (m >> 1);
+            self.set_flag(OF, ((res ^ dst) & sign) != 0);
+        }
+        res
+    }
+
     /// Two-byte (0x0F-prefixed) opcodes: a small system/utility slice.
     fn exec_0f(
         &mut self,
@@ -1254,6 +1613,134 @@ impl Cpu {
                 let (reg, ea) = self.modrm(bus, p, asize);
                 let v = sign_ext(self.read_ea(bus, ea, src), src);
                 self.set_reg(reg as usize, osize, v);
+            }
+
+            // CMOVcc r, r/m — conditional move (no flags affected).
+            0x40..=0x4F => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let v = self.read_ea(bus, ea, osize);
+                if self.cc(op2 - 0x40) {
+                    self.set_reg(reg as usize, osize, v);
+                }
+            }
+
+            // IMUL r, r/m (two-operand, signed) — result truncated, CF=OF on ovf.
+            0xAF => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let a = sign_ext(self.reg(reg as usize, osize), osize) as i32 as i64;
+                let b = sign_ext(self.read_ea(bus, ea, osize), osize) as i32 as i64;
+                let full = a * b;
+                let res = (full as u32) & Cpu::size_mask(osize);
+                let of = sign_ext(res, osize) as i32 as i64 != full;
+                self.set_reg(reg as usize, osize, res);
+                self.set_flag(CF, of);
+                self.set_flag(OF, of);
+            }
+
+            // BT/BTS/BTR/BTC r/m, r  (reg form)
+            0xA3 => self.do_bit(bus, p, asize, osize, BitOp::Test),
+            0xAB => self.do_bit(bus, p, asize, osize, BitOp::Set),
+            0xB3 => self.do_bit(bus, p, asize, osize, BitOp::Reset),
+            0xBB => self.do_bit(bus, p, asize, osize, BitOp::Comp),
+            // group 8: BT/BTS/BTR/BTC r/m, imm8 (reg field selects the op)
+            0xBA => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let imm = self.fetch_u8(bus) as u32;
+                let bop = match reg {
+                    4 => BitOp::Test,
+                    5 => BitOp::Set,
+                    6 => BitOp::Reset,
+                    7 => BitOp::Comp,
+                    _ => {
+                        self.eip = start_eip;
+                        self.raise(Exception::InvalidOpcode, 0, op2);
+                        return;
+                    }
+                };
+                self.bit_apply(bus, ea, osize, imm, bop);
+            }
+
+            // BSF / BSR
+            0xBC | 0xBD => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let src = self.read_ea(bus, ea, osize) & Cpu::size_mask(osize);
+                if src == 0 {
+                    // ZF set; destination is left undefined (we leave it).
+                    self.set_flag(ZF, true);
+                } else {
+                    self.set_flag(ZF, false);
+                    let idx = if op2 == 0xBC {
+                        src.trailing_zeros() // BSF: lowest set bit
+                    } else {
+                        31 - src.leading_zeros() // BSR: highest set bit
+                    };
+                    self.set_reg(reg as usize, osize, idx);
+                }
+            }
+
+            // SHLD r/m, r, imm8 (0xA4) / CL (0xA5)
+            0xA4 | 0xA5 => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let count = if op2 == 0xA4 {
+                    self.fetch_u8(bus) as u32
+                } else {
+                    self.reg8(ECX)
+                };
+                let dst = self.read_ea(bus, ea, osize);
+                let src = self.reg(reg as usize, osize);
+                let r = self.do_shld(dst, src, count, osize);
+                self.write_ea(bus, ea, osize, r);
+            }
+            // SHRD r/m, r, imm8 (0xAC) / CL (0xAD)
+            0xAC | 0xAD => {
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let count = if op2 == 0xAC {
+                    self.fetch_u8(bus) as u32
+                } else {
+                    self.reg8(ECX)
+                };
+                let dst = self.read_ea(bus, ea, osize);
+                let src = self.reg(reg as usize, osize);
+                let r = self.do_shrd(dst, src, count, osize);
+                self.write_ea(bus, ea, osize, r);
+            }
+
+            // BSWAP r32 (0xC8..0xCF) — byte-swap a 32-bit register.
+            0xC8..=0xCF => {
+                let r = (op2 - 0xC8) as usize;
+                if osize == 2 {
+                    // BSWAP r16 is officially undefined; common CPUs zero it.
+                    self.set_reg16(r, 0);
+                } else {
+                    self.set_reg32(r, self.reg32(r).swap_bytes());
+                }
+            }
+
+            // XADD r/m, r (0xC0 byte, 0xC1 word/dword)
+            0xC0 | 0xC1 => {
+                let size = if op2 == 0xC0 { 1 } else { osize };
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let dst = self.read_ea(bus, ea, size);
+                let src = self.reg(reg as usize, size);
+                let sum = self.flags_add(dst, src, size);
+                self.set_reg(reg as usize, size, dst); // old dst -> reg
+                self.write_ea(bus, ea, size, sum); // sum -> dst
+            }
+
+            // CMPXCHG r/m, r (0xB0 byte, 0xB1 word/dword)
+            0xB0 | 0xB1 => {
+                let size = if op2 == 0xB0 { 1 } else { osize };
+                let (reg, ea) = self.modrm(bus, p, asize);
+                let dst = self.read_ea(bus, ea, size);
+                let acc = self.reg(EAX, size);
+                // Compare accumulator with dst (sets flags like CMP acc, dst).
+                self.flags_sub(acc, dst, size);
+                if self.flag(ZF) {
+                    let src = self.reg(reg as usize, size);
+                    self.write_ea(bus, ea, size, src);
+                } else {
+                    self.set_reg(EAX, size, dst);
+                }
             }
             _ => {
                 self.eip = start_eip;
@@ -1492,6 +1979,281 @@ mod tests {
         ]);
         run(&mut xb, 2);
         assert_eq!(xb.cpu.reg32(EBX), 0xFF);
+    }
+
+    #[test]
+    fn rep_movs_copies_buffer() {
+        // Set up source bytes at 0x1000, copy 4 dwords to 0x2000 with rep movsd.
+        // mov esi,0x1000 ; mov edi,0x2000 ; mov ecx,4 ; cld ; rep movsd
+        let mut xb = harness(&[
+            0xBE, 0x00, 0x10, 0x00, 0x00, // mov esi,0x1000
+            0xBF, 0x00, 0x20, 0x00, 0x00, // mov edi,0x2000
+            0xB9, 0x04, 0x00, 0x00, 0x00, // mov ecx,4
+            0xFC, // cld
+            0xF3, 0xA5, // rep movsd
+        ]);
+        for i in 0..4u32 {
+            xb.mem.ram_write8(0x1000 + i * 4, (0x10 + i) & 0xFF);
+            xb.mem.ram_write8(0x1000 + i * 4 + 1, 0);
+            xb.mem.ram_write8(0x1000 + i * 4 + 2, 0);
+            xb.mem.ram_write8(0x1000 + i * 4 + 3, 0);
+        }
+        run(&mut xb, 5);
+        for i in 0..4u32 {
+            assert_eq!(xb.mem.ram_read8(0x2000 + i * 4), 0x10 + i);
+        }
+        assert_eq!(xb.cpu.reg32(ECX), 0, "ecx drained");
+        assert_eq!(xb.cpu.reg32(ESI), 0x1010);
+        assert_eq!(xb.cpu.reg32(EDI), 0x2010);
+    }
+
+    #[test]
+    fn rep_stos_fills_buffer() {
+        // mov eax,0xAB ; mov edi,0x3000 ; mov ecx,5 ; cld ; rep stosb
+        let mut xb = harness(&[
+            0xB8, 0xAB, 0x00, 0x00, 0x00, // mov eax,0xAB
+            0xBF, 0x00, 0x30, 0x00, 0x00, // mov edi,0x3000
+            0xB9, 0x05, 0x00, 0x00, 0x00, // mov ecx,5
+            0xFC, // cld
+            0xF3, 0xAA, // rep stosb
+        ]);
+        run(&mut xb, 5);
+        for i in 0..5u32 {
+            assert_eq!(xb.mem.ram_read8(0x3000 + i), 0xAB);
+        }
+        assert_eq!(xb.cpu.reg32(ECX), 0);
+        assert_eq!(xb.cpu.reg32(EDI), 0x3005);
+    }
+
+    #[test]
+    fn repne_scas_finds_byte() {
+        // Find byte 0x07 in a buffer. al=0x07, edi=0x4000, ecx=8, cld, repne scasb.
+        let mut xb = harness(&[
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax,0x07
+            0xBF, 0x00, 0x40, 0x00, 0x00, // mov edi,0x4000
+            0xB9, 0x08, 0x00, 0x00, 0x00, // mov ecx,8
+            0xFC, // cld
+            0xF2, 0xAE, // repne scasb
+        ]);
+        let data = [1u32, 2, 3, 7, 9, 9, 9, 9];
+        for (i, &b) in data.iter().enumerate() {
+            xb.mem.ram_write8(0x4000 + i as u32, b);
+        }
+        run(&mut xb, 5);
+        // 0x07 is at index 3; scan advances EDI past it -> 0x4004, ecx=8-4=4.
+        assert_eq!(xb.cpu.reg32(EDI), 0x4004);
+        assert_eq!(xb.cpu.reg32(ECX), 4);
+        assert!(xb.cpu.flag(ZF), "match sets ZF");
+    }
+
+    #[test]
+    fn repe_cmps_compares_buffers() {
+        // Compare two equal 4-byte buffers, then differ. esi=0x5000, edi=0x6000.
+        let mut xb = harness(&[
+            0xBE, 0x00, 0x50, 0x00, 0x00, // mov esi,0x5000
+            0xBF, 0x00, 0x60, 0x00, 0x00, // mov edi,0x6000
+            0xB9, 0x04, 0x00, 0x00, 0x00, // mov ecx,4
+            0xFC, // cld
+            0xF3, 0xA6, // repe cmpsb
+        ]);
+        let a = [1u32, 2, 3, 4];
+        let b = [1u32, 2, 9, 4];
+        for i in 0..4 {
+            xb.mem.ram_write8(0x5000 + i as u32, a[i]);
+            xb.mem.ram_write8(0x6000 + i as u32, b[i]);
+        }
+        run(&mut xb, 5);
+        // Equal at idx 0,1; mismatch at idx 2 -> stop after comparing 3 bytes.
+        assert_eq!(xb.cpu.reg32(ECX), 1, "stopped at first mismatch");
+        assert!(!xb.cpu.flag(ZF), "mismatch clears ZF");
+    }
+
+    #[test]
+    fn cmovcc_moves_on_condition() {
+        // mov eax,1 ; mov ebx,0x55 ; test eax,eax ; cmovnz ecx,ebx
+        let mut xb = harness(&[
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax,1
+            0xBB, 0x55, 0x00, 0x00, 0x00, // mov ebx,0x55
+            0x85, 0xC0, // test eax,eax
+            0x0F, 0x45, 0xCB, // cmovnz ecx,ebx
+        ]);
+        run(&mut xb, 4);
+        assert_eq!(xb.cpu.reg32(ECX), 0x55, "moved because nz");
+    }
+
+    #[test]
+    fn cmovcc_skips_when_false() {
+        // mov eax,0 ; mov ebx,0x55 ; test eax,eax ; cmovnz ecx,ebx (skipped)
+        let mut xb = harness(&[
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax,0
+            0xBB, 0x55, 0x00, 0x00, 0x00, // mov ebx,0x55
+            0x85, 0xC0, // test eax,eax
+            0x0F, 0x45, 0xCB, // cmovnz ecx,ebx
+        ]);
+        run(&mut xb, 4);
+        assert_eq!(xb.cpu.reg32(ECX), 0, "not moved because zero");
+    }
+
+    #[test]
+    fn bt_and_bts_set_carry_and_bit() {
+        // mov eax,0x04 ; bt eax,2 (CF=1) ; bts eax,3 (set bit3)
+        let mut xb = harness(&[
+            0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax,4 (bit2 set)
+            0x0F, 0xBA, 0xE0, 0x02, // bt eax,2
+        ]);
+        run(&mut xb, 2);
+        assert!(xb.cpu.flag(CF), "bit2 was set");
+        // Now BTS bit 3.
+        let mut xb = harness(&[
+            0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax,4
+            0x0F, 0xBA, 0xE8, 0x03, // bts eax,3
+        ]);
+        run(&mut xb, 2);
+        assert_eq!(xb.cpu.reg32(EAX), 0x0C, "bit3 set");
+        assert!(!xb.cpu.flag(CF), "bit3 was clear before");
+    }
+
+    #[test]
+    fn shld_shifts_in_high_bits() {
+        // eax=0xF0000000, ebx=0x12345678 ; shld eax,ebx,4 -> 0x00000001
+        let mut xb = harness(&[
+            0xB8, 0x00, 0x00, 0x00, 0xF0, // mov eax,0xF0000000
+            0xBB, 0x78, 0x56, 0x34, 0x12, // mov ebx,0x12345678
+            0x0F, 0xA4, 0xD8, 0x04, // shld eax,ebx,4
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(EAX), 0x0000_0001);
+    }
+
+    #[test]
+    fn shrd_shifts_in_low_bits() {
+        // eax=0x0000000F, ebx=0x12345678 ; shrd eax,ebx,4 -> 0x80000000
+        let mut xb = harness(&[
+            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax,0x0000000F
+            0xBB, 0x78, 0x56, 0x34, 0x12, // mov ebx,0x12345678
+            0x0F, 0xAC, 0xD8, 0x04, // shrd eax,ebx,4
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(EAX), 0x8000_0000);
+    }
+
+    #[test]
+    fn bswap_reverses_bytes() {
+        // mov eax,0x11223344 ; bswap eax -> 0x44332211
+        let mut xb = harness(&[
+            0xB8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+            0x0F, 0xC8, // bswap eax
+        ]);
+        run(&mut xb, 2);
+        assert_eq!(xb.cpu.reg32(EAX), 0x4433_2211);
+    }
+
+    #[test]
+    fn imul_two_operand() {
+        // mov eax,7 ; imul eax,eax,6 -> 42
+        let mut xb = harness(&[
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax,7
+            0x6B, 0xC0, 0x06, // imul eax,eax,6
+        ]);
+        run(&mut xb, 2);
+        assert_eq!(xb.cpu.reg32(EAX), 42);
+        // imul r,r/m form (0F AF): mov ebx,5 ; imul ebx,eax (5*42=210)
+        let mut xb = harness(&[
+            0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax,42
+            0xBB, 0x05, 0x00, 0x00, 0x00, // mov ebx,5
+            0x0F, 0xAF, 0xD8, // imul ebx,eax
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(EBX), 210);
+    }
+
+    #[test]
+    fn leave_restores_frame() {
+        // Simulate: push EBP frame, set ESP below, then LEAVE.
+        // mov ebp,0x1FF0 ; write saved-ebp at [0x1FF0]=0xAAAA ; mov esp,0x1F00 ; leave
+        let mut xb = harness(&[
+            0xBD, 0xF0, 0x1F, 0x00, 0x00, // mov ebp,0x1FF0
+            0xBC, 0x00, 0x1F, 0x00, 0x00, // mov esp,0x1F00
+            0xC9, // leave
+        ]);
+        xb.mem.ram_write8(0x1FF0, 0xAA);
+        xb.mem.ram_write8(0x1FF1, 0xAA);
+        xb.mem.ram_write8(0x1FF2, 0x00);
+        xb.mem.ram_write8(0x1FF3, 0x00);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(ESP), 0x1FF4, "esp = old ebp + 4");
+        assert_eq!(xb.cpu.reg32(EBP), 0x0000_AAAA, "ebp popped");
+    }
+
+    #[test]
+    fn pusha_popa_round_trip() {
+        // Set distinct regs, pusha, clobber, popa, verify restored.
+        // mov eax,0x11 ; mov ecx,0x22 ; pusha ; mov eax,0 ; mov ecx,0 ; popa
+        let mut xb = harness(&[
+            0xB8, 0x11, 0x00, 0x00, 0x00, // mov eax,0x11
+            0xB9, 0x22, 0x00, 0x00, 0x00, // mov ecx,0x22
+            0x60, // pusha
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax,0
+            0xB9, 0x00, 0x00, 0x00, 0x00, // mov ecx,0
+            0x61, // popa
+        ]);
+        let sp0 = xb.cpu.reg32(ESP);
+        run(&mut xb, 6);
+        assert_eq!(xb.cpu.reg32(EAX), 0x11);
+        assert_eq!(xb.cpu.reg32(ECX), 0x22);
+        assert_eq!(xb.cpu.reg32(ESP), sp0, "stack balanced");
+    }
+
+    #[test]
+    fn xadd_swaps_and_adds() {
+        // mov eax,5 ; mov ebx,3 ; xadd ebx,eax -> ebx=8, eax=3(old ebx)
+        let mut xb = harness(&[
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax,5
+            0xBB, 0x03, 0x00, 0x00, 0x00, // mov ebx,3
+            0x0F, 0xC1, 0xC3, // xadd ebx,eax
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(EBX), 8, "sum -> dst");
+        assert_eq!(xb.cpu.reg32(EAX), 3, "old dst -> src");
+    }
+
+    #[test]
+    fn cmpxchg_matches_and_swaps() {
+        // eax=5, ebx(dst)=5, ecx=9 ; cmpxchg ebx,ecx -> equal so ebx=9, ZF=1
+        let mut xb = harness(&[
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax,5
+            0xBB, 0x05, 0x00, 0x00, 0x00, // mov ebx,5
+            0xB9, 0x09, 0x00, 0x00, 0x00, // mov ecx,9
+            0x0F, 0xB1, 0xCB, // cmpxchg ebx,ecx
+        ]);
+        run(&mut xb, 4);
+        assert!(xb.cpu.flag(ZF), "acc == dst");
+        assert_eq!(xb.cpu.reg32(EBX), 9, "src stored");
+        // Mismatch case: eax=5, ebx=7 ; cmpxchg loads ebx into eax.
+        let mut xb = harness(&[
+            0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax,5
+            0xBB, 0x07, 0x00, 0x00, 0x00, // mov ebx,7
+            0xB9, 0x09, 0x00, 0x00, 0x00, // mov ecx,9
+            0x0F, 0xB1, 0xCB, // cmpxchg ebx,ecx
+        ]);
+        run(&mut xb, 4);
+        assert!(!xb.cpu.flag(ZF));
+        assert_eq!(xb.cpu.reg32(EAX), 7, "dst loaded into acc");
+        assert_eq!(xb.cpu.reg32(EBX), 7, "dst unchanged");
+    }
+
+    #[test]
+    fn bsf_bsr_find_bits() {
+        // mov eax,0x100 ; bsf ebx,eax -> 8 ; bsr ecx,eax -> 8
+        let mut xb = harness(&[
+            0xB8, 0x00, 0x01, 0x00, 0x00, // mov eax,0x100
+            0x0F, 0xBC, 0xD8, // bsf ebx,eax
+            0x0F, 0xBD, 0xC8, // bsr ecx,eax
+        ]);
+        run(&mut xb, 3);
+        assert_eq!(xb.cpu.reg32(EBX), 8);
+        assert_eq!(xb.cpu.reg32(ECX), 8);
+        assert!(!xb.cpu.flag(ZF));
     }
 
     #[test]
