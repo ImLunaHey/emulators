@@ -32,6 +32,8 @@ core-gbc/target
 core-gbc/pkg
 core-sms/target
 core-sms/pkg
+core-gc/target
+core-gc/pkg
 core-xbox/target
 core-xbox/pkg
 

@@ -1,0 +1,39 @@
+[package]
+name = "gc-core"
+version = "0.0.0"
+edition = "2021"
+
+# From-scratch Nintendo GameCube ("Dolphin"/GCN) core, built against public
+# hardware references (YAGCD — "Yet Another GameCube Documentation"). The sixth
+# core in this repo, sibling of the GBA/NDS/PS1/GBC/NES/SMS cores. This is
+# strictly FOUNDATION work: the IBM PowerPC 750CXe "Gekko" register/exception
+# state, a starter integer-instruction interpreter, the main-RAM memory map, the
+# bus, and a Flipper GPU framebuffer stub. A full GameCube emulator (Flipper GX
+# pipeline, DSP, DI/DVD, EXI, SI, AI audio, the IPL boot) is a multi-month effort
+# layered on top of this — none of it is attempted here.
+#
+# Builds as a normal rlib for host-side `cargo test`; the web target layers a
+# wasm-bindgen surface (`src/wasm.rs`) on top, exactly like the PS1 core.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-bindgen is only used by the `target_arch="wasm32"` `wasm` module, so it's
+# a wasm-only dependency. Native builds (host `cargo test`) never pull it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O3']
+
+[profile.release]
+opt-level = 3
+lto = true
+# One codegen unit lets LLVM optimize across the whole interpreter (no per-unit
+# boundaries blocking inlining of the monomorphized bus accesses).
+codegen-units = 1
+# No unwinding — a panic in the emulator is unrecoverable anyway. Drops the
+# landing-pad tables, shrinking the binary and trimming the hot paths. (cargo
+# test runs the dev profile, so #[should_panic] still works.)
+panic = "abort"
+
+[dependencies]
