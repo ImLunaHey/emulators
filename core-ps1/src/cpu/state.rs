@@ -83,6 +83,11 @@ pub struct Cpu {
     /// register a pending load targets, the instruction's write wins and the
     /// stale load is dropped. Not architectural state — a single-step scratch.
     pub wrote_reg: u32,
+
+    /// Total exceptions taken since reset. Not architectural — the host watches
+    /// its rate to detect a fault loop (e.g. an unhandled-exception storm) and
+    /// surface a crash screen instead of a silent hang.
+    pub exceptions: u64,
 }
 
 /// The R3000A reset vector: execution begins in the BIOS (KSEG1, uncached).
@@ -110,6 +115,7 @@ impl Cpu {
             cop0: Cop0::new(),
             irq_pending: false,
             wrote_reg: 0,
+            exceptions: 0,
         }
     }
 
@@ -187,6 +193,7 @@ impl Cpu {
     /// redirect the PC pair to the handler vector. The branch-delay state is
     /// reset because the handler starts a fresh (non-delay) instruction stream.
     pub fn raise_exception(&mut self, cause: super::cop0::Exception) {
+        self.exceptions = self.exceptions.wrapping_add(1);
         let vector = self
             .cop0
             .enter_exception(cause, self.current_pc, self.in_delay_slot);

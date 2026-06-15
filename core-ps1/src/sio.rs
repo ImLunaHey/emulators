@@ -14,9 +14,18 @@
 //! | +A  | CTRL        | r/w    |
 //! | +E  | BAUD        | r/w    |
 //!
-//! The shift-register transfer handshake, the pad/memory-card protocol and the
-//! SIO IRQ are stubbed; `STAT` reports "TX ready, RX empty" so the BIOS's pad
-//! probe times out cleanly instead of hanging.
+//! The digital-pad protocol and the SIO0 acknowledge interrupt are modelled:
+//! after the pad clocks back a byte and asserts /ACK, the controller IRQ
+//! (I_STAT bit 7) is raised — gated by JOY_CTRL bit 12 (ACK interrupt enable) —
+//! a short delay later. Games (e.g. Tony Hawk) drive the pad read entirely from
+//! this interrupt and busy-wait on I_STAT bit 7, so without it they hang.
+
+use crate::irq::{Interrupt, Irq};
+
+/// CPU cycles between a pad byte transfer and its /ACK interrupt. Real hardware
+/// asserts /ACK a few dozen microseconds after the byte; a few hundred cycles
+/// is enough for the host's ISR to be ready without stalling the pad read.
+const ACK_DELAY: u32 = 256;
 
 /// One serial port's register block (`SIO0` or `SIO1`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -63,6 +72,11 @@ pub struct Sio {
     /// inverts it into the active-low wire format. Bit layout = [`Button`].
     pub keys: u16,
     pad: PadFsm,
+    /// Cycles until the pending /ACK interrupt fires (0 = none pending).
+    ack_countdown: u32,
+    /// JOY_STAT bit 9 (/IRQ): set when the ACK interrupt has fired, cleared by
+    /// JOY_CTRL bit 4 (ACK) or bit 6 (RESET).
+    irq9: bool,
 }
 
 /// Digital-pad button bit positions in the 16-bit pad word (psx-spx). The wire
@@ -132,11 +146,14 @@ impl Sio {
                 }
             }
             // STAT: bit0 TX-ready (always), bit1 RX-FIFO-not-empty (a reply byte
-            // is waiting), bit2 TX-empty.
+            // is waiting), bit2 TX-empty, bit9 /IRQ (ACK interrupt latched).
             0x4 => {
                 let mut s = 0x0000_0005u32;
                 if self.pad.rx_ready {
                     s |= 1 << 1;
+                }
+                if self.irq9 {
+                    s |= 1 << 9;
                 }
                 s
             }
@@ -164,15 +181,41 @@ impl Sio {
             0x8 => self.sio0.mode = v as u16,
             0xA => {
                 self.sio0.ctrl = v as u16;
-                // Deasserting the transfer (clearing CTRL bit 1 = TX enable, or a
-                // reset via bit 6) ends the current poll and re-idles the pad.
-                if v & 0x40 != 0 || v & 0x2 == 0 {
+                // JOY_CTRL bits (psx-spx): 0=TXEN, 1=/JOYn select (asserts /CS),
+                // 4=ACK (clears the IRQ; must NOT disturb the RX FIFO), 6=RESET.
+                // Re-idle the pad FSM only when /CS is deasserted (bit 1 clear) or
+                // on a reset — an ACK (0x10) leaves the pending RX byte intact.
+                if v & 0x10 != 0 {
+                    // ACK: acknowledge/clear the latched SIO0 interrupt.
+                    self.irq9 = false;
+                }
+                if v & 0x40 != 0 {
+                    // RESET: clear the whole transfer state.
                     self.pad.step = 0;
                     self.pad.rx_ready = false;
+                    self.ack_countdown = 0;
+                    self.irq9 = false;
+                } else if v & 0x2 == 0 {
+                    // /CS deasserted: the next transfer restarts at the address
+                    // byte, but a reply already shifted in stays readable.
+                    self.pad.step = 0;
                 }
             }
             0xE => self.sio0.baud = v as u16,
             _ => {}
+        }
+    }
+
+    /// Advance the pending /ACK: when its countdown expires, latch the SIO0
+    /// interrupt and (if JOY_CTRL bit 12 enables it) raise the controller line.
+    pub fn step(&mut self, cycles: u32, irq: &mut Irq) {
+        if self.ack_countdown == 0 {
+            return;
+        }
+        self.ack_countdown = self.ack_countdown.saturating_sub(cycles);
+        if self.ack_countdown == 0 && self.sio0.ctrl & 0x1000 != 0 {
+            self.irq9 = true;
+            irq.raise(Interrupt::ControllerMemcard);
         }
     }
 
@@ -224,6 +267,13 @@ impl Sio {
                 self.pad.rx_ready = true;
                 self.pad.step = 0;
             }
+        }
+        // The pad asserts /ACK after every byte except its last (which returns
+        // the FSM to step 0). Arm the acknowledge interrupt for those bytes; a
+        // step of 0 means either the final byte or a non-addressed device, both
+        // of which leave /ACK deasserted so the host's read terminates.
+        if self.pad.step != 0 {
+            self.ack_countdown = ACK_DELAY;
         }
     }
 }

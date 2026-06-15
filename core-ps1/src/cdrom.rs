@@ -42,6 +42,13 @@ const ACK_DELAY: u32 = 50_000;
 /// Cycles between the INT3 acknowledge and a follow-up INT (INT2/INT5/INT1).
 const SECOND_DELAY: u32 = 50_000;
 /// Single-speed read rate: 75 sectors/second at 33.8688 MHz ≈ 451584 cycles.
+/// Init (0x0A) completion: drive motor spin-up, ~118 ms (per DuckStation's
+/// hardware-derived `INIT_TICKS`). Far longer than a normal second response.
+const INIT_TICKS: u32 = 4_000_000;
+/// SeekL/SeekP completion: head-move time. A modest fixed approximation (real
+/// hardware scales with seek distance; this is enough for boot sequencing).
+const SEEK_TICKS: u32 = 200_000;
+
 const READ_DELAY_1X: u32 = 451_584;
 /// Double-speed read rate (Setmode bit 7).
 const READ_DELAY_2X: u32 = READ_DELAY_1X / 2;
@@ -99,6 +106,10 @@ pub struct Cdrom {
     data: Vec<u8>,
     /// Read cursor into `data`; padding repeats past the end (psx-spx).
     data_pos: usize,
+    /// True once the host has requested the sector into the data FIFO (port 3
+    /// bit 7, "Want Data"). DRQ (status bit 6) only asserts after this — the
+    /// freshly-read sector sits in the controller's buffer until requested.
+    data_ready: bool,
 
     /// `Setmode` register (bit 5 = sector size, bit 7 = double speed, …).
     mode: u8,
@@ -117,6 +128,11 @@ pub struct Cdrom {
 
     /// The mounted disc image (raw MODE2/2352 bytes). Empty = no disc.
     disc: Vec<u8>,
+
+    /// Set when a command consumes the parameter FIFO; the next parameter push
+    /// then clears the (now-stale) FIFO before adding, so each command sees only
+    /// its own parameters.
+    params_consumed: bool,
 }
 
 impl Cdrom {
@@ -129,15 +145,34 @@ impl Cdrom {
         }
     }
 
-    /// Mount a `.bin` disc image (MODE2/2352). Replaces any previous disc.
-    pub fn load_disc(&mut self, bytes: &[u8]) {
-        self.disc = bytes.to_vec();
+    /// Mount a `.bin` disc image (MODE2/2352). Takes ownership of the bytes so a
+    /// multi-hundred-MB image is moved, not copied. Replaces any previous disc.
+    pub fn load_disc(&mut self, bytes: Vec<u8>) {
+        self.disc = bytes;
         self.drive_stat = stat::MOTOR;
     }
 
     /// True if a disc image is mounted.
     pub fn has_disc(&self) -> bool {
         !self.disc.is_empty()
+    }
+
+    /// The 2048-byte MODE2/form1 user data of sector `lba` (offset 24 into the
+    /// raw 2352-byte sector), or `None` past the end. Used by the HLE disc boot
+    /// to read the ISO9660 filesystem directly.
+    pub fn sector_user_data(&self, lba: u32) -> Option<&[u8]> {
+        let base = lba as usize * SECTOR_RAW + 24;
+        self.disc.get(base..base + 2048)
+    }
+
+    /// Debug: LBA of the next sector a read would deliver (boot-progress probe).
+    pub fn debug_read_lba(&self) -> u32 {
+        self.read_lba
+    }
+
+    /// Debug: whether a ReadN/ReadS stream is currently active.
+    pub fn debug_reading(&self) -> bool {
+        self.reading
     }
 
     /// Number of whole 2352-byte sectors in the mounted image.
@@ -160,8 +195,8 @@ impl Cdrom {
         if !self.response.is_empty() {
             s |= 0x20; // RSLRRDY
         }
-        if self.data_pos < self.data.len() {
-            s |= 0x40; // DRQSTS
+        if self.data_ready && self.data_pos < self.data.len() {
+            s |= 0x40; // DRQSTS — only after the host requests the sector (BFRD)
         }
         // BUSYSTS (bit7): busy while a command's INT3 is still pending.
         if matches!(self.pending, Some(Pending::Ack(_))) {
@@ -228,6 +263,12 @@ impl Cdrom {
 
             // Port 2, bank 0: PARAMETER FIFO push.
             (2, 0) => {
+                // First param after a command starts a fresh set (the prior
+                // command consumed the FIFO).
+                if self.params_consumed {
+                    self.params.clear();
+                    self.params_consumed = false;
+                }
                 if self.params.len() < FIFO_CAP {
                     self.params.push(v);
                 }
@@ -241,9 +282,16 @@ impl Cdrom {
             // data FIFO from the sector buffer; bit0..6 toggle XA/sound-map
             // (not modelled).
             (3, 0) => {
-                if v & 0x80 == 0 {
-                    // BFRD cleared: reset the data-FIFO read cursor.
+                if v & 0x80 != 0 {
+                    // BFRD set: load the data FIFO from the sector buffer, i.e.
+                    // make the current sector readable from the start. DRQ now
+                    // asserts (the host polls it / starts the CD DMA).
+                    self.data_pos = 0;
+                    self.data_ready = true;
+                } else {
+                    // BFRD cleared: reset/empty the data FIFO; DRQ deasserts.
                     self.data_pos = self.data.len();
+                    self.data_ready = false;
                 }
             }
             // Port 3, bank 1: HCLRCTL — acknowledge IRQ flags / clear FIFOs.
@@ -272,6 +320,11 @@ impl Cdrom {
         // a follow-up command sees them; the response timing is what the BIOS
         // waits on.
         self.apply_command_side_effects(cmd);
+        // Mark the parameter FIFO consumed: the command's response may still read
+        // it (e.g. Test 0x19), so we don't clear now — instead the next param
+        // push starts a fresh set. Without this, a later command inherits stale
+        // leading bytes (e.g. misaligning Setloc's mm/ss/ff → wrong LBA).
+        self.params_consumed = true;
         self.pending = Some(Pending::Ack(cmd));
         self.delay = ACK_DELAY;
     }
@@ -361,10 +414,43 @@ impl Cdrom {
                 self.push_stat();
                 None
             }
+            // Mute / Demute / Setfilter: audio-path controls we don't model in
+            // detail, but they are routinely issued during a game's CD init
+            // sequence. Acknowledge with stat (INT3) — returning the unknown-
+            // command error (INT5) made games (e.g. Tony Hawk) treat Init as
+            // failed and retry it forever.
+            0x0B | 0x0C | 0x0D => {
+                self.push_stat();
+                None
+            }
             // Getparam: stat, mode, 0, file, channel.
             0x0F => {
                 let st = self.drive_stat;
                 self.response.extend_from_slice(&[st, self.mode, 0x00, 0x00, 0x00]);
+                None
+            }
+            // GetlocL: header (amm,ass,aff,mode) + subheader (file,chan,sm,ci) of
+            // the most recently read sector, all BCD for the MSF. libcd reads this
+            // to confirm a read landed at the requested position; returning the
+            // unknown-command error (INT5) made position-verifying reads fail.
+            0x10 => {
+                let abs = self.read_lba.wrapping_add(LBA_OFFSET);
+                let (mm, ss, ff) = lba_to_msf(abs);
+                self.response.extend_from_slice(&[
+                    to_bcd(mm), to_bcd(ss), to_bcd(ff), self.mode, 0x00, 0x00, 0x08, 0x00,
+                ]);
+                None
+            }
+            // GetlocP: track, index, relative MSF (to track start), absolute MSF
+            // (all BCD). Single data track ⇒ track 1; relative LBA == read_lba.
+            0x11 => {
+                let abs = self.read_lba.wrapping_add(LBA_OFFSET);
+                let (amm, ass, aff) = lba_to_msf(abs);
+                let (rmm, rss, rff) = lba_to_msf(self.read_lba);
+                self.response.extend_from_slice(&[
+                    0x01, 0x01, to_bcd(rmm), to_bcd(rss), to_bcd(rff),
+                    to_bcd(amm), to_bcd(ass), to_bcd(aff),
+                ]);
                 None
             }
             // GetTN: stat, first track, last track (BCD). One track on a .bin.
@@ -515,6 +601,13 @@ impl Cdrom {
                     self.pending = Some(f);
                     self.delay = match f {
                         Pending::Read => self.read_delay(),
+                        // Init's completion (INT2) is the drive motor spin-up:
+                        // real hardware takes ~118 ms (~4M CPU cycles), not the
+                        // ~50k of a normal second response. libcd's CdInit waits
+                        // on this; delivering it ~80x too early can race its
+                        // handler setup. SeekL/SeekP also take longer (head move).
+                        Pending::Second(0x0A) => INIT_TICKS,
+                        Pending::Second(0x15) | Pending::Second(0x16) => SEEK_TICKS,
                         _ => SECOND_DELAY,
                     };
                 }
@@ -676,7 +769,7 @@ mod tests {
         let mut cd = Cdrom::new();
         let mut irq = Irq::new();
         cd.irq_enable = 0x07;
-        cd.load_disc(&synth_disc(4));
+        cd.load_disc(synth_disc(4));
         cd.write(1, 0x1A); // GetID
         run_until_irq(&mut cd, &mut irq);
         assert_eq!(cd.irq_flags & 0x07, int::ACK, "first INT3");
@@ -725,7 +818,7 @@ mod tests {
         let mut cd = Cdrom::new();
         let mut irq = Irq::new();
         cd.irq_enable = 0x07;
-        cd.load_disc(&synth_disc(8));
+        cd.load_disc(synth_disc(8));
 
         // Setloc to 00:02:00 (LBA 0).
         cd.write(2, 0x00);
@@ -781,7 +874,7 @@ mod tests {
         let mut cd = Cdrom::new();
         let mut irq = Irq::new();
         cd.irq_enable = 0x07;
-        cd.load_disc(&synth_disc(2));
+        cd.load_disc(synth_disc(2));
         cd.seek_lba = 0;
         cd.read_lba = 0;
         cd.mode = 0x20; // whole-sector
@@ -797,7 +890,7 @@ mod tests {
         let mut cd = Cdrom::new();
         let mut irq = Irq::new();
         cd.irq_enable = 0x07;
-        cd.load_disc(&synth_disc(1));
+        cd.load_disc(synth_disc(1));
         cd.read_lba = 1; // past the only sector
         cd.reading = true;
         cd.pending = Some(Pending::Read);

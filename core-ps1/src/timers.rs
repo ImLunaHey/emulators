@@ -50,6 +50,9 @@ const MODE_REACHED_FFFF: u16 = 1 << 12;
 /// status bits 10-12 are hardware-driven, not set by software writes).
 const MODE_WRITE_MASK: u16 = 0x03FF;
 
+/// System-clock ticks per HBLANK (scanline). NTSC: 33.8688 MHz / ~15.734 kHz.
+const HBLANK_CYCLES: u32 = 2153;
+
 /// One root counter's register block.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timer {
@@ -60,6 +63,11 @@ pub struct Timer {
     pub mode: u16,
     /// Counter target value (16-bit).
     pub target: u16,
+    /// Fractional system-clock accumulator for sources slower than the system
+    /// clock (HBLANK for Timer1, dotclock for Timer0). System cycles arrive in
+    /// small batches; we accumulate the remainder here so the slow source ticks
+    /// at the correct average rate instead of being rounded to zero each batch.
+    pub frac: u32,
 }
 
 impl Timer {
@@ -147,6 +155,7 @@ impl Timers {
                 t.mode = (v as u16 & MODE_WRITE_MASK) | MODE_IRQ_REQUEST;
                 // Writing the mode forcefully resets the counter (psx-spx).
                 t.counter = 0;
+                t.frac = 0;
             }
             0x8 => t.target = v as u16,
             _ => {}
@@ -164,7 +173,7 @@ impl Timers {
     /// interrupt controller borrowed in by the orchestrator.
     pub fn step(&mut self, cycles: u32, irq: &mut Irq) {
         for i in 0..3 {
-            let ticks = Self::scale_cycles(i, cycles, &self.timers[i]);
+            let ticks = Self::scale_cycles(i, cycles, &mut self.timers[i]);
             if ticks == 0 {
                 continue;
             }
@@ -172,13 +181,36 @@ impl Timers {
         }
     }
 
-    /// Convert system-clock `cycles` into source-clock ticks for timer `i`.
-    fn scale_cycles(i: usize, cycles: u32, t: &Timer) -> u32 {
+    /// Convert system-clock `cycles` into source-clock ticks for timer `i`,
+    /// accumulating sub-tick remainders in `t.frac` for the slow sources.
+    ///
+    /// Per psx-spx the clock-source field selects: Timer0 — dotclock (src 1/3)
+    /// vs system clock (0/2); Timer1 — HBLANK (src 1/3) vs system clock (0/2);
+    /// Timer2 — system clock (0/1) vs system clock /8 (2/3). HBLANK and dotclock
+    /// run far slower/faster than the system clock, so games that read these
+    /// counters for frame timing (e.g. a custom VSync wait) need the real rate,
+    /// not a 1:1 approximation.
+    fn scale_cycles(i: usize, cycles: u32, t: &mut Timer) -> u32 {
+        let src = t.clock_source();
         match i {
+            // Timer1 HBLANK source: one tick per scanline. NTSC scanline rate
+            // ~15.734 kHz against the 33.8688 MHz system clock ⇒ ~2153 cycles.
+            1 if src & 1 == 1 => {
+                let total = t.frac.wrapping_add(cycles);
+                t.frac = total % HBLANK_CYCLES;
+                total / HBLANK_CYCLES
+            }
+            // Timer0 dotclock source: GPU pixel clock (53.2 MHz = sysclk·11/7)
+            // divided by the 320px H-divider (8) ⇒ ~5.09 sysclk per dot. We use
+            // the 320px divisor as a fixed approximation (no live hres here).
+            0 if src & 1 == 1 => {
+                let total = t.frac.wrapping_add(cycles.wrapping_mul(11));
+                t.frac = total % 56;
+                total / 56
+            }
             // Timer2: clock source 2/3 = system clock / 8.
-            2 if t.clock_source() >= 2 => cycles / 8,
-            // Timer0/1 dotclock/HBLANK and the system-clock sources are all
-            // approximated 1:1 against the system clock for now.
+            2 if src >= 2 => cycles / 8,
+            // System-clock sources: 1:1.
             _ => cycles,
         }
     }

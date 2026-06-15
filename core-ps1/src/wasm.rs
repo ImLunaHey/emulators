@@ -29,14 +29,16 @@ impl WasmPsx {
         self.inner.load_bios(bytes);
     }
 
-    /// Mount a disc image (`.bin`, MODE2/2352) — the disc is the game.
-    pub fn load_disc(&mut self, bytes: &[u8]) {
+    /// Mount a disc image (`.bin`, MODE2/2352) — the disc is the game. Takes a
+    /// `Vec<u8>` (wasm-bindgen moves the copied JS bytes into wasm and we keep
+    /// ownership), avoiding a second copy of a multi-hundred-MB image.
+    pub fn load_disc(&mut self, bytes: Vec<u8>) {
         self.inner.load_disc(bytes);
     }
 
     /// Load a game image: a PS-X EXE is side-loaded directly (handy for
     /// homebrew / no-BIOS), anything else is mounted as a `.bin` disc.
-    pub fn load_rom(&mut self, bytes: &[u8]) {
+    pub fn load_rom(&mut self, bytes: Vec<u8>) {
         self.inner.load_rom(bytes);
     }
 

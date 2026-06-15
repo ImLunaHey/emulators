@@ -28,7 +28,9 @@ pub mod wasm;
 
 // --- Subsystem seams (one file per future agent; empty TODO stubs for now).
 pub mod bios;
+pub mod boot;
 pub mod cdrom;
+pub mod crash;
 pub mod dma;
 pub mod gpu;
 pub mod gte;

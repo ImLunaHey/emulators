@@ -47,6 +47,61 @@ pub struct Psx {
 
     /// Completed video frames since reset (one per [`Psx::run_frame`]).
     pub frames: u32,
+
+    /// Snapshot of the CPU's cache-isolation bit (SR.IsC), refreshed before each
+    /// instruction. The store path consults this instead of `self.cpu` because
+    /// the CPU is moved out (`mem::take`) during a step, so `self.cpu` is a
+    /// placeholder with the wrong SR. Without this, isolated stores (the BIOS's
+    /// i-cache invalidation trick) wrongly hit RAM and corrupt the kernel.
+    cache_isolated: bool,
+
+    /// Set once a fault loop is detected (an unhandled-exception storm). While
+    /// set, [`Psx::run_frame`] freezes the CPU and presents the crash screen.
+    pub fault: Option<Fault>,
+
+    /// HLE disc boot bookkeeping. The BIOS sets up the kernel correctly but its
+    /// shell doesn't always auto-boot the disc; once it's read the system area
+    /// and gone idle, we parse the ISO ourselves, load the boot EXE, and jump
+    /// to it (the game then runs on the initialised kernel). One-shot.
+    hle_booted: bool,
+    boot_watch_lba: u32,
+    boot_stable_frames: u32,
+
+    /// Optional instruction trace (the executed PC stream), for a differential
+    /// trace against a reference emulator to find the first divergence. `None`
+    /// (the default) costs only a branch per instruction; set it via
+    /// [`Psx::enable_trace`] and drain with [`Psx::take_trace`].
+    pub trace: Option<Vec<u32>>,
+}
+
+/// Short uppercase mnemonic for a COP0 ExcCode (font covers A-Z/0-9 only).
+fn exc_name(code: u32) -> &'static str {
+    match code {
+        0 => "INTERRUPT",
+        4 => "ADDRERRLOAD",
+        5 => "ADDRERRSTORE",
+        6 => "IBUSERR",
+        7 => "DBUSERR",
+        8 => "SYSCALL",
+        9 => "BREAK",
+        10 => "RESERVEDINSTR",
+        11 => "COPUNUSABLE",
+        12 => "OVERFLOW",
+        _ => "UNKNOWN",
+    }
+}
+
+/// A detected fault loop, captured for the crash screen.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// COP0 CAUSE.ExcCode of the storm's exceptions.
+    pub code: u32,
+    /// Exception Program Counter at the time of detection.
+    pub epc: u32,
+    /// Bad virtual address of the originating fault.
+    pub badv: u32,
+    /// Frame number when the fault was detected.
+    pub frame: u32,
 }
 
 impl Default for Psx {
@@ -74,6 +129,12 @@ impl Psx {
             ram_size: 0x0000_0B88,
             cache_control: 0,
             frames: 0,
+            cache_isolated: false,
+            fault: None,
+            hle_booted: false,
+            boot_watch_lba: 0,
+            boot_stable_frames: 0,
+            trace: None,
         };
         // No BIOS yet → lay down the minimal HLE boot environment so a freshly
         // constructed machine steps frames cleanly. `load_bios` re-resets to the
@@ -104,27 +165,39 @@ impl Psx {
     }
 
     /// Mount a disc image (`.bin`, MODE2/2352) as the CD-ROM. The disc *is* the
-    /// game on the PSX; the BIOS boots it.
-    pub fn load_disc(&mut self, bytes: &[u8]) {
+    /// game on the PSX; the BIOS boots it. Takes ownership so the (often
+    /// hundreds of MB) image is moved into the CD-ROM rather than copied.
+    pub fn load_disc(&mut self, bytes: Vec<u8>) {
         self.cdrom.load_disc(bytes);
+        self.hle_booted = false;
+        self.boot_watch_lba = 0;
+        self.boot_stable_frames = 0;
     }
 
     /// Load a game image. A PS-X EXE (`"PS-X EXE"` magic) is side-loaded
     /// directly into RAM and the CPU is jumped to its entry point (handy
     /// without a BIOS / for homebrew); anything else is treated as a `.bin`
     /// disc image and mounted via [`Psx::load_disc`].
-    pub fn load_rom(&mut self, bytes: &[u8]) {
+    pub fn load_rom(&mut self, bytes: Vec<u8>) {
         if bytes.len() >= 0x800 && &bytes[0..8] == b"PS-X EXE" {
-            self.load_exe(bytes);
+            self.load_exe(&bytes);
         } else {
             self.load_disc(bytes);
         }
     }
 
-    /// Side-load a PS-X EXE image (psx-spx "CDROM File Formats"): copy the body
-    /// (from file offset 0x800) to its destination address in RAM and seed the
-    /// CPU's PC / GP / SP from the 0x800-byte header.
+    /// Side-load a PS-X EXE image (psx-spx "CDROM File Formats"): reset to a
+    /// fresh boot environment, then install the executable.
     fn load_exe(&mut self, bytes: &[u8]) {
+        self.reset();
+        self.install_exe(bytes);
+    }
+
+    /// Copy a PS-X EXE body (from file offset 0x800) to its destination in RAM
+    /// and seed the CPU's PC / GP / SP from the 0x800-byte header. Does NOT
+    /// reset — the HLE disc boot calls this to launch the game on top of the
+    /// BIOS kernel that's already been initialised in RAM.
+    fn install_exe(&mut self, bytes: &[u8]) {
         let rd = |off: usize| -> u32 {
             u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
         };
@@ -135,25 +208,29 @@ impl Psx {
         let sp_base = rd(0x30);
         let sp_off = rd(0x34);
 
-        // Ensure a boot environment exists (no BIOS → HLE trampolines).
-        self.reset();
-
         // Copy the executable body into RAM at `dest` (physical, folded to 2 MB).
         let body = &bytes[0x800..(0x800 + size).min(bytes.len())];
         let base = (dest & 0x1F_FFFF) as usize;
         let n = body.len().min(self.mem.ram.len().saturating_sub(base));
         self.mem.ram[base..base + n].copy_from_slice(&body[..n]);
 
-        // Seed the CPU registers (gp = $28, sp = $29, fp = $30).
+        // Replicate the BIOS Exec() entry state: a clean register file with
+        // gp/sp/fp seeded from the header and a0=argc(1)/a1=argv(0). Without
+        // this the game's crt0 reads leftover BIOS register garbage and computes
+        // bad pointers. (General regs cleared to a known state.)
+        for r in 1..32 {
+            self.cpu.set_reg(r, 0);
+        }
         self.cpu.pc = pc;
         self.cpu.next_pc = pc.wrapping_add(4);
         self.cpu.current_pc = pc;
+        self.cpu.set_reg(4, 1); // a0 = argc
+        self.cpu.set_reg(5, 0); // a1 = argv
         self.cpu.set_reg(28, gp);
-        let sp = sp_base.wrapping_add(sp_off);
-        if sp != 0 {
-            self.cpu.set_reg(29, sp);
-            self.cpu.set_reg(30, sp);
-        }
+        let sp = if sp_base != 0 { sp_base.wrapping_add(sp_off) } else { 0x801F_FF00 };
+        self.cpu.set_reg(29, sp);
+        self.cpu.set_reg(30, sp);
+        self.cpu.set_reg(31, pc); // ra (defensive; entry shouldn't return)
     }
 
     /// Set the digital-pad button state (active-high; bit layout per
@@ -183,6 +260,48 @@ impl Psx {
     pub fn height(&self) -> u32 {
         self.gpu.display_h as u32
     }
+    /// Debug: current CPU program counter (BIOS ROM ~0xBFC0_xxxx vs RAM
+    /// 0x8000_xxxx tells whether the machine is still in the BIOS or running
+    /// kernel/game code).
+    #[inline]
+    pub fn debug_pc(&self) -> u32 {
+        self.cpu.current_pc
+    }
+
+    /// Debug: next-sector LBA the CD-ROM would read, and whether a read stream
+    /// is active — a boot that's loading the game advances the LBA.
+    #[inline]
+    pub fn debug_cd_lba(&self) -> u32 {
+        self.cdrom.debug_read_lba()
+    }
+    #[inline]
+    pub fn debug_cd_reading(&self) -> bool {
+        self.cdrom.debug_reading()
+    }
+
+    /// Total exceptions taken since reset. The host watches this rate to detect
+    /// a fault loop (unhandled-exception storm) and show a crash screen.
+    #[inline]
+    pub fn exception_count(&self) -> u64 {
+        self.cpu.exceptions
+    }
+    /// COP0 CAUSE.ExcCode of the most recent exception (psx-spx codes).
+    #[inline]
+    pub fn debug_exccode(&self) -> u32 {
+        (self.cpu.cop0.cause & crate::cpu::cop0::CAUSE_EXCCODE_MASK)
+            >> crate::cpu::cop0::CAUSE_EXCCODE_SHIFT
+    }
+    /// COP0 EPC (return address of the most recent exception).
+    #[inline]
+    pub fn debug_epc(&self) -> u32 {
+        self.cpu.cop0.epc
+    }
+    /// COP0 BadVaddr (faulting address of the most recent address/bus error).
+    #[inline]
+    pub fn debug_badv(&self) -> u32 {
+        self.cpu.cop0.bad_vaddr
+    }
+
     /// Completed frames since reset.
     #[inline]
     pub fn frame_count(&self) -> u32 {
@@ -210,7 +329,19 @@ impl Psx {
     /// timers / CD-ROM / SPU by the matching cycle budget, running any armed DMA
     /// transfers, folding every device's IRQ line into the CPU, and finally
     /// expanding the display area into the framebuffer.
+    /// Exceptions within a single frame above which we declare a fault loop. A
+    /// real frame takes a handful (IRQs, syscalls); a CPU re-faulting every few
+    /// instructions takes tens of thousands — a crash, not a running game.
+    const FAULT_THRESHOLD: u64 = 10_000;
+
     pub fn run_frame(&mut self) {
+        // Once faulted, freeze: keep presenting the crash screen, run no code.
+        if self.fault.is_some() {
+            self.present_crash();
+            return;
+        }
+
+        let exc_before = self.cpu.exceptions;
         let mut elapsed = 0u32;
         while elapsed < Self::CYCLES_PER_FRAME {
             // ---- step the CPU a batch of instructions ----
@@ -230,6 +361,67 @@ impl Psx {
         // Latch the interlace field + present the display area.
         self.gpu.render_frame();
         self.frames = self.frames.wrapping_add(1);
+
+        self.maybe_hle_boot();
+
+        // Fault-loop detection: a storm of exceptions this frame means the CPU
+        // is wedged re-faulting; capture the cause and switch to the crash screen.
+        if self.cpu.exceptions.wrapping_sub(exc_before) > Self::FAULT_THRESHOLD {
+            self.fault = Some(Fault {
+                code: (self.cpu.cop0.cause & crate::cpu::cop0::CAUSE_EXCCODE_MASK)
+                    >> crate::cpu::cop0::CAUSE_EXCCODE_SHIFT,
+                epc: self.cpu.cop0.epc,
+                badv: self.cpu.cop0.bad_vaddr,
+                frame: self.frames,
+            });
+            self.present_crash();
+        }
+    }
+
+    /// HLE disc-boot fallback. Once the BIOS has read the disc system area
+    /// (`read_lba >= 16`, so the kernel is fully initialised) and then gone idle
+    /// (the LBA hasn't moved for a while — its shell didn't auto-boot), parse the
+    /// ISO ourselves, load the boot EXE on top of the live kernel, and jump.
+    fn maybe_hle_boot(&mut self) {
+        if self.hle_booted || !self.cdrom.has_disc() {
+            return;
+        }
+        // Inject once the kernel's A-call vector trampoline is installed
+        // (`addiu t0,zero,<handler>` at 0xA0) but before the BIOS reads the disc
+        // and runs its failing boot. NOTE: letting the BIOS read the system area
+        // first and injecting afterwards does NOT help — each game re-runs its
+        // own libcd CdInit regardless, so the BIOS's CD state doesn't carry over
+        // (verified 2026-06-15). The remaining blocker is the game's own CD-read
+        // verify, not the injection point; documented in memory.
+        let vec_installed = (self.mem.ram_read32(0xA0) & 0xFFFF_0000) == 0x2408_0000;
+        if vec_installed && self.cdrom.debug_read_lba() == 0 {
+            self.boot_stable_frames += 1;
+        } else {
+            self.boot_stable_frames = 0;
+        }
+        if self.boot_stable_frames >= 2 {
+            self.hle_booted = true; // one-shot, whether or not the disc is bootable
+            if let Some(exe) = crate::boot::find_boot_exe(&self.cdrom) {
+                self.install_exe(&exe);
+            }
+        }
+    }
+
+    /// Draw the crash screen into the display framebuffer from the latched
+    /// [`Fault`]. Called every frame once faulted so the panel stays presented.
+    fn present_crash(&mut self) {
+        let f = match self.fault {
+            Some(f) => f,
+            None => return,
+        };
+        let lines = [
+            "PSX CORE FAULT".to_string(),
+            format!("CAUSE {:02X} {}", f.code, exc_name(f.code)),
+            format!("EPC  {:08X}", f.epc),
+            format!("BADV {:08X}", f.badv),
+            format!("FRAME {}", f.frame),
+        ];
+        crate::crash::render(&mut self.gpu, &lines);
     }
 
     /// Step the CPU exactly one instruction, split-borrowing it out of `self`
@@ -237,11 +429,31 @@ impl Psx {
     /// `mem::take` pattern). Samples the folded IRQ line first.
     fn step_cpu(&mut self) {
         self.cpu.irq_pending = self.irq.pending();
+        // Snapshot the cache-isolation bit from the *real* CPU before moving it
+        // out: the store path can't see `self.cpu` during the step (it's the
+        // mem::take placeholder), and a store instruction never changes SR
+        // itself, so this per-instruction snapshot is exact.
+        self.cache_isolated = self.cpu.cache_isolated();
         // Split the borrow: take the CPU out so the executor can use `self` as
         // its `&mut dyn Bus` (the contract's mem::take pattern). `Cpu: Default`.
         let mut cpu = std::mem::take(&mut self.cpu);
         cpu.step(self);
         self.cpu = cpu;
+        if let Some(t) = &mut self.trace {
+            if t.len() < t.capacity() {
+                t.push(self.cpu.current_pc);
+            }
+        }
+    }
+
+    /// Begin recording the executed-PC stream (up to `capacity` instructions)
+    /// for a differential trace. See [`Psx::trace`].
+    pub fn enable_trace(&mut self, capacity: usize) {
+        self.trace = Some(Vec::with_capacity(capacity));
+    }
+    /// Take the recorded PC trace (leaving recording disabled).
+    pub fn take_trace(&mut self) -> Vec<u32> {
+        self.trace.take().unwrap_or_default()
     }
 
     /// Advance the timed sub-devices by `cycles` system clocks and fold their
@@ -257,6 +469,7 @@ impl Psx {
 
         self.timers.step(cycles, &mut self.irq);
         self.cdrom.step(cycles, &mut self.irq);
+        self.sio.step(cycles, &mut self.irq);
         self.spu.step(cycles);
 
         self.cpu.irq_pending = self.irq.pending();
@@ -479,7 +692,9 @@ impl Psx {
         // doubles as the scratchpad) rather than main RAM. We model this by
         // dropping RAM writes entirely — the BIOS uses it to invalidate the
         // i-cache during boot and never expects the RAM to change.
-        let isolated = self.cpu.cache_isolated();
+        // Use the per-instruction snapshot, not `self.cpu` (the CPU is moved out
+        // during a step, so `self.cpu` here is the mem::take placeholder).
+        let isolated = self.cache_isolated;
         let region = bus::translate(addr);
 
         if isolated {
@@ -750,7 +965,7 @@ mod tests {
         img[0x800..0x804].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         img[0x804..0x808].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         let mut psx = Psx::new();
-        psx.load_rom(&img);
+        psx.load_rom(img);
         assert_eq!(psx.cpu.pc, 0x8001_0000);
         assert_eq!(psx.mem.ram_read32(0x1_0000), 0xDEAD_BEEF);
         assert_eq!(psx.mem.ram_read32(0x1_0004), 0x1234_5678);

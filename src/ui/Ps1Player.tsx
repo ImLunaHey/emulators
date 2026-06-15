@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import initPsx, { WasmPsx } from '../../core-ps1/pkg/ps1_core.js';
 import { getRomBytes } from './romStore';
-import { getBios, setBios } from './biosStore';
+import { setBios } from './biosStore';
+import { usePs1Bios } from './hooks/usePs1Bios';
 import { usePlayerAudio } from './playerAudio';
 
-// PlayStation player. The PS1 can't boot real discs without a BIOS ROM, so the
-// player gates on one (stored in IndexedDB). Once present it boots the .bin
-// disc. Single screen; size comes from the core (PS1 resolution varies).
+// PlayStation player. The PS1 needs a BIOS ROM to boot real discs. We prefer a
+// user-supplied BIOS (best compatibility, stored in IndexedDB), but fall back to
+// a bundled open-source BIOS (/openbios.bin) when the user hasn't supplied one,
+// so commercial discs boot without the user sourcing a file. BIOS resolution
+// lives in usePs1Bios. Single screen; size comes from the core (PS1 res varies).
 
 // Digital-pad bits (active-high, psx-spx order).
 const KEY: Record<string, number> = {
@@ -28,23 +32,31 @@ export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const keysRef = useRef(0);
   const audio = usePlayerAudio();
-  const [phase, setPhase] = useState<'checking' | 'needbios' | 'ready'>('checking');
-
-  useEffect(() => { getBios('ps1').then((b) => setPhase(b ? 'ready' : 'needbios')); }, []);
+  const qc = useQueryClient();
+  // Resolved BIOS: user-supplied ROM if present, else the bundled open-source
+  // one. While the query is loading we show the canvas; null-once-settled ->
+  // the optional "provide a BIOS" prompt.
+  const { data: bios, isLoading } = usePs1Bios();
+  const phase = isLoading ? 'checking' : bios ? 'ready' : 'needbios';
+  // True while the (large) disc image is being read from IndexedDB and handed to
+  // the core — a PS1 disc is hundreds of MB, so this takes a noticeable moment.
+  const [loadingDisc, setLoadingDisc] = useState(false);
 
   useEffect(() => {
-    if (phase !== 'ready') return;
+    if (!bios) return;
     let alive = true;
     let raf = 0;
     let psx: WasmPsx | null = null;
+    setLoadingDisc(true);
     (async () => {
       await initPsx();
-      const bios = await getBios('ps1');
       const disc = await getRomBytes(romId);
-      if (!bios || !disc || !alive) return;
+      if (!disc || !alive) return;
       psx = new WasmPsx();
       psx.load_bios(bios);
-      psx.load_disc(disc);
+      psx.load_disc(disc); // moves the bytes into the core (no extra copy)
+      if (!alive) return;
+      setLoadingDisc(false);
       const ctx = canvasRef.current!.getContext('2d')!;
       const loop = () => {
         if (!alive || !psx) return;
@@ -61,7 +73,7 @@ export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void
       raf = requestAnimationFrame(loop);
     })();
     return () => { alive = false; cancelAnimationFrame(raf); psx?.free(); };
-  }, [phase, romId]);
+  }, [bios, romId]);
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => { if (e.key in KEY) { e.preventDefault(); keysRef.current |= KEY[e.key]; } };
@@ -73,8 +85,10 @@ export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void
 
   const onBiosFile = async (file: File | undefined) => {
     if (!file) return;
-    await setBios('ps1', new Uint8Array(await file.arrayBuffer()));
-    setPhase('ready');
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await setBios('ps1', bytes);
+    // Re-resolve so the boot effect picks up the user BIOS (over the bundled one).
+    qc.setQueryData(['ps1-bios'], bytes);
   };
 
   return (
@@ -94,7 +108,12 @@ export function Ps1Player({ romId, onExit }: { romId: string; onExit: () => void
         </label>
       ) : (
         <>
-          <canvas ref={canvasRef} width={640} height={480} className="w-[min(94vw,640px)] h-auto bg-black" style={{ imageRendering: 'pixelated' }} />
+          <div className="relative w-[min(94vw,640px)]">
+            <canvas ref={canvasRef} width={640} height={480} className="w-full h-auto bg-black" style={{ imageRendering: 'pixelated' }} />
+            {loadingDisc && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-sm">Loading disc…</div>
+            )}
+          </div>
           <div className="text-[10px] opacity-50 mt-1">x=✕ z=○ s=△ a=□ · q/w=L1/R1 · enter=Start shift=Select · arrows</div>
         </>
       )}
