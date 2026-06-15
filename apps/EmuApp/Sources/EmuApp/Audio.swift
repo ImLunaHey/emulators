@@ -16,27 +16,26 @@ final class AudioPlayer {
     init?(sampleRate: Double, channels: Int) {
         self.channels = channels
         self.maxBacklog = Int(sampleRate) * channels // ~1s cap to bound drift
-        guard
-            let fmt = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: sampleRate,
-                channels: AVAudioChannelCount(channels),
-                interleaved: true
-            )
+        // AVAudioEngine nodes require the *standard* (non-interleaved float)
+        // format — an interleaved format fails connect() with -10868. The core
+        // hands us interleaved samples, so we de-interleave in the render block.
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: sampleRate,
+                                      channels: AVAudioChannelCount(channels))
         else { return nil }
 
         source = AVAudioSourceNode(format: fmt) { [weak self] _, _, frameCount, ablPtr -> OSStatus in
             let abl = UnsafeMutableAudioBufferListPointer(ablPtr)
-            guard let self = self, let buf = abl.first,
-                  let dst = buf.mData?.assumingMemoryBound(to: Float.self)
-            else { return noErr }
-            let need = Int(frameCount) * self.channels
+            guard let self = self else { return noErr }
+            let frames = Int(frameCount)
             self.lock.lock()
-            let available = self.ring.count - self.readIdx
-            let n = min(need, max(0, available))
-            for i in 0..<n { dst[i] = self.ring[self.readIdx + i] }
-            for i in n..<need { dst[i] = 0 } // underrun -> silence
-            self.readIdx += n
+            let availFrames = (self.ring.count - self.readIdx) / self.channels
+            let n = min(frames, max(0, availFrames))
+            for ch in 0..<self.channels where ch < abl.count {
+                guard let dst = abl[ch].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                for f in 0..<n { dst[f] = self.ring[self.readIdx + f * self.channels + ch] }
+                for f in n..<frames { dst[f] = 0 } // underrun -> silence
+            }
+            self.readIdx += n * self.channels
             if self.readIdx > 48_000 { // compact occasionally
                 self.ring.removeFirst(self.readIdx)
                 self.readIdx = 0

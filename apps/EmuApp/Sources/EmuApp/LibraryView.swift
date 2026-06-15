@@ -33,6 +33,25 @@ struct LibraryView: View {
         .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
         }
+        .onAppear { DispatchQueue.main.async { autoloadFromEnv() } }
+    }
+
+    /// Debug hook: auto-launch a ROM at startup via EMU_AUTOLOAD (+ optional
+    /// EMU_SYSTEM id). Lets the play path be exercised without clicking.
+    private func autoloadFromEnv() {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["EMU_AUTOLOAD"] else { return }
+        let url = URL(fileURLWithPath: path)
+        let system: EmuSystem?
+        if let s = env["EMU_SYSTEM"], let raw = UInt32(s) {
+            system = EmuSystem(rawValue: raw)
+        } else {
+            system = Self.resolveSystem(url)
+        }
+        guard let sys = system,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return }
+        hub.launch(system: sys, rom: data, title: url.deletingPathExtension().lastPathComponent)
+        openWindow(id: "player")
     }
 
     // ---- actions ----

@@ -18,6 +18,9 @@ final class EmuHub: ObservableObject {
     private weak var screenLayer: CALayer?
     private var audioBuf = [Float](repeating: 0, count: 16_384)
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private var lastControllerInfo = ""
+    private var fpsAccum = 0
+    private var fpsClock = CACurrentMediaTime()
 
     /// In-memory BIOS/flash images per system (PS1, Xbox).
     private var bios: [EmuSystem: Data] = [:]
@@ -71,9 +74,27 @@ final class EmuHub: ObservableObject {
         present(e)
         let n = e.drainAudio(into: &audioBuf)
         if n > 0 { audio?.enqueue(audioBuf[0..<n]) }
-        controllerInfo = input.controllerConnected
+
+        // Only touch @Published state when it actually changes — mutating it every
+        // frame forces SwiftUI to re-render both windows 60x/sec and starves the
+        // main thread (looks like a freeze in a debug build). The screen itself
+        // updates via the CALayer in present(), independent of SwiftUI.
+        let info = input.controllerConnected
             ? (input.controllerName ?? "Controller connected")
             : "No controller — using keyboard"
+        if info != lastControllerInfo {
+            lastControllerInfo = info
+            controllerInfo = info
+        }
+
+        // Lightweight frame-rate diagnostic on stdout (once/sec).
+        fpsAccum += 1
+        let now = CACurrentMediaTime()
+        if now - fpsClock >= 1.0 {
+            FileHandle.standardError.write("emu: \(fpsAccum) fps, frame \(e.frameCount)\n".data(using: .utf8)!)
+            fpsAccum = 0
+            fpsClock = now
+        }
     }
 
     private func present(_ e: Emulator) {
