@@ -270,9 +270,83 @@ struct Sched {
     current: usize,
     started: bool,
     signaled: std::collections::HashSet<u32>,
+    /// Saved context(s) of code interrupted by a delivered ISR (the ISR runs on
+    /// the interrupted thread's stack; we restore on its return).
+    isr_saved: Vec<ThreadCtx>,
 }
 
 static SCHED: Mutex<Option<Sched>> = Mutex::new(None);
+
+/// The connected device ISR: (ServiceRoutine, ServiceContext), captured from
+/// KeInitializeInterrupt. We deliver it on each vblank.
+static CONNECTED_ISR: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Return address pushed under a delivered ISR; when EIP reaches it the
+/// orchestrator restores the interrupted context.
+pub const ISR_RETURN_SENTINEL: u32 = 0xDEAD_0004;
+
+/// Capture the device interrupt's service routine + context (KeInitializeInterrupt).
+pub fn set_isr(routine: u32, context: u32) {
+    *CONNECTED_ISR.lock().unwrap() = Some((routine, context));
+}
+
+/// Deliver the connected ISR (called once per vblank): save the current context
+/// and set the CPU up to call `ServiceRoutine(Interrupt, ServiceContext)`. No-op
+/// if no ISR is connected or one is already running. Returns true if delivered.
+pub fn deliver_isr(cpu: &mut Cpu, mem: &mut Mem) -> bool {
+    let (routine, context) = match *CONNECTED_ISR.lock().unwrap() {
+        Some(x) => x,
+        None => return false,
+    };
+    // Don't deliver a fresh ISR if a delivered call is still running.
+    {
+        let g = SCHED.lock().unwrap();
+        if g.as_ref().map_or(true, |s| !s.isr_saved.is_empty()) {
+            return false;
+        }
+    }
+    // ServiceRoutine(Interrupt, ServiceContext).
+    deliver_call(cpu, mem, routine, &[0, context])
+}
+
+/// Set the CPU up to call a guest routine `routine(args...)` (stdcall) on top of
+/// the current context, saving the interrupted context so [`isr_return`] can
+/// restore it when the routine returns to the sentinel. Used for ISR + DPC
+/// delivery. Returns false if `routine` is null or nesting is too deep.
+pub fn deliver_call(cpu: &mut Cpu, mem: &mut Mem, routine: u32, args: &[u32]) -> bool {
+    if routine == 0 {
+        return false;
+    }
+    let mut g = SCHED.lock().unwrap();
+    let s = match g.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+    if s.isr_saved.len() > 8 {
+        return false; // bound nesting
+    }
+    s.isr_saved.push(capture(cpu));
+    let mut sp = cpu.reg32(ESP);
+    for &a in args.iter().rev() {
+        sp = sp.wrapping_sub(4);
+        mem.ram_write32(sp, a);
+    }
+    sp = sp.wrapping_sub(4);
+    mem.ram_write32(sp, ISR_RETURN_SENTINEL);
+    cpu.set_reg32(ESP, sp);
+    cpu.eip = routine;
+    true
+}
+
+/// Restore the context interrupted by a delivered ISR (EIP hit the sentinel).
+pub fn isr_return(cpu: &mut Cpu) {
+    let mut g = SCHED.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        if let Some(ctx) = s.isr_saved.pop() {
+            apply(cpu, &ctx);
+        }
+    }
+}
 
 fn capture(cpu: &Cpu) -> ThreadCtx {
     ThreadCtx {
@@ -325,6 +399,7 @@ pub fn create_thread(cpu: &mut Cpu, mem: &mut Mem, entry: u32, ctx1: u32, ctx2: 
         current: 0,
         started: false,
         signaled: std::collections::HashSet::new(),
+        isr_saved: Vec::new(),
     });
     if !s.started {
         s.threads.push(Thread {
@@ -536,6 +611,7 @@ fn read_obj_path(mem: &Mem, oa: u32) -> String {
 
 const ORD_DBG_PRINT: u32 = 8;
 const ORD_KE_INITIALIZE_DPC: u32 = 107;
+const ORD_KE_INSERT_QUEUE_DPC: u32 = 119;
 const ORD_MM_ALLOCATE_CONTIGUOUS_MEMORY: u32 = 165;
 const ORD_MM_ALLOCATE_CONTIGUOUS_MEMORY_EX: u32 = 166;
 const ORD_MM_ALLOCATE_SYSTEM_MEMORY: u32 = 167;
@@ -569,6 +645,10 @@ const ORD_NT_CREATE_FILE: u32 = 190;
 const ORD_NT_READ_FILE: u32 = 219;
 const ORD_NT_CLOSE: u32 = 187;
 const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
+const ORD_KE_INITIALIZE_INTERRUPT: u32 = 109;
+const ORD_KE_CONNECT_INTERRUPT: u32 = 98;
+const ORD_MM_CLAIM_GPU_INSTANCE_MEMORY: u32 = 168;
+const ORD_HAL_READ_WRITE_PCI_SPACE: u32 = 46;
 
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
@@ -582,10 +662,8 @@ const SAFE_NOOP: &[u32] = &[
     24,  // ExQueryNonVolatileSetting (returns success; value left zero)
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
-    109, // KeInitializeInterrupt
-    98,  // KeConnectInterrupt
     100, // KeDisconnectInterrupt
-    // (events / waits / threads are handled by the scheduler, not here)
+    // (interrupt connect/init, events, waits, threads handled explicitly below)
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.
@@ -710,9 +788,31 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
 
         // ---- Synchronization (single-threaded HLE: all no-ops) ----
         ORD_KE_INITIALIZE_DPC => {
-            // VOID KeInitializeDpc(PKDPC, PKDEFERRED_ROUTINE, PVOID Context)
+            // VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE, PVOID Context).
+            // Store routine/context in the KDPC (DeferredRoutine @ +0x0C,
+            // DeferredContext @ +0x10) so KeInsertQueueDpc can run it.
+            let dpc = arg(cpu, mem, 0);
+            let routine = arg(cpu, mem, 1);
+            let context = arg(cpu, mem, 2);
+            if dpc != 0 {
+                mem.ram_write32(dpc.wrapping_add(0x0C), routine);
+                mem.ram_write32(dpc.wrapping_add(0x10), context);
+            }
             stdcall_return(cpu, mem, 0, 12);
             Dispatch::Handled("KeInitializeDpc")
+        }
+        ORD_KE_INSERT_QUEUE_DPC => {
+            // BOOLEAN KeInsertQueueDpc(Dpc, SystemArgument1, SystemArgument2).
+            // Run the DPC routine now (DeferredRoutine(Dpc, Context, Arg1, Arg2)):
+            // return TRUE to the caller, then deliver the deferred call.
+            let dpc = arg(cpu, mem, 0);
+            let a1 = arg(cpu, mem, 1);
+            let a2 = arg(cpu, mem, 2);
+            let routine = mem.ram_read32(dpc.wrapping_add(0x0C));
+            let context = mem.ram_read32(dpc.wrapping_add(0x10));
+            stdcall_return(cpu, mem, 1, 12);
+            deliver_call(cpu, mem, routine, &[dpc, context, a1, a2]);
+            Dispatch::Handled("KeInsertQueueDpc")
         }
         ORD_RTL_INITIALIZE_CRITICAL_SECTION => {
             // VOID RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION)
@@ -828,6 +928,67 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+
+        // ---- PCI config space ----
+        ORD_HAL_READ_WRITE_PCI_SPACE => {
+            // HalReadWritePCISpace(Bus, Slot, RegisterNumber, Buffer, Length,
+            //   WritePCISpace). On read, return the NV2A's config (so the GPU is
+            //   mapped at its fixed addresses); writes are accepted (ignored).
+            let reg = arg(cpu, mem, 2);
+            let buffer = arg(cpu, mem, 3);
+            let length = arg(cpu, mem, 4);
+            let write = arg(cpu, mem, 5);
+            if write == 0 && buffer != 0 {
+                let val: u32 = match reg & !3 {
+                    0x00 => 0x02A0_10DE, // vendor 10DE (NVIDIA) / device 02A0 (NV2A)
+                    0x10 => 0xFD00_0000, // BAR0: NV2A register block
+                    0x14 => 0xF000_0000, // BAR1: framebuffer / AGP aperture
+                    _ => 0,
+                };
+                for i in 0..length.min(4) {
+                    mem.ram_write8(buffer.wrapping_add(i), (val >> (i * 8)) & 0xFF);
+                }
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 24);
+            Dispatch::Handled("HalReadWritePCISpace")
+        }
+
+        // ---- GPU instance memory ----
+        ORD_MM_CLAIM_GPU_INSTANCE_MEMORY => {
+            // PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes,
+            //   SIZE_T *NumberOfPaddingBytes). Return the top of contiguous RAM
+            //   (the GPU instance memory sits at the end); no padding.
+            let pad_out = arg(cpu, mem, 1);
+            if pad_out != 0 {
+                mem.ram_write32(pad_out, 0);
+            }
+            let top = crate::regions::RAM_SIZE as u32; // 0x0400_0000 (64 MB)
+            stdcall_return(cpu, mem, top, 8);
+            Dispatch::Handled("MmClaimGpuInstanceMemory")
+        }
+
+        // ---- Interrupts ----
+        ORD_KE_INITIALIZE_INTERRUPT => {
+            // KeInitializeInterrupt(Interrupt, ServiceRoutine, ServiceContext,
+            //   Vector, Irql, Mode, ShareVector) — capture the service routine so
+            //   we can deliver it on vblank; also fill the KINTERRUPT struct.
+            let kint = arg(cpu, mem, 0);
+            let routine = arg(cpu, mem, 1);
+            let context = arg(cpu, mem, 2);
+            if kint != 0 {
+                mem.ram_write32(kint, routine);
+                mem.ram_write32(kint.wrapping_add(4), context);
+            }
+            set_isr(routine, context);
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 28);
+            Dispatch::Handled("KeInitializeInterrupt")
+        }
+        ORD_KE_CONNECT_INTERRUPT => {
+            // KeConnectInterrupt(Interrupt) — the ISR was captured at init; just
+            // report success (TRUE). Delivery happens each vblank.
+            stdcall_return(cpu, mem, 1, 4);
+            Dispatch::Handled("KeConnectInterrupt")
         }
 
         // ---- Interrupts (stub: echo the bus level as the vector) ----

@@ -254,6 +254,9 @@ impl Xbox {
             // Signal one vblank per frame so the game's interrupt-service loop
             // advances its frame/timer bookkeeping.
             self.nv2a.raise_vblank();
+            // Deliver the connected device ISR (vblank) — runs the game's
+            // interrupt handler, which acks the GPU and signals its vblank event.
+            crate::hle::deliver_isr(&mut self.cpu, &mut self.mem);
             if self.cpu.fault.is_none() {
                 let mut quantum = 0u32;
                 let mut steps = 0u32;
@@ -261,6 +264,11 @@ impl Xbox {
                     steps += 1;
                     let eip = self.cpu.eip;
 
+                    // A delivered ISR returned: restore the interrupted context.
+                    if eip == crate::hle::ISR_RETURN_SENTINEL {
+                        crate::hle::isr_return(&mut self.cpu);
+                        continue;
+                    }
                     // A thread returned from its entry routine: terminate it and
                     // schedule another.
                     if eip == crate::hle::THREAD_EXIT_SENTINEL {
@@ -273,7 +281,10 @@ impl Xbox {
                         let idx = ((eip - Self::HLE_BASE) / 4) as usize;
                         let ord = self.kernel_ordinals.get(idx).copied().unwrap_or(0);
                         match crate::hle::dispatch(&mut self.cpu, &mut self.mem, ord) {
-                            crate::hle::Dispatch::Handled(_) => continue,
+                            crate::hle::Dispatch::Handled(_) => {
+                                trace_kernel(ord);
+                                continue;
+                            }
                             crate::hle::Dispatch::Unhandled(_) => {
                                 self.last_kernel_ordinal = Some(ord);
                                 break;
@@ -430,6 +441,25 @@ impl Xbox {
             format!("IMPORTS {}", self.kernel_ordinals.len()),
             status,
         ]
+    }
+}
+
+/// Debug aid: count kernel-import calls per ordinal (gated on `XBOX_TRACE_KERNEL`)
+/// and surface the "hot" ones a boot loop hammers — what the game is waiting on.
+fn trace_kernel(ord: u32) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static COUNTS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+    if std::env::var_os("XBOX_TRACE_KERNEL").is_none() {
+        return;
+    }
+    let mut g = COUNTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let c = m.entry(ord).or_insert(0);
+    *c += 1;
+    if *c == 1 {
+        let name = crate::hle_table::lookup(ord).map(|(n, _)| n).unwrap_or("?");
+        eprintln!("[krn] ord {ord} {name}");
     }
 }
 
