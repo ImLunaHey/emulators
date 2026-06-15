@@ -67,6 +67,44 @@ const PAGE: u32 = 0x1000;
 /// [`HEAP_BASE`] and only ever increases. `AtomicU32` so no `Mutex` is needed.
 static NEXT_HEAP: AtomicU32 = AtomicU32::new(HEAP_BASE);
 
+/// Dedicated arena for kernel DATA-export backing variables (KeTickCount,
+/// XboxKrnlVersion, LaunchDataPage, …). These MUST NOT come from the
+/// game-visible contiguous heap (`NEXT_HEAP`): that bump allocator is
+/// deterministic, so the addresses it hands the *game* are byte-identical on a
+/// warm reboot — and a kernel scratch cell placed there collides with a game
+/// allocation. Concretely, Halo's launcher keeps its launch-data pointer in a
+/// heap cell that lands at 0x0200_3000; if the kernel writes the persisted page
+/// pointer into that same cell (which happened when `data_export_addr` shared
+/// the heap), the warm-booted launcher sees its launch data "already present"
+/// and reboots forever. This arena sits in the 1 MB gap just below the heap,
+/// above any loaded XBE image (which ends well under 2 MB), so it can never
+/// alias either the game's image or its allocations.
+const KDATA_BASE: u32 = 0x01F0_0000;
+const KDATA_END: u32 = HEAP_BASE; // 0x0200_0000
+static NEXT_KDATA: AtomicU32 = AtomicU32::new(KDATA_BASE);
+
+/// Bump-allocate a kernel DATA-export backing block from the reserved kernel
+/// arena (see [`KDATA_BASE`]). Falls back to the game heap only if exhausted.
+fn kdata_alloc(size: u32, align: u32) -> u32 {
+    let align = align.max(16);
+    let size = align_up(size.max(1), 16);
+    loop {
+        let cur = NEXT_KDATA.load(Ordering::Relaxed);
+        let base = align_up(cur, align);
+        match base.checked_add(size) {
+            Some(end) if end <= KDATA_END => {
+                if NEXT_KDATA
+                    .compare_exchange(cur, end, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return base;
+                }
+            }
+            _ => return heap_alloc(size, align), // arena full: degrade gracefully
+        }
+    }
+}
+
 /// Round `v` up to a multiple of `align` (a power of two).
 #[inline]
 fn align_up(v: u32, align: u32) -> u32 {
@@ -193,11 +231,44 @@ fn hdd_path_is_file(p: &str) -> bool {
 /// disc bytes; reads return zero-filled success).
 const HDD_PSEUDO_OFFSET: usize = usize::MAX;
 
+/// True if an HDD path is dashboard-managed title METADATA in the title's
+/// `UDATA\<titleid>\` directory (`TitleMeta.xbx` — title display name/settings,
+/// `TitleImage.xbx`/`SaveImage.xbx` — the title's thumbnail images,
+/// `SaveMeta.xbx`) rather than per-save gameplay payload. The dashboard creates
+/// this UDATA metadata when a title is first registered, so on a real console it
+/// exists before the game ever runs. We boot the XBE directly (no dashboard), so
+/// it was never created; reporting it absent makes a launcher that treats
+/// "title metadata missing" as "first-time setup, reboot to regenerate it" loop
+/// forever, since our HDD doesn't persist the write — this is exactly the Halo
+/// CE / Halo 2 reboot loop. Present this metadata as existing-but-empty so the
+/// launcher proceeds to the game.
+///
+/// Per-save gameplay files live in save-slot subdirectories (not `UDATA\<id>\`
+/// directly) and are intentionally NOT matched here, so a fresh console still
+/// has no actual saves.
+fn is_title_metadata_file(p: &str) -> bool {
+    let s = p.replace('\\', "/").to_ascii_lowercase();
+    // Must sit directly in the user-data area for a title.
+    if !s.contains("/udata/") {
+        return false;
+    }
+    let last = s.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    matches!(
+        last,
+        "titlemeta.xbx" | "titleimage.xbx" | "saveimage.xbx" | "savemeta.xbx"
+    )
+}
+
 /// Open a file by Xbox path. Returns `(status, handle, information)`.
 fn open_file(path: &str) -> (u32, u32, u32) {
+    let r = open_file_inner(path);
     if std::env::var_os("XBOX_TRACE_FS").is_some() {
-        eprintln!("[fs] open {path:?}");
+        eprintln!("[fs] open {path:?} -> status={:08X}", r.0);
     }
+    r
+}
+
+fn open_file_inner(path: &str) -> (u32, u32, u32) {
     // Hard-disk paths: present an empty-but-present HDD so the launcher's
     // partition/directory opens succeed and it doesn't relaunch (reboot to
     // dashboard). But a fresh console has NO save data, so opening a concrete
@@ -207,6 +278,26 @@ fn open_file(path: &str) -> (u32, u32, u32) {
     // final component has a file extension as a non-existent file.
     if is_hdd_path(path) {
         if hdd_path_is_file(path) {
+            // A concrete file on the (otherwise empty) HDD. Two cases:
+            //
+            //  * Title METADATA under UDATA\<titleid>\ (TitleMeta.xbx, TitleImage
+            //    .xbx, SaveMeta.xbx) is written by the DASHBOARD when a title is
+            //    first registered — on a real console it already exists before the
+            //    game ever runs. We boot the XBE directly (no dashboard), so these
+            //    never got created; reporting them absent makes a launcher that
+            //    treats "metadata missing" as "first-time setup" reboot to
+            //    regenerate it — forever, since our HDD doesn't persist the write.
+            //    (This is exactly Halo CE/2's reboot loop.) Present them as
+            //    existing-but-empty so the launcher proceeds to the game.
+            //
+            //  * Actual SAVE data (SaveImage.xbx and per-slot save files) must stay
+            //    absent: a fresh console has no saves, and returning a zero-filled
+            //    "save" would make the game parse junk as a valid savegame.
+            if is_title_metadata_file(path) {
+                let mut files = FILES.lock().unwrap();
+                files.push(Some(FileHandle { offset: HDD_PSEUDO_OFFSET, size: 0x4000, pos: 0 }));
+                return (0, FILE_HANDLE_BASE + (files.len() as u32 - 1), FILE_OPENED);
+            }
             return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
         }
         let mut files = FILES.lock().unwrap();
@@ -332,7 +423,7 @@ pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
     if let Some(&a) = map.get(&ordinal) {
         return a;
     }
-    let addr = heap_alloc(64, 16); // room for scalars or a small struct
+    let addr = kdata_alloc(64, 16); // room for scalars or a small struct
     map.insert(ordinal, addr);
     // Sensible initial contents.
     match ordinal {
@@ -376,6 +467,7 @@ pub fn tick_clock(mem: &mut Mem) {
 /// are process-globals) doesn't leak across loads.
 pub fn reset() {
     NEXT_HEAP.store(HEAP_BASE, Ordering::SeqCst);
+    NEXT_KDATA.store(KDATA_BASE, Ordering::SeqCst);
     *SCHED.lock().unwrap() = None;
     *CONNECTED_ISR.lock().unwrap() = None;
     *KDATA.lock().unwrap() = None;
@@ -459,6 +551,9 @@ pub fn restore_persisted(mem: &mut Mem, snap: Vec<(u32, Vec<u8>)>) {
 /// relaunched image detects it was launched (rather than cold-booted).
 pub fn set_launch_data_slot(mem: &mut Mem, page: u32) {
     let slot = data_export_addr(ORD_LAUNCH_DATA_PAGE, mem);
+    if std::env::var_os("XBOX_TRACE_NV").is_some() {
+        eprintln!("[set_launch_data_slot] slot(ord164 backing)={slot:08X} page={page:08X}");
+    }
     mem.ram_write32(slot, page);
     *LAUNCH_DATA.lock().unwrap() = Some(page);
 }
@@ -1012,6 +1107,9 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             let base = arg(cpu, mem, 0);
             let size = arg(cpu, mem, 1);
             let persist = arg(cpu, mem, 2);
+            if std::env::var_os("XBOX_TRACE_NV").is_some() {
+                eprintln!("[persist] base={base:08X} size={size:08X} persist={persist}");
+            }
             if persist != 0 {
                 let mut g = PERSISTED.lock().unwrap();
                 g.get_or_insert_with(Vec::new).push((base, size));
@@ -1972,13 +2070,33 @@ mod tests {
 
     #[test]
     fn hdd_concrete_file_open_fails() {
-        // A save file on a fresh HDD must report NOT_FOUND, not zero-filled success.
+        // An actual save-game payload file on a fresh HDD must report NOT_FOUND,
+        // not zero-filled success (a fresh console has no saves; a zero "save"
+        // would be parsed as junk). This is NOT title metadata — it lives in a
+        // save-slot subdirectory and has a generic name.
         let (status, _, _) =
-            open_file("\\Device\\Harddisk0\\partition1\\UDATA\\4d530064\\TitleMeta.xbx");
+            open_file("\\Device\\Harddisk0\\partition1\\UDATA\\4d530064\\00000001\\savegame.dat");
         assert_eq!(status, STATUS_OBJECT_NAME_NOT_FOUND);
         // A directory/partition path still succeeds (present, empty).
         let (status2, _, _) = open_file("\\Device\\Harddisk0\\partition1\\UDATA");
         assert_eq!(status2, STATUS_SUCCESS);
+        FILES.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn hdd_title_metadata_open_succeeds() {
+        // Dashboard-managed title metadata under UDATA\<titleid>\ exists before a
+        // game ever runs on a real console. Reporting it absent makes Halo CE /
+        // Halo 2 reboot-loop (treating "metadata missing" as first-time setup),
+        // so we present it as existing-but-empty. Regression guard for that fix.
+        for f in ["TitleMeta.xbx", "TitleImage.xbx", "SaveImage.xbx", "SaveMeta.xbx"] {
+            let path = format!("\\Device\\Harddisk0\\partition1\\UDATA\\4d530004\\{f}");
+            let (status, handle, info) = open_file(&path);
+            assert_eq!(status, STATUS_SUCCESS, "{f} must open (present-but-empty)");
+            assert_eq!(info, FILE_OPENED);
+            // Reads from it return zero-filled success (an empty metadata file).
+            assert!(handle >= FILE_HANDLE_BASE);
+        }
         FILES.lock().unwrap().clear();
     }
 

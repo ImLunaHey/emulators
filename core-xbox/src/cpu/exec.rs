@@ -30,6 +30,71 @@
 use super::state::*;
 use crate::bus::Bus;
 
+// ---------------------------------------------------------------------------
+// Branch-trace ring buffer (debug aid, gated on `XBOX_TRACE_BRANCH`).
+//
+// Records a window of recently-decided conditional branches (EIP, condition,
+// taken/not-taken, EFLAGS, and the integer register file at the decision) so a
+// reboot-loop diagnosis can dump the deciding Jcc that led to a reboot. See
+// `xbox.rs`'s reboot path, which calls `dump_branch_trace()`.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy)]
+pub struct BranchRec {
+    pub eip: u32,
+    pub cond: u8,
+    pub taken: bool,
+    pub eflags: u32,
+    pub regs: [u32; 8],
+}
+
+static BRANCH_TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BRANCH_TRACE_INIT: std::sync::Once = std::sync::Once::new();
+static BRANCH_RING: std::sync::Mutex<Vec<BranchRec>> = std::sync::Mutex::new(Vec::new());
+const BRANCH_RING_CAP: usize = 128;
+
+#[inline]
+fn branch_trace_on() -> bool {
+    BRANCH_TRACE_INIT.call_once(|| {
+        if std::env::var_os("XBOX_TRACE_BRANCH").is_some() {
+            BRANCH_TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    BRANCH_TRACE_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_branch(rec: BranchRec) {
+    let mut g = BRANCH_RING.lock().unwrap();
+    if g.len() >= BRANCH_RING_CAP {
+        g.remove(0);
+    }
+    g.push(rec);
+}
+
+/// Dump (and clear) the recorded branch ring buffer — called at the reboot seam.
+pub fn dump_branch_trace() {
+    let mut g = BRANCH_RING.lock().unwrap();
+    eprintln!("[branch] --- last {} conditional branches ---", g.len());
+    for r in g.iter() {
+        let cc_name = COND_NAME[(r.cond & 0xF) as usize];
+        eprintln!(
+            "[branch] eip={:08X} j{:<3} {} ZF={} CF={} SF={} OF={} | eax={:08X} ecx={:08X} edx={:08X} ebx={:08X} esi={:08X} edi={:08X} ebp={:08X} esp={:08X}",
+            r.eip,
+            cc_name,
+            if r.taken { "TAKEN" } else { "not  " },
+            (r.eflags >> 6) & 1,
+            r.eflags & 1,
+            (r.eflags >> 7) & 1,
+            (r.eflags >> 11) & 1,
+            r.regs[0], r.regs[1], r.regs[2], r.regs[3], r.regs[6], r.regs[7], r.regs[5], r.regs[4],
+        );
+    }
+    g.clear();
+}
+
+const COND_NAME: [&str; 16] = [
+    "o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g",
+];
+
 /// Legacy instruction prefixes gathered before the opcode.
 #[derive(Default, Clone, Copy)]
 struct Prefixes {
@@ -1025,7 +1090,17 @@ impl Cpu {
             }
             0x70..=0x7F => {
                 let d = self.fetch_i8(bus);
-                if self.cc(op - 0x70) {
+                let taken = self.cc(op - 0x70);
+                if branch_trace_on() {
+                    record_branch(BranchRec {
+                        eip: start_eip,
+                        cond: op - 0x70,
+                        taken,
+                        eflags: self.eflags,
+                        regs: self.regs,
+                    });
+                }
+                if taken {
                     self.jump_rel(d);
                 }
             }
@@ -1634,7 +1709,17 @@ impl Cpu {
             0x80..=0x8F => {
                 let d = self.fetch_imm(bus, osize);
                 let d = if osize == 2 { d as u16 as i16 as i32 as u32 } else { d };
-                if self.cc(op2 - 0x80) {
+                let taken = self.cc(op2 - 0x80);
+                if branch_trace_on() {
+                    record_branch(BranchRec {
+                        eip: start_eip,
+                        cond: op2 - 0x80,
+                        taken,
+                        eflags: self.eflags,
+                        regs: self.regs,
+                    });
+                }
+                if taken {
                     self.jump_rel(d);
                 }
             }

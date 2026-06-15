@@ -336,8 +336,20 @@ impl Xbox {
                     if (Self::HLE_BASE..Self::HLE_BASE + Self::HLE_SPAN).contains(&eip) {
                         let idx = ((eip - Self::HLE_BASE) / 4) as usize;
                         let ord = self.kernel_ordinals.get(idx).copied().unwrap_or(0);
+                        let trace_call = std::env::var_os("XBOX_TRACE_CALL").is_some();
+                        let caller = if trace_call {
+                            self.mem.ram_read32(self.cpu.reg32(crate::cpu::state::ESP))
+                        } else {
+                            0
+                        };
                         match crate::hle::dispatch(&mut self.cpu, &mut self.mem, ord) {
                             crate::hle::Dispatch::Handled(_) => {
+                                if trace_call {
+                                    let eax = self.cpu.reg32(crate::cpu::state::EAX);
+                                    let name = crate::hle_table::lookup(ord)
+                                        .map(|(n, _)| n).unwrap_or("?");
+                                    eprintln!("[call] ord {ord} {name} caller={caller:08X} -> eax={eax:08X}");
+                                }
                                 trace_kernel(ord);
                                 continue;
                             }
@@ -370,6 +382,12 @@ impl Xbox {
             // default.xbe with the persisted launch page intact so its second
             // boot proceeds instead of showing the boot screen.
             if crate::hle::take_reboot() && self.reboots < Self::MAX_REBOOTS {
+                // On the warm boot(s), dump the conditional-branch trace that led
+                // to this reboot decision (gated on XBOX_TRACE_BRANCH).
+                if std::env::var_os("XBOX_TRACE_BRANCH").is_some() {
+                    eprintln!("[branch] === reboot #{} decision ===", self.reboots + 1);
+                    crate::cpu::exec::dump_branch_trace();
+                }
                 self.do_reboot();
             }
             // If the GPU has produced a color surface, scan it out to the screen;
