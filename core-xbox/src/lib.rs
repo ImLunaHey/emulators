@@ -64,6 +64,7 @@ pub mod hle_table;
 
 // --- NV2A GPU (pushbuffer + PGRAPH + scanout).
 pub mod nv2a;
+pub mod nv2a_render;
 
 // --- Top-level orchestrator (the god-struct + Bus impl).
 pub mod xbox;
