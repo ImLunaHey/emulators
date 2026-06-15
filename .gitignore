@@ -18,30 +18,20 @@ public/*.sav
 public/*.bin
 public/*.cue
 
-# rust cores (build artifacts; wasm-pack output built in CI + locally, not committed)
-core/target
-core/pkg
-core-api/target
-core-nds/target
-core-nds/pkg
-core-ps1/target
-core-ps1/pkg
-core-nes/target
-core-nes/pkg
-core-gbc/target
-core-gbc/pkg
-core-sms/target
-core-sms/pkg
-core-gc/target
-core-gc/pkg
-core-xbox/target
-core-xbox/pkg
+# rust build artifacts (every crate's target/ + wasm-pack pkg/ output, anywhere;
+# built in CI + locally, never committed). Blanket globs so new cores don't each
+# need their own entry.
+**/target/
+**/pkg/
 
 # rust mobile FFI crate (native libs / xcframework build output)
-core-ffi/target
 core-ffi/build
 core-ffi/Cargo.lock
 **/*.rs.bk
+
+# swift package / native app build output
+.build/
+apps/**/.build/
 
 # wrangler files
 .wrangler
