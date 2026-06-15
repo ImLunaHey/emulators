@@ -102,6 +102,14 @@ fn main() {
         xb.run_frame();
     }
     xbox_core::xbox::dump_eip_hist(); // top spin EIPs when XBOX_TRACE_EIP is set
+    if let Ok(a) = std::env::var("XBOX_DUMP_ADDR") {
+        let base = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
+        print!("  code @ {base:08X}:");
+        for i in 0..32u32 {
+            print!(" {:02X}", xb.mem.ram_read8(base + i));
+        }
+        println!();
+    }
     println!("--- boot diagnostic ---");
     for line in xb.boot_diagnostic() {
         println!("  {line}");

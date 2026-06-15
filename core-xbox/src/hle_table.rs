@@ -408,6 +408,18 @@ pub fn lookup(ordinal: u32) -> Option<(&'static str, u16)> {
         .map(|i| (KERNEL_EXPORTS[i].1, KERNEL_EXPORTS[i].2))
 }
 
+/// Ordinals that are DATA exports (kernel variables, not callable functions).
+/// Their import thunks must point at real backing memory, not call stubs.
+pub const DATA_EXPORTS: &[u16] = &[
+    16, 22, 30, 31, 40, 41, 42, 64, 70, 71, 88, 89, 102, 120, 154, 156, 157, 162,
+    164, 240, 245, 249, 259, 321, 322, 323, 324, 325, 326, 353, 354, 355, 356, 357,
+];
+
+/// Whether `ordinal` is a DATA export (a kernel variable, read as memory).
+pub fn is_data_export(ordinal: u32) -> bool {
+    DATA_EXPORTS.contains(&(ordinal as u16))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -141,12 +141,16 @@ impl Xbox {
             Some(i) => i,
             None => return false,
         };
-        // Fresh RAM, then map the image.
+        // Fresh RAM + HLE state (allocator/scheduler/files/kernel-data globals).
+        crate::hle::reset();
         self.mem = Mem::new();
         crate::xbe::load_into(&img, xbe, &mut self.mem.ram[..]);
 
-        // Patch the kernel-import thunk table: replace each `0x8000_0000|ordinal`
-        // entry with a unique HLE stub address so a CALL traps to our dispatch.
+        // Patch the kernel-import thunk table. Each entry is `0x8000_0000|ordinal`:
+        // - a FUNCTION export becomes a unique HLE call-stub address (a CALL there
+        //   traps to our dispatch);
+        // - a DATA export becomes the address of a real backing variable (the game
+        //   reads it as memory, e.g. KeTickCount).
         self.kernel_ordinals.clear();
         let mut addr = img.kernel_thunk;
         while addr != 0 {
@@ -155,13 +159,18 @@ impl Xbox {
                 break;
             }
             let ordinal = v & 0x7FFF_FFFF;
-            let idx = self.kernel_ordinals.len() as u32;
-            self.kernel_ordinals.push(ordinal);
-            self.mem.ram_write32(addr, Self::HLE_BASE + idx * 4);
-            addr = addr.wrapping_add(4);
-            if idx >= Self::HLE_SPAN / 4 - 1 {
-                break;
+            if crate::hle_table::is_data_export(ordinal) {
+                let data_addr = crate::hle::data_export_addr(ordinal, &mut self.mem);
+                self.mem.ram_write32(addr, data_addr);
+            } else {
+                let idx = self.kernel_ordinals.len() as u32;
+                self.kernel_ordinals.push(ordinal);
+                self.mem.ram_write32(addr, Self::HLE_BASE + idx * 4);
+                if idx >= Self::HLE_SPAN / 4 - 1 {
+                    break;
+                }
             }
+            addr = addr.wrapping_add(4);
         }
 
         // CPU: flat 32-bit protected mode (PE set, segment bases 0), entry point,
@@ -254,6 +263,7 @@ impl Xbox {
             // Signal one vblank per frame so the game's interrupt-service loop
             // advances its frame/timer bookkeeping.
             self.nv2a.raise_vblank();
+            crate::hle::tick_clock(&mut self.mem); // advance KeTickCount
             // Deliver the connected device ISR (vblank) — runs the game's
             // interrupt handler, which acks the GPU and signals its vblank event.
             crate::hle::deliver_isr(&mut self.cpu, &mut self.mem);

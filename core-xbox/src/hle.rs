@@ -228,6 +228,73 @@ fn close_file(h: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel DATA exports (variables the game reads as memory) + the system clock.
+//
+// DATA exports (KeTickCount, object-type pointers, Xbox*Info, ...) are NOT
+// callable: the game reads them as memory through their import thunk. So their
+// thunk must point at a real backing variable in RAM, not a call stub. We back
+// each with a small block and tick KeTickCount every frame so timed waits
+// (e.g. "spin until KeTickCount advances N") complete.
+// ---------------------------------------------------------------------------
+
+static KDATA: Mutex<Option<std::collections::HashMap<u32, u32>>> = Mutex::new(None);
+const ORD_KE_TICK_COUNT: u32 = 156;
+const ORD_XBOX_KRNL_VERSION: u32 = 324;
+/// KeTickCount units (~ms) advanced per emulated frame (~60 Hz → ~16 ms).
+const KTICK_PER_FRAME: u32 = 16;
+
+/// Return (lazily allocating + initializing) the guest address of a DATA
+/// export's backing variable. The loader patches the import thunk to this.
+pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
+    let mut g = KDATA.lock().unwrap();
+    let map = g.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(&a) = map.get(&ordinal) {
+        return a;
+    }
+    let addr = heap_alloc(64, 16); // room for scalars or a small struct
+    map.insert(ordinal, addr);
+    // Sensible initial contents.
+    match ordinal {
+        ORD_XBOX_KRNL_VERSION => {
+            // XBOX_KRNL_VERSION { Major, Minor, Build, Qfe } — kernel 1.0.5838.1.
+            mem.ram_write16(addr, 1);
+            mem.ram_write16(addr.wrapping_add(2), 0);
+            mem.ram_write16(addr.wrapping_add(4), 5838);
+            mem.ram_write16(addr.wrapping_add(6), 1);
+        }
+        _ => {
+            for i in 0..16 {
+                mem.ram_write32(addr.wrapping_add(i * 4), 0);
+            }
+        }
+    }
+    addr
+}
+
+/// Advance the system tick count (call once per emulated frame).
+pub fn tick_clock(mem: &mut Mem) {
+    let g = KDATA.lock().unwrap();
+    if let Some(map) = g.as_ref() {
+        if let Some(&addr) = map.get(&ORD_KE_TICK_COUNT) {
+            let v = mem.ram_read32(addr).wrapping_add(KTICK_PER_FRAME);
+            mem.ram_write32(addr, v);
+        }
+    }
+}
+
+/// Reset all HLE global state (allocator, scheduler, ISR, filesystem, kernel
+/// data). Called when a new game boots so stale state from a prior run (these
+/// are process-globals) doesn't leak across loads.
+pub fn reset() {
+    NEXT_HEAP.store(HEAP_BASE, Ordering::SeqCst);
+    *SCHED.lock().unwrap() = None;
+    *CONNECTED_ISR.lock().unwrap() = None;
+    *KDATA.lock().unwrap() = None;
+    FILES.lock().unwrap().clear();
+    DISC.lock().unwrap().clear();
+}
+
+// ---------------------------------------------------------------------------
 // Cooperative thread scheduler.
 //
 // The Xbox is multi-threaded (a main thread plus asset-loader / audio threads).
