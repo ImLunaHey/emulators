@@ -655,6 +655,8 @@ const ORD_KE_INITIALIZE_INTERRUPT: u32 = 109;
 const ORD_KE_CONNECT_INTERRUPT: u32 = 98;
 const ORD_MM_CLAIM_GPU_INSTANCE_MEMORY: u32 = 168;
 const ORD_HAL_READ_WRITE_PCI_SPACE: u32 = 46;
+const ORD_AV_SEND_TV_ENCODER_OPTION: u32 = 2;
+const ORD_AV_SET_DISPLAY_MODE: u32 = 3;
 
 /// Fake handle / id handed back for created threads (we don't model handles yet).
 const FAKE_THREAD_HANDLE: u32 = 0x0000_BEEF;
@@ -669,7 +671,9 @@ const SAFE_NOOP: &[u32] = &[
     301, // RtlNtStatusToDosError (returns 0 = ERROR_SUCCESS)
     149, // KeSetTimer
     100, // KeDisconnectInterrupt
-    // (interrupt connect/init, events, waits, threads handled explicitly below)
+    1,   // AvGetSavedDataAddress (return 0 = none)
+    4,   // AvSetSavedDataAddress
+    // (interrupt connect/init, events, waits, threads, Av display handled below)
 ];
 /// Return address pushed under a new thread's entry: if the thread ever returns,
 /// EIP lands here (recognizable, and out of mapped code) so it stops cleanly.
@@ -934,6 +938,25 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+
+        // ---- Display / TV encoder (Av*) ----
+        ORD_AV_SEND_TV_ENCODER_OPTION => {
+            // AvSendTVEncoderOption(RegisterBase, Option, Param, ULONG *Result).
+            // No encoder modeled; report success and a zero result.
+            let result = arg(cpu, mem, 3);
+            if result != 0 {
+                mem.ram_write32(result, 0);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 16);
+            Dispatch::Handled("AvSendTVEncoderOption")
+        }
+        ORD_AV_SET_DISPLAY_MODE => {
+            // AvSetDisplayMode(RegisterBase, Step, Mode, Format, Pitch, FrameBuffer).
+            // The display mode is a no-op for us — the game renders into a PGRAPH
+            // surface we already scan out. Report success.
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 24);
+            Dispatch::Handled("AvSetDisplayMode")
         }
 
         // ---- PCI config space ----

@@ -18,15 +18,37 @@ mod off {
     // PMC (master control) — the top-level interrupt aggregator.
     pub const PMC_INTR_0: u32 = 0x00_0100;
     pub const PMC_INTR_EN_0: u32 = 0x00_0140;
-    // PFIFO.
+    // PFIFO (base 0x2000; register offsets below are PFIFO-base + reg).
     pub const PFIFO_INTR_0: u32 = 0x00_2100;
     pub const PFIFO_INTR_EN_0: u32 = 0x00_2140;
-    // PFIFO CACHE1 DMA engine state (games poll these to see the pushbuffer
-    // drain / the FIFO go idle).
-    pub const PFIFO_CACHE1_STATUS: u32 = 0x00_3214;
-    pub const PFIFO_CACHE1_DMA_PUSH: u32 = 0x00_3220;
+    /// PFIFO_CACHES (0x2000+0x080): master enable for the CACHE0/CACHE1 caches.
+    pub const PFIFO_CACHES: u32 = 0x00_2080;
+    /// RAMHT / RAMFC / RAMRO (RAMIN table base configuration).
+    pub const PFIFO_RAMHT: u32 = 0x00_2210;
+    pub const PFIFO_RAMFC: u32 = 0x00_2214;
+    pub const PFIFO_RAMRO: u32 = 0x00_2218;
+    /// RUNOUT ring status (0x2000+0x400): LOW_MARK=empty, RANOUT=error.
+    pub const PFIFO_RUNOUT_STATUS: u32 = 0x00_2400;
+    /// Per-channel push enable / mode select (0x2000+0x500/0x504/0x508).
+    pub const PFIFO_REASSIGN: u32 = 0x00_2500; // a.k.a. caches-reassign toggle
+    pub const PFIFO_MODE: u32 = 0x00_2504;
+    pub const PFIFO_DMA: u32 = 0x00_2508;
+    // PFIFO CACHE1 (the active DMA channel). Offsets are PFIFO-base + 0x1xxx.
+    pub const PFIFO_CACHE1_PUSH0: u32 = 0x00_3200; // pusher access enable
+    pub const PFIFO_CACHE1_PUSH1: u32 = 0x00_3204; // CHID + MODE(PIO/DMA)
+    pub const PFIFO_CACHE1_PUT: u32 = 0x00_3210; // method-cache write ptr
+    pub const PFIFO_CACHE1_STATUS: u32 = 0x00_3214; // LOW_MARK/HIGH_MARK
+    pub const PFIFO_CACHE1_DMA_PUSH: u32 = 0x00_3220; // ACCESS/STATE/STATUS
+    pub const PFIFO_CACHE1_DMA_FETCH: u32 = 0x00_3224;
+    pub const PFIFO_CACHE1_DMA_STATE: u32 = 0x00_3228;
+    pub const PFIFO_CACHE1_DMA_INSTANCE: u32 = 0x00_322C;
     pub const PFIFO_CACHE1_DMA_PUT: u32 = 0x00_3240;
     pub const PFIFO_CACHE1_DMA_GET: u32 = 0x00_3244;
+    pub const PFIFO_CACHE1_DMA_SUBROUTINE: u32 = 0x00_324C;
+    pub const PFIFO_CACHE1_PULL0: u32 = 0x00_3250; // puller access enable
+    pub const PFIFO_CACHE1_PULL1: u32 = 0x00_3254; // puller engine select
+    pub const PFIFO_CACHE1_GET: u32 = 0x00_3270; // method-cache read ptr
+    pub const PFIFO_CACHE1_ENGINE: u32 = 0x00_3280;
     // PTIMER.
     pub const PTIMER_INTR_0: u32 = 0x00_9100;
     pub const PTIMER_INTR_EN_0: u32 = 0x00_9140;
@@ -53,6 +75,22 @@ const PCRTC_INTR_VBLANK: u32 = 1 << 0;
 /// PTIMER alarm-pending bit.
 const PTIMER_INTR_ALARM: u32 = 1 << 0;
 
+// ---- PFIFO register bit layout (from nv2a_regs.h / envytools nv1-pfifo). ----
+/// CACHE1_STATUS: method cache empty (read ptr == write ptr).
+const CACHE1_STATUS_LOW_MARK: u32 = 1 << 4;
+/// CACHE1_STATUS: method cache full.
+const CACHE1_STATUS_HIGH_MARK: u32 = 1 << 8;
+/// RUNOUT_STATUS: runout ring empty (no pending error entries) — the idle state.
+const RUNOUT_STATUS_LOW_MARK: u32 = 1 << 4;
+/// CACHE1_DMA_PUSH: pusher access enabled.
+const DMA_PUSH_ACCESS: u32 = 1 << 0;
+/// CACHE1_DMA_PUSH: pusher actively running a method run (STATE/busy).
+const DMA_PUSH_STATE: u32 = 1 << 4;
+/// CACHE1_DMA_PUSH: pusher suspended on error (STATUS).
+const DMA_PUSH_STATUS: u32 = 1 << 12;
+/// CACHE1_PUSH0/PULL0: access-enable bit.
+const ACCESS: u32 = 1 << 0;
+
 pub struct Nv2a {
     put: u32,
     get: u32,
@@ -67,7 +105,35 @@ pub struct Nv2a {
     pfifo_intr: u32,
     pfifo_intr_en: u32,
     pmc_intr_en: u32,
+
+    // ---- PFIFO state machine (CACHE1 DMA channel + caches/RAM config). ----
+    /// Master cache enable (PFIFO_CACHES) and per-channel mode select.
+    pfifo_caches: u32,
+    pfifo_reassign: u32,
+    pfifo_mode: u32,
+    pfifo_dma: u32,
+    pfifo_ramht: u32,
+    pfifo_ramfc: u32,
+    pfifo_ramro: u32,
+    /// CACHE1 pusher: PUSH0 access enable, PUSH1 (CHID|MODE).
+    cache1_push0: u32,
+    cache1_push1: u32,
+    /// CACHE1 puller: PULL0 access enable, PULL1 engine select, ENGINE map.
+    cache1_pull0: u32,
+    cache1_pull1: u32,
+    cache1_engine: u32,
+    /// CACHE1_STATUS (LOW_MARK/HIGH_MARK); CACHE1 method-cache GET/PUT pointers.
+    cache1_status: u32,
+    cache1_get: u32,
+    cache1_put: u32,
+    /// CACHE1 DMA pusher control + scratch.
     cache1_dma_push: u32,
+    cache1_dma_fetch: u32,
+    cache1_dma_state: u32,
+    cache1_dma_instance: u32,
+    cache1_dma_subroutine: u32,
+    /// RUNOUT ring status (LOW_MARK = empty / idle).
+    runout_status: u32,
     /// PCRTC scanout base (the framebuffer the display reads).
     crtc_start: u32,
     /// Frames signalled (vblank count).
@@ -157,7 +223,29 @@ impl Nv2a {
             pfifo_intr: 0,
             pfifo_intr_en: 0,
             pmc_intr_en: 0,
+            pfifo_caches: 0,
+            pfifo_reassign: 0,
+            pfifo_mode: 0,
+            pfifo_dma: 0,
+            pfifo_ramht: 0,
+            pfifo_ramfc: 0,
+            pfifo_ramro: 0,
+            cache1_push0: 0,
+            cache1_push1: 0,
+            cache1_pull0: 0,
+            cache1_pull1: 0,
+            cache1_engine: 0,
+            // The method cache starts empty (LOW_MARK set) — nothing queued.
+            cache1_status: CACHE1_STATUS_LOW_MARK,
+            cache1_get: 0,
+            cache1_put: 0,
             cache1_dma_push: 0,
+            cache1_dma_fetch: 0,
+            cache1_dma_state: 0,
+            cache1_dma_instance: 0,
+            cache1_dma_subroutine: 0,
+            // The runout ring starts empty (LOW_MARK set) — no error entries.
+            runout_status: RUNOUT_STATUS_LOW_MARK,
             crtc_start: 0,
             vblank_count: 0,
             has_surface: false,
@@ -222,11 +310,42 @@ impl Nv2a {
             off::PCRTC_START => self.crtc_start,
             off::DMA_GET => self.get,
             off::DMA_PUT => self.put,
-            // PFIFO CACHE1: we execute the pushbuffer synchronously, so the FIFO
-            // is always idle/empty and fully drained — report that so the game's
-            // "wait for GPU" loops complete.
-            off::PFIFO_CACHE1_STATUS => 0x10, // LOW_MARK: cache empty
-            off::PFIFO_CACHE1_DMA_PUSH => self.cache1_dma_push & !0x10, // STATE not busy
+            // ---- PFIFO state machine ----
+            // The pusher/puller run synchronously on a kick (see `execute`), so
+            // whenever the driver polls, the FIFO is idle: the method cache is
+            // empty (LOW_MARK), the runout ring is empty (LOW_MARK), and the DMA
+            // pusher is not mid-run (STATE clear). These are exactly the bits the
+            // Xbox GPU driver's "wait for FIFO idle" loop checks.
+            off::PFIFO_CACHES => self.pfifo_caches,
+            off::PFIFO_REASSIGN => self.pfifo_reassign,
+            off::PFIFO_MODE => self.pfifo_mode,
+            off::PFIFO_DMA => self.pfifo_dma,
+            off::PFIFO_RAMHT => self.pfifo_ramht,
+            off::PFIFO_RAMFC => self.pfifo_ramfc,
+            off::PFIFO_RAMRO => self.pfifo_ramro,
+            // RUNOUT empty/idle (LOW_MARK set, no RANOUT error). The driver's
+            // bring-up wait requires this bit set to declare the FIFO drained.
+            off::PFIFO_RUNOUT_STATUS => self.runout_status,
+            off::PFIFO_CACHE1_PUSH0 => self.cache1_push0,
+            off::PFIFO_CACHE1_PUSH1 => self.cache1_push1,
+            off::PFIFO_CACHE1_PULL0 => self.cache1_pull0,
+            off::PFIFO_CACHE1_PULL1 => self.cache1_pull1,
+            off::PFIFO_CACHE1_ENGINE => self.cache1_engine,
+            // Method cache: empty after every kick (GET == PUT), LOW_MARK set.
+            off::PFIFO_CACHE1_STATUS => self.cache1_status,
+            off::PFIFO_CACHE1_GET => self.cache1_get,
+            off::PFIFO_CACHE1_PUT => self.cache1_put,
+            // DMA pusher control: ACCESS reflects what the driver enabled; STATE
+            // (busy) is always clear because the pusher already ran to GET==PUT;
+            // STATUS (suspended-on-error) is clear (no pushbuffer errors).
+            off::PFIFO_CACHE1_DMA_PUSH => {
+                self.cache1_dma_push & !(DMA_PUSH_STATE | DMA_PUSH_STATUS)
+            }
+            off::PFIFO_CACHE1_DMA_FETCH => self.cache1_dma_fetch,
+            off::PFIFO_CACHE1_DMA_STATE => self.cache1_dma_state,
+            off::PFIFO_CACHE1_DMA_INSTANCE => self.cache1_dma_instance,
+            off::PFIFO_CACHE1_DMA_SUBROUTINE => self.cache1_dma_subroutine,
+            // GET has caught up to PUT (pushbuffer fully consumed on each kick).
             off::PFIFO_CACHE1_DMA_PUT => self.put,
             off::PFIFO_CACHE1_DMA_GET => self.get,
             _ => 0,
@@ -239,8 +358,7 @@ impl Nv2a {
         match offset {
             off::DMA_PUT => {
                 self.put = val;
-                self.execute(ram);
-                self.get = val; // pretend the pushbuffer was consumed
+                self.kick(ram);
             }
             off::DMA_GET => self.get = val,
             off::PMC_INTR_EN_0 => self.pmc_intr_en = val,
@@ -250,19 +368,75 @@ impl Nv2a {
             off::PTIMER_INTR_EN_0 => self.ptimer_intr_en = val,
             off::PGRAPH_INTR => self.pgraph_intr &= !val,
             off::PGRAPH_INTR_EN => self.pgraph_intr_en = val,
-            off::PFIFO_INTR_0 => self.pfifo_intr &= !val,
+            off::PFIFO_INTR_0 => self.pfifo_intr &= !val, // write-1-to-clear
             off::PFIFO_INTR_EN_0 => self.pfifo_intr_en = val,
             off::PCRTC_START => self.crtc_start = val,
+            // ---- PFIFO state machine config (just latch what the driver sets) ----
+            off::PFIFO_CACHES => self.pfifo_caches = val,
+            off::PFIFO_REASSIGN => self.pfifo_reassign = val,
+            off::PFIFO_MODE => self.pfifo_mode = val,
+            off::PFIFO_DMA => self.pfifo_dma = val,
+            off::PFIFO_RAMHT => self.pfifo_ramht = val,
+            off::PFIFO_RAMFC => self.pfifo_ramfc = val,
+            off::PFIFO_RAMRO => self.pfifo_ramro = val,
+            off::PFIFO_RUNOUT_STATUS => self.runout_status &= !val, // w1c errors
+            off::PFIFO_CACHE1_PUSH0 => self.cache1_push0 = val,
+            off::PFIFO_CACHE1_PUSH1 => self.cache1_push1 = val,
+            off::PFIFO_CACHE1_PULL0 => self.cache1_pull0 = val,
+            off::PFIFO_CACHE1_PULL1 => self.cache1_pull1 = val,
+            off::PFIFO_CACHE1_ENGINE => self.cache1_engine = val,
+            off::PFIFO_CACHE1_STATUS => self.cache1_status = val,
+            off::PFIFO_CACHE1_GET => self.cache1_get = val,
+            off::PFIFO_CACHE1_PUT => self.cache1_put = val,
             off::PFIFO_CACHE1_DMA_PUSH => self.cache1_dma_push = val,
-            // The pushbuffer can also be kicked via the PFIFO DMA_PUT register.
+            off::PFIFO_CACHE1_DMA_FETCH => self.cache1_dma_fetch = val,
+            off::PFIFO_CACHE1_DMA_STATE => self.cache1_dma_state = val,
+            off::PFIFO_CACHE1_DMA_INSTANCE => self.cache1_dma_instance = val,
+            off::PFIFO_CACHE1_DMA_SUBROUTINE => self.cache1_dma_subroutine = val,
+            // The pushbuffer can also be kicked via the PFIFO CACHE1_DMA_PUT
+            // register (alternative to the USER DMA_PUT alias above).
             off::PFIFO_CACHE1_DMA_PUT => {
                 self.put = val;
-                self.execute(ram);
-                self.get = val;
+                self.kick(ram);
             }
             off::PFIFO_CACHE1_DMA_GET => self.get = val,
             _ => {}
         }
+    }
+
+    /// Kick the PFIFO pusher/puller: run the pushbuffer (GET..PUT) to completion,
+    /// then leave the engine idle — exactly the state the GPU driver busy-waits
+    /// for. Faithful to the NV2A pusher/puller (xemu `pfifo_run_pusher` /
+    /// `pfifo_run_puller`): the pusher fetches command words from the channel's
+    /// DMA pushbuffer in RAM and feeds methods into CACHE1; the puller dispatches
+    /// them to PGRAPH. Because we drain synchronously, when control returns:
+    ///   - GET has advanced to PUT (pushbuffer consumed),
+    ///   - CACHE1_STATUS.LOW_MARK is set (method cache empty),
+    ///   - RUNOUT_STATUS.LOW_MARK is set (no error entries),
+    ///   - CACHE1_DMA_PUSH.STATE is clear (pusher not mid-run).
+    fn kick(&mut self, ram: &mut [u8]) {
+        // The pusher only runs when the driver has enabled pusher access (PUSH0
+        // and DMA_PUSH ACCESS) and it isn't suspended on a prior error. If those
+        // gates aren't set we still accept PUT but execute nothing — matching
+        // hardware, where the pusher sleeps until access is granted. We keep the
+        // legacy unconditional behavior when no gates were ever configured so the
+        // existing homebrew clear/draw path (which kicks via DMA_PUT without
+        // touching PUSH0) keeps working.
+        let gated = self.cache1_push0 != 0 || self.cache1_dma_push != 0;
+        let access = !gated
+            || (self.cache1_push0 & ACCESS != 0
+                && self.cache1_dma_push & DMA_PUSH_ACCESS != 0
+                && self.cache1_dma_push & DMA_PUSH_STATUS == 0);
+        if access && self.get != self.put {
+            self.execute(ram); // pusher fetch + puller dispatch (advances GET)
+        }
+        // Pushbuffer fully consumed: GET == PUT, caches drained, engine idle.
+        self.get = self.put;
+        self.cache1_get = self.cache1_put;
+        self.cache1_status |= CACHE1_STATUS_LOW_MARK; // method cache empty
+        self.cache1_status &= !CACHE1_STATUS_HIGH_MARK; // not full
+        self.runout_status |= RUNOUT_STATUS_LOW_MARK; // runout ring empty
+        self.cache1_dma_push &= !DMA_PUSH_STATE; // pusher not mid-run
     }
 
     /// Walk + execute the pushbuffer (GET..PUT). Parses the NV command FIFO and
@@ -543,5 +717,55 @@ mod tests {
         let mut nv = Nv2a::new();
         // CACHE1_STATUS LOW_MARK (empty) set so "wait for FIFO" loops complete.
         assert_eq!(nv.mmio_read(off::PFIFO_CACHE1_STATUS, 4) & 0x10, 0x10);
+    }
+
+    #[test]
+    fn pfifo_bringup_wait_completes() {
+        // The Xbox GPU driver's pushbuffer bring-up busy-wait (the loop Halo 2
+        // stalls in) exits only when, after a kick, all three are true:
+        //   CACHE1_STATUS.LOW_MARK && RUNOUT_STATUS.LOW_MARK && !DMA_PUSH.STATE
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x10_0000];
+        // Driver enables the pusher then kicks with GET == PUT (empty ring) —
+        // exactly Halo 2's first kick. This must not walk garbage and must leave
+        // the engine idle.
+        nv.test_get_set(off::PFIFO_CACHE1_PUSH0, ACCESS, &mut ram);
+        nv.test_get_set(off::PFIFO_CACHE1_DMA_PUSH, DMA_PUSH_ACCESS, &mut ram);
+        nv.test_get_set(off::PFIFO_CACHE1_DMA_GET, 0x2000, &mut ram);
+        nv.test_get_set(off::DMA_PUT, 0x2000, &mut ram); // kick, ring empty
+        assert_eq!(
+            nv.mmio_read(off::PFIFO_CACHE1_STATUS, 4) & CACHE1_STATUS_LOW_MARK,
+            CACHE1_STATUS_LOW_MARK
+        );
+        assert_eq!(
+            nv.mmio_read(off::PFIFO_RUNOUT_STATUS, 4) & RUNOUT_STATUS_LOW_MARK,
+            RUNOUT_STATUS_LOW_MARK
+        );
+        assert_eq!(
+            nv.mmio_read(off::PFIFO_CACHE1_DMA_PUSH, 4) & DMA_PUSH_STATE,
+            0
+        );
+        // GET caught up to PUT (pushbuffer consumed / nothing to do).
+        assert_eq!(nv.mmio_read(off::PFIFO_CACHE1_DMA_GET, 4), 0x2000);
+    }
+
+    #[test]
+    fn pfifo_config_registers_round_trip() {
+        // The bring-up sequence latches a pile of CACHE1/RAM config; reads must
+        // return what the driver wrote (it reads several back during setup).
+        let mut nv = Nv2a::new();
+        let mut ram = vec![0u8; 0x1000];
+        for (o, v) in [
+            (off::PFIFO_CACHE1_PUSH1, 0x0000_0100u32),
+            (off::PFIFO_CACHE1_DMA_INSTANCE, 0x0000_011C),
+            (off::PFIFO_CACHE1_DMA_FETCH, 0x0008_6078),
+            (off::PFIFO_CACHE1_PULL0, 0x1),
+            (off::PFIFO_MODE, 0x1),
+            (off::PFIFO_RAMHT, 0x0300_0000),
+            (off::PFIFO_RAMFC, 0x0009_0010),
+        ] {
+            nv.test_get_set(o, v, &mut ram);
+            assert_eq!(nv.mmio_read(o, 4), v, "reg {o:#06X}");
+        }
     }
 }
