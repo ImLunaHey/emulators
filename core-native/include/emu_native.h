@@ -36,7 +36,15 @@ typedef enum {
     EMU_SYSTEM_SMS = 4,
     EMU_SYSTEM_GAME_GEAR = 5,
     EMU_SYSTEM_GBC = 6,
-    EMU_SYSTEM_XBOX = 7
+    EMU_SYSTEM_XBOX = 7,
+    EMU_SYSTEM_SNES = 8,
+    EMU_SYSTEM_GENESIS = 9,
+    EMU_SYSTEM_PCE = 10,
+    EMU_SYSTEM_ATARI2600 = 11,
+    EMU_SYSTEM_NGPC = 12,
+    EMU_SYSTEM_WONDERSWAN = 13,
+    EMU_SYSTEM_VIRTUALBOY = 14,
+    EMU_SYSTEM_N64 = 15
 } EmuSystem;
 
 /* Opaque session handle. */

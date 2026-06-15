@@ -29,6 +29,15 @@ use xbox_core::Xbox;
 
 use gba_core::Gba;
 
+use atari2600_core::Atari;
+use genesis_core::Genesis;
+use n64_core::N64;
+use ngpc_core::Ngpc;
+use pce_core::Pce;
+use snes_core::Snes;
+use virtualboy_core::Vb;
+use wonderswan_core::WonderSwan;
+
 /// System selector passed to [`emu_new`]. Keep in sync with the C header and the
 /// Swift `System` enum.
 #[repr(u32)]
@@ -42,6 +51,14 @@ pub enum System {
     GameGear = 5,
     Gbc = 6,
     Xbox = 7,
+    Snes = 8,
+    Genesis = 9,
+    Pce = 10,
+    Atari2600 = 11,
+    Ngpc = 12,
+    WonderSwan = 13,
+    VirtualBoy = 14,
+    N64 = 15,
 }
 
 impl System {
@@ -55,6 +72,14 @@ impl System {
             5 => System::GameGear,
             6 => System::Gbc,
             7 => System::Xbox,
+            8 => System::Snes,
+            9 => System::Genesis,
+            10 => System::Pce,
+            11 => System::Atari2600,
+            12 => System::Ngpc,
+            13 => System::WonderSwan,
+            14 => System::VirtualBoy,
+            15 => System::N64,
             _ => return None,
         })
     }
@@ -69,6 +94,14 @@ enum Inner {
     Sms(Box<Sms>),
     Gbc(Box<Gbc>),
     Xbox(Box<Xbox>),
+    Snes(Box<Snes>),
+    Genesis(Box<Genesis>),
+    Pce(Box<Pce>),
+    Atari2600(Box<Atari>),
+    Ngpc(Box<Ngpc>),
+    WonderSwan(Box<WonderSwan>),
+    VirtualBoy(Box<Vb>),
+    N64(Box<N64>),
 }
 
 /// The opaque session handle.
@@ -96,6 +129,16 @@ impl Emu {
             System::GameGear => (Inner::Sms(Box::new(Sms::new_system(true))), 160, 144, 44100, 1),
             System::Gbc => (Inner::Gbc(Box::new(Gbc::new())), 160, 144, 48000, 2),
             System::Xbox => (Inner::Xbox(Box::new(Xbox::new())), 640, 480, 48000, 2),
+            System::Snes => (Inner::Snes(Box::new(Snes::new())), 256, 224, 32000, 2),
+            System::Genesis => (Inner::Genesis(Box::new(Genesis::new())), 320, 224, 44100, 2),
+            System::Pce => (Inner::Pce(Box::new(Pce::new())), 256, 224, 44100, 2),
+            System::Atari2600 => (Inner::Atari2600(Box::new(Atari::new())), 160, 192, 44100, 1),
+            System::Ngpc => (Inner::Ngpc(Box::new(Ngpc::new())), 160, 152, 44100, 2),
+            System::WonderSwan => {
+                (Inner::WonderSwan(Box::new(WonderSwan::new_model(true))), 224, 144, 44100, 2)
+            }
+            System::VirtualBoy => (Inner::VirtualBoy(Box::new(Vb::new())), 384, 224, 44100, 2),
+            System::N64 => (Inner::N64(Box::new(N64::new())), 320, 240, 44100, 2),
         };
         let mut e = Emu {
             inner,
@@ -138,6 +181,38 @@ impl Emu {
                 c.load_rom(bytes.to_vec());
                 true
             }
+            Inner::Snes(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Genesis(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Pce(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Atari2600(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::Ngpc(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::WonderSwan(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::VirtualBoy(c) => {
+                c.load_rom(bytes);
+                true
+            }
+            Inner::N64(c) => {
+                c.load_rom(bytes);
+                true
+            }
         }
     }
 
@@ -165,6 +240,14 @@ impl Emu {
             Inner::Sms(c) => c.run_frame(),
             Inner::Gbc(c) => c.run_frame(),
             Inner::Xbox(c) => c.run_frame(),
+            Inner::Snes(c) => c.run_frame(),
+            Inner::Genesis(c) => c.run_frame(),
+            Inner::Pce(c) => c.run_frame(),
+            Inner::Atari2600(c) => c.run_frame(),
+            Inner::Ngpc(c) => c.run_frame(),
+            Inner::WonderSwan(c) => c.run_frame(),
+            Inner::VirtualBoy(c) => c.run_frame(),
+            Inner::N64(c) => c.run_frame(),
         }
         self.frames = self.frames.wrapping_add(1);
         self.refresh();
@@ -189,6 +272,14 @@ impl Emu {
             Inner::Sms(c) => c.set_keys(bits),
             Inner::Gbc(c) => c.set_keys((bits & 0xFF) as u8),
             Inner::Xbox(c) => c.set_keys(bits),
+            Inner::Snes(c) => c.set_keys(bits),
+            Inner::Genesis(c) => c.set_keys(bits),
+            Inner::Pce(c) => c.set_keys(bits),
+            Inner::Atari2600(c) => c.set_keys(bits),
+            Inner::Ngpc(c) => c.set_keys(bits),
+            Inner::WonderSwan(c) => c.set_keys(bits),
+            Inner::VirtualBoy(c) => c.set_keys(bits),
+            Inner::N64(c) => c.set_keys(bits),
         }
     }
 
@@ -202,6 +293,14 @@ impl Emu {
             Inner::Sms(c) => c.drain_audio(),
             Inner::Gbc(c) => c.drain_audio(),
             Inner::Xbox(c) => c.drain_audio(),
+            Inner::Snes(c) => c.drain_audio(),
+            Inner::Genesis(c) => c.drain_audio(),
+            Inner::Pce(c) => c.drain_audio(),
+            Inner::Atari2600(c) => c.drain_audio(),
+            Inner::Ngpc(c) => c.drain_audio(),
+            Inner::WonderSwan(c) => c.drain_audio(),
+            Inner::VirtualBoy(c) => c.drain_audio(),
+            Inner::N64(c) => c.drain_audio(),
         };
         let n = samples.len().min(out.len());
         out[..n].copy_from_slice(&samples[..n]);
@@ -253,6 +352,47 @@ impl Emu {
             Inner::Xbox(c) => {
                 self.width = c.width();
                 self.height = c.height();
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            // The new cores all expose width()/height()->usize + framebuffer()->&[u8].
+            Inner::Snes(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Genesis(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Pce(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Atari2600(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::Ngpc(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::WonderSwan(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::VirtualBoy(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
+                self.fb.extend_from_slice(c.framebuffer());
+            }
+            Inner::N64(c) => {
+                self.width = c.width() as u32;
+                self.height = c.height() as u32;
                 self.fb.extend_from_slice(c.framebuffer());
             }
         }
