@@ -24,7 +24,7 @@
 //! is still being populated, and unknown ordinals fall through to
 //! [`Dispatch::Unhandled`] (named from the table when possible).
 
-use crate::cpu::state::{EAX, ESP};
+use crate::cpu::state::{EAX, ECX, EDX, ESP};
 use crate::cpu::Cpu;
 use crate::hle_table;
 use crate::mem::Mem;
@@ -167,6 +167,8 @@ static DISC: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// handle return signalled — see NtWaitForSingleObject).
 const SYNC_HANDLE_BASE: u32 = 0x2000_0000;
 static SYNC_NEXT: AtomicU32 = AtomicU32::new(SYNC_HANDLE_BASE);
+/// Backing KTHREAD block returned by KeGetCurrentThread (lazily allocated).
+static CURRENT_KTHREAD: AtomicU32 = AtomicU32::new(0);
 fn alloc_sync_handle() -> u32 {
     SYNC_NEXT.fetch_add(4, Ordering::SeqCst)
 }
@@ -619,6 +621,7 @@ pub fn reset() {
     REBOOT.store(false, Ordering::SeqCst);
     SAVED_DATA_ADDR.store(0, Ordering::SeqCst);
     SYNC_NEXT.store(SYNC_HANDLE_BASE, Ordering::SeqCst);
+    CURRENT_KTHREAD.store(0, Ordering::SeqCst);
     *PERSISTED.lock().unwrap() = None;
     *LAUNCH_DATA.lock().unwrap() = None;
     *DISPLAY_MODE.lock().unwrap() = None;
@@ -1145,7 +1148,18 @@ const ORD_NT_SET_INFORMATION_FILE: u32 = 226;
 const ORD_NT_QUERY_FULL_ATTRIBUTES_FILE: u32 = 210;
 const ORD_NT_DEVICE_IO_CONTROL_FILE: u32 = 196;
 const ORD_NT_CREATE_MUTANT: u32 = 192;
-const ORD_NT_RELEASE_MUTANT: u32 = 230;
+const ORD_NT_RELEASE_MUTANT: u32 = 221;
+const ORD_KE_GET_CURRENT_THREAD: u32 = 104;
+const ORD_KE_GET_CURRENT_IRQL: u32 = 103;
+const ORD_KE_RAISE_IRQL_TO_DPC: u32 = 129;
+const ORD_KE_RAISE_IRQL_TO_SYNCH: u32 = 130;
+const ORD_KF_RAISE_IRQL: u32 = 160;
+const ORD_KF_LOWER_IRQL: u32 = 161;
+const ORD_INTERLOCKED_COMPARE_EXCHANGE: u32 = 51;
+const ORD_INTERLOCKED_DECREMENT: u32 = 52;
+const ORD_INTERLOCKED_INCREMENT: u32 = 53;
+const ORD_INTERLOCKED_EXCHANGE: u32 = 54;
+const ORD_INTERLOCKED_EXCHANGE_ADD: u32 = 55;
 const ORD_XC_SHA_INIT: u32 = 335;
 const ORD_XC_SHA_UPDATE: u32 = 336;
 const ORD_XC_SHA_FINAL: u32 = 337;
@@ -1505,6 +1519,85 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             stdcall_return(cpu, mem, STATUS_SUCCESS, 12);
             Dispatch::Handled("NtCreateMutant")
         }
+        ORD_KE_GET_CURRENT_THREAD => {
+            // PKTHREAD KeGetCurrentThread(VOID) — a stable non-null pointer to a
+            // KTHREAD block for the running thread (used as a thread identity
+            // token / for thread-local fields).
+            let mut h = CURRENT_KTHREAD.load(Ordering::SeqCst);
+            if h == 0 {
+                h = kdata_alloc(0x100, 16);
+                // KTHREAD.TlsData (offset 0x28) — the per-thread TLS slot array.
+                // nxdk asserts it's non-null AND that (TlsData + 4) is 16-byte
+                // aligned (it stores a self-pointer at [TlsData] and aligns the
+                // slots to +4). Allocate so TlsData ≡ 12 (mod 16).
+                let tls = kdata_alloc(0x1010, 16) + 12;
+                mem.ram_write32(h.wrapping_add(0x28), tls);
+                CURRENT_KTHREAD.store(h, Ordering::SeqCst);
+            }
+            stdcall_return(cpu, mem, h, 0);
+            Dispatch::Handled("KeGetCurrentThread")
+        }
+
+        // ---- IRQL ----
+        // The cooperative scheduler has no interrupt levels, so every thread runs
+        // at PASSIVE_LEVEL (0). Get/raise/lower all report/return 0; the fastcall
+        // Kf* variants take their new level in ECX (ignored) and clean no stack.
+        ORD_KE_GET_CURRENT_IRQL
+        | ORD_KE_RAISE_IRQL_TO_DPC
+        | ORD_KE_RAISE_IRQL_TO_SYNCH
+        | ORD_KF_RAISE_IRQL
+        | ORD_KF_LOWER_IRQL => {
+            stdcall_return(cpu, mem, 0, 0);
+            Dispatch::Handled("Irql")
+        }
+
+        // ---- Interlocked atomics (fastcall: args in ECX/EDX) ----
+        // Single-threaded-at-a-time scheduler, so a plain read-modify-write IS
+        // the atomic operation. Return value in EAX; only the (zero or one)
+        // stack args beyond ECX/EDX are cleaned.
+        ORD_INTERLOCKED_INCREMENT => {
+            let p = cpu.reg32(ECX);
+            let v = mem.ram_read32(p).wrapping_add(1);
+            mem.ram_write32(p, v);
+            stdcall_return(cpu, mem, v, 0);
+            Dispatch::Handled("InterlockedIncrement")
+        }
+        ORD_INTERLOCKED_DECREMENT => {
+            let p = cpu.reg32(ECX);
+            let v = mem.ram_read32(p).wrapping_sub(1);
+            mem.ram_write32(p, v);
+            stdcall_return(cpu, mem, v, 0);
+            Dispatch::Handled("InterlockedDecrement")
+        }
+        ORD_INTERLOCKED_EXCHANGE => {
+            // LONG InterlockedExchange(Target=ECX, Value=EDX) — set, return old.
+            let p = cpu.reg32(ECX);
+            let old = mem.ram_read32(p);
+            mem.ram_write32(p, cpu.reg32(EDX));
+            stdcall_return(cpu, mem, old, 0);
+            Dispatch::Handled("InterlockedExchange")
+        }
+        ORD_INTERLOCKED_EXCHANGE_ADD => {
+            // LONG InterlockedExchangeAdd(Addend=ECX, Value=EDX) — add, return old.
+            let p = cpu.reg32(ECX);
+            let old = mem.ram_read32(p);
+            mem.ram_write32(p, old.wrapping_add(cpu.reg32(EDX)));
+            stdcall_return(cpu, mem, old, 0);
+            Dispatch::Handled("InterlockedExchangeAdd")
+        }
+        ORD_INTERLOCKED_COMPARE_EXCHANGE => {
+            // LONG InterlockedCompareExchange(Dest=ECX, Exchange=EDX,
+            //   Comparand=[esp+4]) — CAS; one stack arg (4 bytes) to clean.
+            let p = cpu.reg32(ECX);
+            let exchange = cpu.reg32(EDX);
+            let comparand = arg(cpu, mem, 0);
+            let old = mem.ram_read32(p);
+            if old == comparand {
+                mem.ram_write32(p, exchange);
+            }
+            stdcall_return(cpu, mem, old, 4);
+            Dispatch::Handled("InterlockedCompareExchange")
+        }
         ORD_XC_SHA_INIT => {
             // VOID XcSHAInit(PUCHAR Context) — reset to the SHA-1 initial state.
             let ctx = arg(cpu, mem, 0);
@@ -1702,15 +1795,39 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             let value_out = arg(cpu, mem, 2);
             let value_len = arg(cpu, mem, 3);
             let result_len = arg(cpu, mem, 4);
-            let val: u32 = nonvolatile_value(value_index);
-            if type_out != 0 {
-                mem.ram_write32(type_out, 4); // REG_DWORD
-            }
-            if value_out != 0 && value_len >= 4 {
-                mem.ram_write32(value_out, val);
-            }
-            if result_len != 0 {
-                mem.ram_write32(result_len, 4);
+            if value_index == 0xFFFF {
+                // Read the entire 256-byte EEPROM image (nxdk hashes it to seed
+                // rand() and asserts ResultLength == 256). Emit a zeroed image
+                // with plausible factory fields.
+                let n = value_len.min(256);
+                if value_out != 0 {
+                    for i in 0..n {
+                        mem.ram_write8(value_out.wrapping_add(i), 0);
+                    }
+                    if n >= 0x30 {
+                        mem.ram_write32(value_out.wrapping_add(0x2C), 1); // GameRegion = North America
+                    }
+                    if n >= 0x5C {
+                        mem.ram_write32(value_out.wrapping_add(0x58), 0x0040_0100); // VideoStandard = NTSC-M
+                    }
+                }
+                if type_out != 0 {
+                    mem.ram_write32(type_out, 3); // REG_BINARY
+                }
+                if result_len != 0 {
+                    mem.ram_write32(result_len, n);
+                }
+            } else {
+                let val: u32 = nonvolatile_value(value_index);
+                if type_out != 0 {
+                    mem.ram_write32(type_out, 4); // REG_DWORD
+                }
+                if value_out != 0 && value_len >= 4 {
+                    mem.ram_write32(value_out, val);
+                }
+                if result_len != 0 {
+                    mem.ram_write32(result_len, 4);
+                }
             }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 20);
             Dispatch::Handled("ExQueryNonVolatileSetting")

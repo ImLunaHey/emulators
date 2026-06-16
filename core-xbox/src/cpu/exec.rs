@@ -1701,6 +1701,15 @@ impl Cpu {
                 self.set_reg32(EAX, self.instret as u32);
                 self.set_reg32(EDX, (self.instret >> 32) as u32);
             }
+            // RDMSR: EDX:EAX <- MSR[ECX]. We model the time-stamp counter MSR
+            // (0x10) like RDTSC; other MSRs read as zero.
+            0x32 => {
+                let v: u64 = if self.reg32(ECX) == 0x10 { self.instret } else { 0 };
+                self.set_reg32(EAX, v as u32);
+                self.set_reg32(EDX, (v >> 32) as u32);
+            }
+            // WRMSR: MSR[ECX] <- EDX:EAX. No MSRs modeled; ignore the write.
+            0x30 => {}
             // INVD / WBINVD — cache invalidate/flush; no cache modeled, so nop.
             0x08 | 0x09 => {}
             // CPUID: a minimal, plausible Pentium III response.
