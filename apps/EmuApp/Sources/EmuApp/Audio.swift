@@ -51,6 +51,12 @@ final class AudioPlayer {
     func start() { try? engine.start() }
     func stop() { engine.stop() }
 
+    /// Output volume (0...1), applied at the engine's main mixer.
+    var volume: Float {
+        get { engine.mainMixerNode.outputVolume }
+        set { engine.mainMixerNode.outputVolume = max(0, min(1, newValue)) }
+    }
+
     func enqueue(_ samples: ArraySlice<Float>) {
         lock.lock()
         if ring.count - readIdx > maxBacklog {

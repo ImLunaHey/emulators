@@ -8,6 +8,8 @@ final class EmuHub: ObservableObject {
     @Published var isPlaying = false
     @Published var title = ""
     @Published var systemLabel = ""
+    /// The running system (nil when stopped) — drives the in-game control bar.
+    @Published var currentSystem: EmuSystem?
     @Published var controllerInfo = "No controller"
     /// Most recent measured frames-per-second (updated ~4×/sec).
     @Published var fps: Double = 0
@@ -28,6 +30,16 @@ final class EmuHub: ObservableObject {
 
     /// In-memory BIOS/flash images per system (PS1, Xbox).
     private var bios: [EmuSystem: Data] = [:]
+
+    /// App settings (video/audio/attachments). Set via `configure` before launch.
+    private var settings: AppSettings?
+    /// The running game, so we can persist its save on stop / autosave.
+    private var current: (system: EmuSystem, title: String)?
+    /// Frames since the last autosave check (~every 5 s).
+    private var saveClock = 0
+
+    /// Inject the shared settings (call before `launch`).
+    func configure(settings: AppSettings) { self.settings = settings }
 
     // ---- screen wiring ----
     /// The view hosting our screen layer; used to tell whether this window is the
@@ -58,13 +70,28 @@ final class EmuHub: ObservableObject {
         }
         if let b = bios[system] { _ = e.loadBIOS(b) }
         _ = e.loadROM(rom)
+        // Restore the persisted save, then attach the chosen link peripheral.
+        if let saved = SaveStore.shared.load(system: system, game: title) {
+            e.loadSave(saved)
+        }
+        if let s = settings {
+            e.setAttachment(s.attachment(for: system))
+        }
+        e.clearSaveDirty()
         emu = e
+        current = (system, title)
         self.title = title
         self.systemLabel = system.label
+        self.currentSystem = system
         isPlaying = true
+        applyVideoSettings()
+        applyBindings()
 
-        audio = AudioPlayer(sampleRate: e.sampleRate, channels: e.channels)
-        audio?.start()
+        if settings?.audioEnabled ?? true {
+            audio = AudioPlayer(sampleRate: e.sampleRate, channels: e.channels)
+            audio?.volume = Float(settings?.volume ?? 1.0)
+            audio?.start()
+        }
 
         installKeyMonitor()
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
@@ -76,20 +103,67 @@ final class EmuHub: ObservableObject {
         timer?.invalidate()
         timer = nil
         if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        flushSave()
         audio?.stop()
         audio = nil
         emu = nil
+        current = nil
+        currentSystem = nil
         isPlaying = false
         input.clear()
+    }
+
+    /// Switch the link attachment on the running game and remember the choice.
+    func setAttachment(_ attachment: Attachment) {
+        guard let e = emu, let game = current else { return }
+        e.setAttachment(attachment)
+        settings?.setAttachment(attachment, for: game.system)
+    }
+
+    /// Persist the running game's save to disk if it changed.
+    private func flushSave() {
+        guard let e = emu, let game = current, e.saveDirty, let data = e.saveData() else { return }
+        SaveStore.shared.save(data, system: game.system, game: game.title)
+        e.clearSaveDirty()
+    }
+
+    /// Push the user's key bindings into the input manager (call on launch and
+    /// whenever the bindings change).
+    func applyBindings() {
+        if let s = settings { input.bindings = s.effectiveBindings }
+    }
+
+    /// Push the current video settings into the screen layer (filter, scaling).
+    func applyVideoSettings() {
+        guard let layer = screenLayer, let s = settings else { return }
+        layer.magnificationFilter = s.videoFilter == .smooth ? .linear : .nearest
+    }
+
+    /// Apply changed audio settings to a live session.
+    func applyAudioSettings() {
+        guard let s = settings else { return }
+        audio?.volume = s.audioEnabled ? Float(s.volume) : 0
     }
 
     // ---- frame ----
     private func tick() {
         guard let e = emu else { return }
+        // Optionally pause windows that aren't frontmost (off by default).
+        if !(settings?.runInBackground ?? true) && !inputFocused {
+            return
+        }
         // Only the focused window drives input; background games keep emulating
         // with no buttons pressed.
         e.setKeys(inputFocused ? e.system.keyMask(input.currentButtons()) : 0)
         e.runFrame()
+
+        // Autosave battery-backed games ~every 5 s when the save changed, so a
+        // crash or force-quit can't lose much progress.
+        saveClock += 1
+        if saveClock >= 300 {
+            saveClock = 0
+            flushSave()
+        }
         present(e)
         let n = e.drainAudio(into: &audioBuf)
         if n > 0 { audio?.enqueue(audioBuf[0..<n]) }

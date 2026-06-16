@@ -170,12 +170,42 @@ enum EmuSystem: UInt32, CaseIterable, Identifiable {
 }
 
 /// Logical, controller-agnostic buttons. Per-system bit layouts are derived from
-/// these so keyboard and gamepad share one path.
-enum Btn: CaseIterable {
+/// these so keyboard and gamepad share one path. The String raw value is a
+/// stable key for persisting custom key bindings.
+enum Btn: String, CaseIterable, Identifiable {
     case up, down, left, right
     case south, east, west, north // face buttons by physical position
     case l1, r1, l2, r2
     case start, select
+
+    var id: String { rawValue }
+
+    /// Human label for the controls UI. Face buttons are named by position
+    /// (the per-system bit layout assigns them to A/B/X/Y as appropriate).
+    var label: String {
+        switch self {
+        case .up: return "Up"
+        case .down: return "Down"
+        case .left: return "Left"
+        case .right: return "Right"
+        case .south: return "South (A / B)"
+        case .east: return "East (B / A)"
+        case .west: return "West (X / Y)"
+        case .north: return "North (Y / X)"
+        case .l1: return "L"
+        case .r1: return "R"
+        case .l2: return "L2 / ZL"
+        case .r2: return "R2 / ZR"
+        case .start: return "Start"
+        case .select: return "Select"
+        }
+    }
+
+    /// Display order for the controls list (d-pad, face, shoulders, system).
+    static var bindOrder: [Btn] {
+        [.up, .down, .left, .right, .south, .east, .west, .north,
+         .l1, .r1, .l2, .r2, .start, .select]
+    }
 }
 
 extension EmuSystem {

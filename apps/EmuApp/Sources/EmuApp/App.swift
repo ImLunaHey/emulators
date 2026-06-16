@@ -106,6 +106,7 @@ struct EmuAppMain: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var library = Library()
     @StateObject private var bios = BiosStore()
+    @StateObject private var settings = AppSettings()
 
     var body: some Scene {
         // Primary window: the console library, OR — in player-only mode
@@ -121,6 +122,7 @@ struct EmuAppMain: App {
             }
             .environmentObject(library)
             .environmentObject(bios)
+            .environmentObject(settings)
         }
         .defaultSize(width: 920, height: 640)
 
@@ -129,8 +131,23 @@ struct EmuAppMain: App {
         WindowGroup(for: LaunchRequest.self) { $request in
             PlayerWindow(request: request)
                 .environmentObject(bios)
+                .environmentObject(settings)
         }
         .defaultSize(width: 768, height: 576)
         .defaultPosition(.center)
+
+        // Settings window: video/audio, link attachments, and the memory-card /
+        // HDD / save manager. A dedicated `Window` (not the `Settings` scene,
+        // whose ⌘, menu item is unreliable for a bare SwiftPM executable) opened
+        // by id from the Consoles toolbar. `Window` is a single shared instance,
+        // so reopening just brings it to the front.
+        Window("Settings", id: SettingsWindowID) {
+            SettingsView()
+                .environmentObject(settings)
+        }
+        .defaultSize(width: 540, height: 440)
     }
 }
+
+/// Scene id for the Settings window (opened via `openWindow(id:)`).
+let SettingsWindowID = "emu-settings"

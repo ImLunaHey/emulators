@@ -8,6 +8,7 @@ import SwiftUI
 struct PlayerWindow: View {
     let request: LaunchRequest?
     @EnvironmentObject var bios: BiosStore
+    @EnvironmentObject var settings: AppSettings
     @StateObject private var hub = EmuHub()
     @State private var launched = false
 
@@ -16,11 +17,18 @@ struct PlayerWindow: View {
             .environmentObject(hub)
             .onAppear { launchIfNeeded() }
             .onDisappear { hub.stop() }
+            // Live-apply settings changes (filter, volume, key bindings) to the
+            // running game.
+            .onChange(of: settings.videoFilter) { _ in hub.applyVideoSettings() }
+            .onChange(of: settings.audioEnabled) { _ in hub.applyAudioSettings() }
+            .onChange(of: settings.volume) { _ in hub.applyAudioSettings() }
+            .onChange(of: settings.effectiveBindings) { _ in hub.applyBindings() }
     }
 
     private func launchIfNeeded() {
         guard !launched, let request else { return }
         launched = true
+        hub.configure(settings: settings)
         let url = URL(fileURLWithPath: request.path)
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             hub.title = "Couldn't read \(url.lastPathComponent)"
@@ -43,12 +51,14 @@ struct PlayerWindow: View {
 /// and metadata changes.
 struct PlayerView: View {
     @EnvironmentObject var hub: EmuHub
+    @EnvironmentObject var settings: AppSettings
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 0) {
             if hub.isPlaying {
                 // A real top bar (not an overlay) so it never covers the screen.
-                HStack {
+                HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(hub.title)
                             .font(.system(size: 13, weight: .semibold))
@@ -58,7 +68,19 @@ struct PlayerView: View {
                             .font(.system(size: 10))
                             .foregroundColor(.white.opacity(0.6))
                     }
-                    Spacer()
+                    Spacer(minLength: 8)
+
+                    // Link attachment (only systems that have a link port).
+                    if let sys = hub.currentSystem, sys.hasAttachments {
+                        AttachmentMenu(system: sys)
+                    }
+                    // Volume.
+                    VolumeControl()
+                    // All settings (video/audio/attachments/storage).
+                    PlayerBarButton(systemImage: "gearshape", help: "Settings") {
+                        openWindow(id: SettingsWindowID)
+                    }
+                    // Stop.
                     Button("Stop") { hub.stop() }
                         .buttonStyle(.plain)
                         .foregroundColor(.white.opacity(0.85))
@@ -86,11 +108,101 @@ struct PlayerView: View {
                             .font(.system(size: 12))
                             .foregroundColor(.white.opacity(0.5))
                     }
+                    // Center the placeholder: the ZStack is .topTrailing so the
+                    // FPS HUD pins to the corner, but this should fill + center.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
         .frame(minWidth: 480, minHeight: 360)
         .background(Color.black)
+    }
+}
+
+/// A compact icon button styled to match the player top bar (like Stop).
+private struct PlayerBarButton: View {
+    let systemImage: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.85))
+                .frame(width: 28, height: 22)
+                .background(.white.opacity(0.12))
+                .cornerRadius(6)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+/// In-game link-attachment switcher: a borderless icon menu listing the running
+/// system's supported attachments (link cable / wireless adapter / none). The
+/// choice applies live and is remembered for next launch.
+private struct AttachmentMenu: View {
+    @EnvironmentObject var hub: EmuHub
+    @EnvironmentObject var settings: AppSettings
+    let system: EmuSystem
+
+    var body: some View {
+        let current = settings.attachment(for: system)
+        Menu {
+            ForEach(system.supportedAttachments) { a in
+                Button { hub.setAttachment(a) } label: {
+                    Label(a.label, systemImage: current == a ? "checkmark" : a.symbol)
+                }
+            }
+        } label: {
+            Image(systemName: current.symbol)
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.85))
+                .frame(width: 28, height: 22)
+                .background(.white.opacity(0.12))
+                .cornerRadius(6)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Link attachment: \(current.label)")
+    }
+}
+
+/// In-game volume control: a speaker button opening a popover with a mute toggle
+/// and a volume slider. Changes apply live via the player window's onChange.
+private struct VolumeControl: View {
+    @EnvironmentObject var settings: AppSettings
+    @State private var show = false
+
+    var body: some View {
+        PlayerBarButton(systemImage: speakerIcon, help: "Volume") { show.toggle() }
+            .popover(isPresented: $show, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle("Audio", isOn: $settings.audioEnabled)
+                    HStack(spacing: 8) {
+                        Image(systemName: "speaker.fill").foregroundStyle(.secondary)
+                        Slider(value: $settings.volume, in: 0...1)
+                        Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+                    }
+                    .disabled(!settings.audioEnabled)
+                    Text("\(Int(settings.volume * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .padding(14)
+                .frame(width: 220)
+            }
+    }
+
+    private var speakerIcon: String {
+        if !settings.audioEnabled || settings.volume == 0 { return "speaker.slash.fill" }
+        if settings.volume < 0.4 { return "speaker.fill" }
+        if settings.volume < 0.75 { return "speaker.wave.2.fill" }
+        return "speaker.wave.3.fill"
     }
 }
 

@@ -9,42 +9,35 @@ final class InputManager {
     /// Logical buttons currently held on the keyboard.
     private var keyboard: Set<Btn> = []
 
+    /// Active keyboard bindings (logical button → key). Replaced by `EmuHub`
+    /// from the user's settings; defaults until then.
+    var bindings: [Btn: KeyBind] = DefaultBindings.map {
+        didSet { keyboard.removeAll() } // avoid stuck keys after a rebind
+    }
+
     // ---- keyboard ----
 
-    /// Map a key event to a logical button. Returns nil for unmapped keys.
-    private static func button(for event: NSEvent) -> Btn? {
-        switch event.keyCode {
-        case 126: return .up
-        case 125: return .down
-        case 123: return .left
-        case 124: return .right
-        case 36, 76: return .start // return / keypad-enter
-        default: break
-        }
-        switch event.charactersIgnoringModifiers?.lowercased() {
-        case "z": return .south
-        case "x": return .east
-        case "a": return .west
-        case "s": return .north
-        case "q": return .l1
-        case "w": return .r1
-        case "d": return .l2
-        case "f": return .r2
-        default: return nil
-        }
+    /// Which logical button (if any) a key-code is bound to.
+    private func button(forKeyCode code: UInt16) -> Btn? {
+        bindings.first { $0.value == .key(code) }?.key
     }
 
     func handleKey(_ event: NSEvent, down: Bool) {
-        guard let b = Self.button(for: event) else { return }
+        guard let b = button(forKeyCode: event.keyCode) else { return }
         if down { keyboard.insert(b) } else { keyboard.remove(b) }
     }
 
-    /// Shift is a modifier, so it arrives via flagsChanged rather than keyDown.
+    /// Modifier-key bindings (e.g. the default Select = Shift) arrive via
+    /// flagsChanged, not keyDown. Re-evaluate every modifier binding against the
+    /// current flags.
     func handleFlags(_ event: NSEvent) {
-        if event.modifierFlags.contains(.shift) {
-            keyboard.insert(.select)
-        } else {
-            keyboard.remove(.select)
+        for (btn, bind) in bindings {
+            guard case .modifier(let m) = bind else { continue }
+            if event.modifierFlags.contains(m.flag) {
+                keyboard.insert(btn)
+            } else {
+                keyboard.remove(btn)
+            }
         }
     }
 

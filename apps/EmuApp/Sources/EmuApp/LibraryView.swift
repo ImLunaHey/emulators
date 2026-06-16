@@ -159,6 +159,7 @@ struct LibraryView: View {
 
 private struct ConsoleGrid: View {
     @EnvironmentObject var library: Library
+    @Environment(\.openWindow) private var openWindow
     let select: (EmuSystem) -> Void
     let onAdd: () -> Void
     let status: String
@@ -181,6 +182,13 @@ private struct ConsoleGrid: View {
                 }
                 .keyboardShortcut("o", modifiers: .command)
                 .help("Add games — auto-sorted into the right console")
+                Button {
+                    openWindow(id: SettingsWindowID)
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .keyboardShortcut(",", modifiers: .command)
+                .help("Video & audio, link attachments, and the memory-card / HDD / save manager")
             }
             .padding(.horizontal, 28)
             .padding(.top, 24)

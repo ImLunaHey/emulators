@@ -54,4 +54,34 @@ final class Emulator {
             Int(emu_drain_audio(handle, buf.baseAddress, buf.count))
         }
     }
+
+    // ---- saves (battery / memory card / HDD) ----
+
+    /// The current save image (the core's native `.sav`), or nil if empty.
+    func saveData() -> Data? {
+        let len = emu_save_data_len(handle)
+        if len == 0 { return nil }
+        var buf = [UInt8](repeating: 0, count: len)
+        let n = buf.withUnsafeMutableBufferPointer { emu_save_data(handle, $0.baseAddress, $0.count) }
+        return Data(buf.prefix(n))
+    }
+
+    /// Load a `.sav` image into the core's battery store (call after `loadROM`).
+    func loadSave(_ data: Data) {
+        data.withUnsafeBytes { raw in
+            emu_load_save(handle, raw.bindMemory(to: UInt8.self).baseAddress, data.count)
+        }
+    }
+
+    /// True if the save changed since the last `clearSaveDirty` — poll to decide
+    /// when to flush a `.sav` to disk.
+    var saveDirty: Bool { emu_save_dirty(handle) }
+    func clearSaveDirty() { emu_clear_save_dirty(handle) }
+
+    // ---- link attachments ----
+
+    /// Select the active link attachment. No-op if the core doesn't model it.
+    func setAttachment(_ attachment: Attachment) {
+        emu_set_attachment(handle, attachment.rawValue)
+    }
 }
