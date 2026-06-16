@@ -59,9 +59,16 @@ impl Default for Settings {
     }
 }
 
+/// A recently-opened game (persisted, shown on the home screen).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Recent {
+    path: String,
+    name: String,
+}
+
 struct App {
     emu: Option<Emu>,
-    /// (system, game name) of the running game — for the save path.
+    /// (system, game name) of the running game — for the save / state paths.
     current: Option<(System, String)>,
     title: String,
     tex: Option<egui::TextureHandle>,
@@ -69,6 +76,9 @@ struct App {
     gilrs: Option<gilrs::Gilrs>,
     settings: Settings,
     settings_open: bool,
+    recents: Vec<Recent>,
+    /// Transient on-screen message (text, shown-until).
+    status: Option<(String, Instant)>,
     save_clock: u32,
     last: Instant,
     acc: f32,
@@ -80,6 +90,10 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value::<Settings>(s, "settings"))
             .unwrap_or_default();
+        let recents = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Vec<Recent>>(s, "recents"))
+            .unwrap_or_default();
         Self {
             emu: None,
             current: None,
@@ -89,10 +103,16 @@ impl App {
             gilrs: gilrs::Gilrs::new().ok(),
             settings,
             settings_open: false,
+            recents,
+            status: None,
             save_clock: 0,
             last: Instant::now(),
             acc: 0.0,
         }
+    }
+
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), Instant::now()));
     }
 
     fn open_rom(&mut self) {
@@ -109,7 +129,14 @@ impl App {
         else {
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        self.load_path(&path);
+    }
+
+    /// Load and launch a ROM by path. Used by the file dialog and the recents
+    /// list.
+    fn load_path(&mut self, path: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            self.set_status(format!("Couldn't read {}", path.display()));
             return;
         };
         let name = path
@@ -122,12 +149,11 @@ impl App {
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase());
         let Some(system) = detect_system(ext.as_deref(), &bytes) else {
-            self.title = format!("Unknown system for {name}");
+            self.set_status(format!("Unknown system for {name}"));
             return;
         };
         let mut emu = Emu::new(system);
         emu.load_rom(&bytes);
-        // Restore a previous .sav if one exists.
         if let Some(p) = save_path(system, &name) {
             if let Ok(save) = std::fs::read(&p) {
                 emu.load_save(&save);
@@ -135,11 +161,62 @@ impl App {
         }
         self.audio = AudioOut::new();
         self.title = name.clone();
-        self.current = Some((system, name));
+        self.current = Some((system, name.clone()));
         self.emu = Some(emu);
         self.acc = 0.0;
         self.save_clock = 0;
         self.last = Instant::now();
+        self.record_recent(path, &name);
+    }
+
+    /// Add (or move to front) a game in the recents list, capped at 12.
+    fn record_recent(&mut self, path: &std::path::Path, name: &str) {
+        let path = path.to_string_lossy().to_string();
+        self.recents.retain(|r| r.path != path);
+        self.recents.insert(
+            0,
+            Recent {
+                path,
+                name: name.to_string(),
+            },
+        );
+        self.recents.truncate(12);
+    }
+
+    /// Save / load a save state (GBA today) to `<data>/states/<system>/<game>.state`.
+    fn save_state(&mut self) {
+        let Some((system, name)) = self.current.clone() else {
+            return;
+        };
+        let Some(blob) = self.emu.as_ref().and_then(|e| e.save_state()) else {
+            self.set_status("Save states not supported for this core");
+            return;
+        };
+        if let Some(p) = state_path(system, &name) {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            self.set_status(if std::fs::write(&p, &blob).is_ok() {
+                "State saved"
+            } else {
+                "Failed to write state"
+            });
+        }
+    }
+
+    fn load_state(&mut self) {
+        let Some((system, name)) = self.current.clone() else {
+            return;
+        };
+        let Some(p) = state_path(system, &name) else {
+            return;
+        };
+        let Ok(blob) = std::fs::read(&p) else {
+            self.set_status("No save state");
+            return;
+        };
+        let ok = self.emu.as_mut().map(|e| e.load_state(&blob)).unwrap_or(false);
+        self.set_status(if ok { "State loaded" } else { "Failed to load state" });
     }
 
     /// Write the running game's save to disk if it changed.
@@ -177,6 +254,7 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "settings", &self.settings);
+        eframe::set_value(storage, "recents", &self.recents);
         // Also a good moment to flush the battery save.
         self.flush_save();
     }
@@ -186,6 +264,16 @@ impl eframe::App for App {
             while g.next_event().is_some() {}
         }
         let gamepad_mask = self.gilrs.as_ref().map(read_gamepad).unwrap_or(0);
+
+        // Save-state hotkeys (RetroArch-style): F2 = save, F4 = load.
+        if self.emu.is_some() {
+            if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
+                self.save_state();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F4)) {
+                self.load_state();
+            }
+        }
 
         if self.emu.is_some() {
             let now = Instant::now();
@@ -297,14 +385,51 @@ impl eframe::App for App {
                     if self.settings.scanlines {
                         draw_scanlines(ui.painter(), rect);
                     }
+                    // Transient status (e.g. "State saved").
+                    if let Some((msg, since)) = &self.status {
+                        if since.elapsed().as_secs_f32() < 2.0 {
+                            ui.painter().text(
+                                rect.left_top() + egui::vec2(8.0, 8.0),
+                                egui::Align2::LEFT_TOP,
+                                msg,
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::from_white_alpha(220),
+                            );
+                            ctx.request_repaint();
+                        }
+                    }
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new("Open a ROM to start")
-                                .color(egui::Color32::GRAY)
-                                .size(16.0),
-                        );
+                    // Home screen: a recents list + open button.
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.heading("imlunahey emulator");
+                        ui.add_space(6.0);
+                        if ui.button("Open ROM…").clicked() {
+                            self.open_rom();
+                        }
+                        ui.add_space(20.0);
+                        if !self.recents.is_empty() {
+                            ui.label(egui::RichText::new("Recent").color(egui::Color32::GRAY));
+                            ui.add_space(6.0);
+                        }
                     });
+                    let recents = self.recents.clone();
+                    let mut to_open: Option<PathBuf> = None;
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            for r in &recents {
+                                if ui
+                                    .add_sized([320.0, 28.0], egui::Button::new(&r.name))
+                                    .clicked()
+                                {
+                                    to_open = Some(PathBuf::from(&r.path));
+                                }
+                            }
+                        });
+                    });
+                    if let Some(p) = to_open {
+                        self.load_path(&p);
+                    }
                 }
             });
     }
@@ -332,6 +457,21 @@ fn save_path(system: System, game: &str) -> Option<PathBuf> {
             .join("saves")
             .join(sys_label(system))
             .join(format!("{safe}.sav")),
+    )
+}
+
+/// On-disk save-state path: `<data dir>/states/<system>/<game>.state`.
+fn state_path(system: System, game: &str) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("me", "wvvw", "imlunahey-emulator")?;
+    let safe: String = game
+        .chars()
+        .map(|c| if "/\\:?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    Some(
+        dirs.data_dir()
+            .join("states")
+            .join(sys_label(system))
+            .join(format!("{safe}.state")),
     )
 }
 
