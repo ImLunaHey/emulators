@@ -5,6 +5,12 @@
 //! struct owning only its own state, and cross-subsystem calls pass `&mut`
 //! references as parameters (mirroring the TS constructor wiring).
 
+// The core is 100% safe Rust — every subsystem indexes its own buffers through
+// bounds-checked slices, so no hand-written `unsafe` is needed. Enforce that at
+// compile time. Gated to non-wasm targets because the wasm-bindgen macros in
+// `wasm` (compiled only on wasm32) expand to `unsafe` glue we don't own.
+#![cfg_attr(not(target_arch = "wasm32"), forbid(unsafe_code))]
+
 // --- Foundation (hand-ported; the contract every other module codes against).
 pub mod bus;
 pub mod irq;
