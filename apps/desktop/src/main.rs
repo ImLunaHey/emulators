@@ -2,13 +2,14 @@
 //! the portable counterpart to the macOS-only SwiftUI app in apps/EmuApp.
 //!
 //! Pure Rust: links `emu-native` directly (no FFI), renders + UIs with egui,
-//! plays audio through cpal, and reads gamepads via gilrs. This v1 covers the
-//! essentials (open a ROM, run, video, audio, keyboard + gamepad); settings,
-//! retro effects/upscaling, remapping, and save management land on top.
+//! plays audio through cpal, and reads gamepads via gilrs. Covers: open a ROM,
+//! run, video (filter / integer scale / scanlines), audio (with volume),
+//! keyboard + gamepad input, persisted settings, and per-game `.sav` saves.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -33,24 +34,62 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Persisted app settings (saved via eframe's storage).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    /// Linear (smooth) vs nearest (sharp) scaling.
+    smooth: bool,
+    /// Snap the picture to an integer multiple of its native size.
+    integer_scale: bool,
+    /// Draw CRT-style scanlines over the picture.
+    scanlines: bool,
+    /// Output volume, 0..1.
+    volume: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            smooth: false,
+            integer_scale: false,
+            scanlines: false,
+            volume: 1.0,
+        }
+    }
+}
+
 struct App {
     emu: Option<Emu>,
+    /// (system, game name) of the running game — for the save path.
+    current: Option<(System, String)>,
     title: String,
     tex: Option<egui::TextureHandle>,
     audio: Option<AudioOut>,
     gilrs: Option<gilrs::Gilrs>,
+    settings: Settings,
+    settings_open: bool,
+    save_clock: u32,
     last: Instant,
     acc: f32,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Settings>(s, "settings"))
+            .unwrap_or_default();
         Self {
             emu: None,
+            current: None,
             title: String::new(),
             tex: None,
             audio: None,
             gilrs: gilrs::Gilrs::new().ok(),
+            settings,
+            settings_open: false,
+            save_clock: 0,
             last: Instant::now(),
             acc: 0.0,
         }
@@ -88,15 +127,47 @@ impl App {
         };
         let mut emu = Emu::new(system);
         emu.load_rom(&bytes);
+        // Restore a previous .sav if one exists.
+        if let Some(p) = save_path(system, &name) {
+            if let Ok(save) = std::fs::read(&p) {
+                emu.load_save(&save);
+            }
+        }
         self.audio = AudioOut::new();
-        self.title = name;
+        self.title = name.clone();
+        self.current = Some((system, name));
         self.emu = Some(emu);
         self.acc = 0.0;
+        self.save_clock = 0;
         self.last = Instant::now();
     }
 
+    /// Write the running game's save to disk if it changed.
+    fn flush_save(&mut self) {
+        let (Some(emu), Some((system, name))) = (self.emu.as_mut(), self.current.as_ref()) else {
+            return;
+        };
+        if !emu.save_dirty() {
+            return;
+        }
+        let data = emu.save_data();
+        if data.is_empty() {
+            return;
+        }
+        if let Some(p) = save_path(*system, name) {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::write(&p, &data).is_ok() {
+                emu.clear_save_dirty();
+            }
+        }
+    }
+
     fn stop(&mut self) {
+        self.flush_save();
         self.emu = None;
+        self.current = None;
         self.audio = None;
         self.tex = None;
         self.title.clear();
@@ -104,14 +175,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "settings", &self.settings);
+        // Also a good moment to flush the battery save.
+        self.flush_save();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Pump gamepad events so button state is current.
         if let Some(g) = &mut self.gilrs {
             while g.next_event().is_some() {}
         }
         let gamepad_mask = self.gilrs.as_ref().map(read_gamepad).unwrap_or(0);
 
-        // Advance emulation to keep ~60 fps, capped so a slow frame can't spiral.
         if self.emu.is_some() {
             let now = Instant::now();
             let dt = (now - self.last).as_secs_f32().min(0.1);
@@ -119,6 +194,7 @@ impl eframe::App for App {
             self.acc += dt;
             let frame_time = 1.0 / 60.0;
             let buttons = read_keyboard(ctx) | gamepad_mask;
+            let volume = self.settings.volume;
             let mut ran = 0;
             while self.acc >= frame_time && ran < 4 {
                 self.acc -= frame_time;
@@ -127,6 +203,7 @@ impl eframe::App for App {
                 emu.set_buttons(buttons);
                 emu.run_frame();
                 if let Some(audio) = &mut self.audio {
+                    audio.volume = volume;
                     let mut tmp = [0f32; 4096];
                     let n = emu.drain_audio(&mut tmp);
                     if n > 0 {
@@ -134,18 +211,26 @@ impl eframe::App for App {
                     }
                 }
             }
-            // Upload the latest frame to the texture once per UI repaint.
+            // Autosave the battery roughly every 5 s when it changed.
+            self.save_clock += ran;
+            if self.save_clock >= 300 {
+                self.save_clock = 0;
+                self.flush_save();
+            }
+            // Upload the latest frame.
             let emu = self.emu.as_ref().unwrap();
             let (w, h) = (emu.width() as usize, emu.height() as usize);
             let fb = emu.framebuffer();
             if w > 0 && h > 0 && fb.len() == w * h * 4 {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w, h], fb);
+                let opt = if self.settings.smooth {
+                    egui::TextureOptions::LINEAR
+                } else {
+                    egui::TextureOptions::NEAREST
+                };
                 match &mut self.tex {
-                    Some(t) => t.set(img, egui::TextureOptions::NEAREST),
-                    None => {
-                        self.tex =
-                            Some(ctx.load_texture("framebuffer", img, egui::TextureOptions::NEAREST))
-                    }
+                    Some(t) => t.set(img, opt),
+                    None => self.tex = Some(ctx.load_texture("framebuffer", img, opt)),
                 }
             }
             ctx.request_repaint();
@@ -155,21 +240,44 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if self.emu.is_some() {
                     ui.strong(&self.title);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").clicked() {
-                            self.stop();
-                        }
-                    });
-                } else {
-                    if ui.button("Open ROM…").clicked() {
-                        self.open_rom();
-                    }
-                    if !self.title.is_empty() {
-                        ui.label(&self.title);
-                    }
+                } else if ui.button("Open ROM…").clicked() {
+                    self.open_rom();
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.emu.is_some() && ui.button("Stop").clicked() {
+                        self.stop();
+                    }
+                    ui.toggle_value(&mut self.settings_open, "⚙ Settings");
+                });
             });
         });
+
+        if self.settings_open {
+            egui::SidePanel::right("settings")
+                .resizable(false)
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.heading("Settings");
+                    ui.separator();
+                    ui.label("Video");
+                    ui.checkbox(&mut self.settings.smooth, "Smooth (bilinear)");
+                    ui.checkbox(&mut self.settings.integer_scale, "Integer scale");
+                    ui.checkbox(&mut self.settings.scanlines, "Scanlines");
+                    ui.add_space(8.0);
+                    ui.label("Audio");
+                    ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).text("Volume"));
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "Keyboard: arrows + Z/X (B/A), A/S (Y/X), Q/W (L/R), \
+                             Enter=Start, Shift=Select. Gamepads auto-detected.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
@@ -178,11 +286,17 @@ impl eframe::App for App {
                     let avail = ui.available_size();
                     let [tw, th] = tex.size();
                     let (tw, th) = (tw as f32, th as f32);
-                    let scale = (avail.x / tw).min(avail.y / th).max(0.0);
+                    let mut scale = (avail.x / tw).min(avail.y / th).max(0.0);
+                    if self.settings.integer_scale && scale >= 1.0 {
+                        scale = scale.floor();
+                    }
                     let size = egui::vec2(tw * scale, th * scale);
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)));
-                    });
+                    let rect = egui::Align2::CENTER_CENTER
+                        .align_size_within_rect(size, ui.available_rect_before_wrap());
+                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)).paint_at(ui, rect);
+                    if self.settings.scanlines {
+                        draw_scanlines(ui.painter(), rect);
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -193,6 +307,52 @@ impl eframe::App for App {
                     });
                 }
             });
+    }
+}
+
+/// Cheap CRT scanlines: a darkened 1px line every 3px down the picture.
+fn draw_scanlines(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_black_alpha(70);
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        painter.hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
+        y += 3.0;
+    }
+}
+
+/// On-disk save path: `<data dir>/saves/<system>/<game>.sav`.
+fn save_path(system: System, game: &str) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("me", "wvvw", "imlunahey-emulator")?;
+    let safe: String = game
+        .chars()
+        .map(|c| if "/\\:?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    Some(
+        dirs.data_dir()
+            .join("saves")
+            .join(sys_label(system))
+            .join(format!("{safe}.sav")),
+    )
+}
+
+fn sys_label(s: System) -> &'static str {
+    match s {
+        System::Gba => "GBA",
+        System::Ps1 => "PS1",
+        System::Nds => "NDS",
+        System::Nes => "NES",
+        System::Sms => "SMS",
+        System::GameGear => "GameGear",
+        System::Gbc => "GBC",
+        System::Xbox => "Xbox",
+        System::Snes => "SNES",
+        System::Genesis => "Genesis",
+        System::Pce => "PCE",
+        System::Atari2600 => "Atari2600",
+        System::Ngpc => "NGPC",
+        System::WonderSwan => "WonderSwan",
+        System::VirtualBoy => "VirtualBoy",
+        System::N64 => "N64",
     }
 }
 
@@ -280,10 +440,8 @@ fn read_gamepad(gilrs: &gilrs::Gilrs) -> u32 {
     b(Button::RightTrigger2, BTN_R2);
     b(Button::Start, BTN_START);
     b(Button::Select, BTN_SELECT);
-    // Left analog stick → d-pad.
     let t = 0.4;
-    let x = pad.value(Axis::LeftStickX);
-    let y = pad.value(Axis::LeftStickY);
+    let (x, y) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
     if y > t {
         m |= BTN_UP;
     }
@@ -305,6 +463,7 @@ struct AudioOut {
     buf: Arc<Mutex<VecDeque<f32>>>,
     device_rate: u32,
     resample_pos: f32,
+    volume: f32,
     _stream: cpal::Stream,
 }
 
@@ -346,6 +505,7 @@ impl AudioOut {
             buf,
             device_rate,
             resample_pos: 0.0,
+            volume: 1.0,
             _stream: stream,
         })
     }
@@ -354,14 +514,17 @@ impl AudioOut {
         if samples.is_empty() || self.device_rate == 0 {
             return;
         }
+        let vol = self.volume;
         let frames: Vec<(f32, f32)> = if src_channels >= 2 {
-            samples.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+            samples
+                .chunks_exact(2)
+                .map(|c| (c[0] * vol, c[1] * vol))
+                .collect()
         } else {
-            samples.iter().map(|&v| (v, v)).collect()
+            samples.iter().map(|&v| (v * vol, v * vol)).collect()
         };
-        let step = src_rate as f32 / self.device_rate as f32; // src advance per out frame
+        let step = src_rate as f32 / self.device_rate as f32;
         let mut out = self.buf.lock().unwrap();
-        // Bound latency: if we're more than ~0.25 s behind, resync.
         if out.len() > (self.device_rate as usize) / 2 {
             out.clear();
             self.resample_pos = 0.0;
