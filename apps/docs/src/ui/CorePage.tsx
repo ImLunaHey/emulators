@@ -1,5 +1,6 @@
 import { useParams, Link } from 'react-router-dom';
 import { coreById } from '../cores';
+import { MATRICES } from '../matrices';
 import { MaturityPill } from './MaturityPill';
 import { Formats } from './Formats';
 import { Section } from './Section';
@@ -61,9 +62,9 @@ export function CorePage() {
       </header>
 
       {/* Capability matrix — what's supported, partial, needs testing, or to-add */}
-      {core.matrix && (
+      {MATRICES[core.id] && (
         <Section title="Support matrix">
-          <SupportMatrix groups={core.matrix} />
+          <SupportMatrix groups={MATRICES[core.id]} />
         </Section>
       )}
 

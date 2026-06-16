@@ -76,12 +76,8 @@ export interface Core {
   /** One sentence describing the cargo test suite. */
   tests: string;
   testedGames: TestedGame[];
-  /**
-   * Optional fine-grained capability matrix (supported / partial / needs
-   * testing / to-add), grouped by subsystem. Rendered as a table when present.
-   * Currently authored for the flagship GBA core.
-   */
-  matrix?: MatrixGroup[];
+  // The fine-grained capability matrix (supported / partial / needs-testing /
+  // to-add, grouped by subsystem) lives in ./matrices.ts, keyed by `id`.
 }
 
 export const CORES: Core[] = [
@@ -134,75 +130,6 @@ export const CORES: Core[] = [
       { title: 'Pokémon Ruby', boots: true, plays: true, sound: true, notes: '"Battery has run dry" prompt fixed' },
       { title: 'Garfield: Search for Pooky', boots: true, plays: true, sound: true, notes: 'Language select renders' },
       { title: 'Crash Bandicoot', boots: true, plays: true, sound: true, notes: 'Title intro + Earth flyby' },
-    ],
-    // Benchmarked against the emulation-general wiki + Shonumi's peripheral catalog, cross-checked against the gba-core source.
-    matrix: [
-      {
-        group: 'CPU & timing',
-        rows: [
-          { feature: 'ARM + THUMB interpreter', support: 'yes', note: 'Validated bit-identical vs a reference interpreter for 120 frames' },
-          { feature: 'IRQ / exception banking', support: 'yes' },
-          { feature: 'Cycle accuracy', support: 'partial', note: 'Instruction-approximate, not cycle-/dot-exact' },
-          { feature: 'BIOS-region open-bus behavior', support: 'partial', note: 'Simplified' },
-        ],
-      },
-      {
-        group: 'Video (PPU)',
-        rows: [
-          { feature: 'All BG modes (text / affine / bitmap)', support: 'yes' },
-          { feature: 'Sprites: affine, mosaic, windows, blending', support: 'yes' },
-          { feature: 'Golden-frame accuracy tests', support: 'yes' },
-          { feature: 'GBA LCD color correction (higan/byuu)', support: 'yes', note: 'Optional toggle in the player' },
-          { feature: 'LCD pixel-grid / CRT filter', support: 'yes' },
-          { feature: 'High-resolution affine / Mode-7 upscaling', support: 'no', note: 'mGBA-style OpenGL enhancement' },
-        ],
-      },
-      {
-        group: 'Audio (APU)',
-        rows: [
-          { feature: 'PSG (square / wave / noise)', support: 'yes' },
-          { feature: 'DirectSound (2 FIFO PCM channels)', support: 'yes' },
-          { feature: 'High-quality "XQ" audio (Sappy HLE)', support: 'no', note: 'Cleaner music mixer; enhancement' },
-        ],
-      },
-      {
-        group: 'Saves & RTC',
-        rows: [
-          { feature: 'SRAM / Flash 64–128 KB / EEPROM autodetect', support: 'yes' },
-          { feature: 'Cartridge RTC (Pokémon R/S/E time events)', support: 'yes', note: 'Host supplies the clock' },
-          { feature: 'Save states + rewind', support: 'yes' },
-          { feature: 'Raw .sav exchange with other emulators', support: 'testing', note: 'Persists locally; cross-emulator interchange unverified' },
-        ],
-      },
-      {
-        group: 'Sensors & rumble',
-        rows: [
-          { feature: 'Solar sensor (Boktai series)', support: 'no', note: 'Needs a GPIO ADC; GPIO is currently RTC-only' },
-          { feature: 'Tilt / gyro (WarioWare: Twisted!, Yoshi UG, Koro Koro)', support: 'no' },
-          { feature: 'Cartridge rumble (Drill Dozer, Pokémon Pinball)', support: 'no' },
-          { feature: 'Game Boy Player rumble', support: 'no' },
-        ],
-      },
-      {
-        group: 'Connectivity',
-        rows: [
-          { feature: 'Link cable — multiplayer / trading', support: 'testing', note: 'SIO multiplay over WebRTC; needs broader real-game verification' },
-          { feature: 'GameCube ↔ GBA link (JOY-bus)', support: 'no', note: 'Registers accepted but non-functional' },
-          { feature: 'Single-Pak link (multiboot)', support: 'no' },
-          { feature: 'Wireless Adapter', support: 'no' },
-          { feature: 'Mobile Adapter GB', support: 'no' },
-        ],
-      },
-      {
-        group: 'Cartridge hardware & compatibility',
-        rows: [
-          { feature: 'Real (dumped) BIOS support', support: 'no', note: 'HLE BIOS only today' },
-          { feature: 'GB/GBC enhanced backward-compat mode', support: 'no' },
-          { feature: 'e-Reader (dot-code scanning)', support: 'no' },
-          { feature: 'Exotic peripherals (Battle Chip Gate, Campho, Play-Yan, Glucoboy, Turbo File, Soul Doll)', support: 'no' },
-          { feature: 'Commercial-game compatibility breadth', support: 'testing', note: 'Only ~5 titles verified so far' },
-        ],
-      },
     ],
   },
   {
