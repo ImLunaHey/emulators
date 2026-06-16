@@ -412,6 +412,16 @@ fn close_file(h: u32) -> bool {
 static KDATA: Mutex<Option<std::collections::HashMap<u32, u32>>> = Mutex::new(None);
 const ORD_KE_TICK_COUNT: u32 = 156;
 const ORD_XBOX_KRNL_VERSION: u32 = 324;
+/// `HalDiskCachePartitionCount` (DATA export, ordinal 40) — the number of HDD
+/// cache partitions. On a real console this is non-zero (the X/Y/Z game-cache
+/// partitions); the dashboard/kernel sets it at boot. During init Halo reads
+/// this export as a count, `dec`s it, and uses `count*12` as a memcpy length, so
+/// a zero here underflows to 0xFFFFFFFF and triggers a ~4-billion-dword
+/// `rep movsd` (EIP 0x19505) that wipes the game's own loaded image, after which
+/// EIP free-runs through zeroed RAM. Initialize it to the standard partition
+/// count so the count stays positive and the memcpy is bounded.
+const ORD_HAL_DISK_CACHE_PARTITION_COUNT: u32 = 40;
+const HAL_DISK_CACHE_PARTITION_COUNT: u32 = 3;
 /// KeTickCount units (~ms) advanced per emulated frame (~60 Hz → ~16 ms).
 const KTICK_PER_FRAME: u32 = 16;
 
@@ -424,6 +434,9 @@ pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
         return a;
     }
     let addr = kdata_alloc(64, 16); // room for scalars or a small struct
+    if std::env::var_os("XBOX_TRACE_KDATA").is_some() {
+        eprintln!("[kdata] ordinal {ordinal} -> {addr:#010X}");
+    }
     map.insert(ordinal, addr);
     // Sensible initial contents.
     match ordinal {
@@ -433,6 +446,9 @@ pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
             mem.ram_write16(addr.wrapping_add(2), 0);
             mem.ram_write16(addr.wrapping_add(4), 5838);
             mem.ram_write16(addr.wrapping_add(6), 1);
+        }
+        ORD_HAL_DISK_CACHE_PARTITION_COUNT => {
+            mem.ram_write32(addr, HAL_DISK_CACHE_PARTITION_COUNT);
         }
         ORD_LAUNCH_DATA_PAGE => {
             // On a real console `LaunchDataPage` is a pointer the kernel sets to a
@@ -2002,6 +2018,21 @@ mod tests {
         assert_eq!(len, 4, "Length is byte count of 2 wide chars");
         assert_eq!(max, 6, "MaximumLength includes the wide NUL");
         assert_eq!(mem.ram_read32(dest + 4), src, "Buffer points at source");
+    }
+
+    #[test]
+    fn hal_disk_cache_partition_count_is_nonzero() {
+        // Regression: Halo reads HalDiskCachePartitionCount (ordinal 40) as a
+        // count, decrements it, and uses count*12 as a memcpy length. A zero
+        // here underflows to 0xFFFFFFFF and wipes the game's own image. The
+        // DATA-export backing must be initialized to a positive partition count.
+        reset();
+        let mut mem = Mem::new();
+        let addr = data_export_addr(ORD_HAL_DISK_CACHE_PARTITION_COUNT, &mut mem);
+        let count = mem.ram_read32(addr);
+        assert_eq!(count, HAL_DISK_CACHE_PARTITION_COUNT);
+        assert!(count != 0, "count must be positive to avoid dec-to-0xFFFFFFFF");
+        assert!(count.wrapping_sub(1) < 0x1000, "decremented count stays small");
     }
 
     #[test]
