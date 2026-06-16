@@ -291,8 +291,17 @@ impl Xbox {
     /// conceptual budget; we cap the actual step count well below it so a tight
     /// loop in unfinished boot code can't hang the browser.
     const CYCLES_PER_FRAME: u32 = 733_000_000 / 60;
-    /// Instructions to step per frame (capped — see above).
-    const STEP_BUDGET: u32 = 1 << 16;
+    /// Instructions to step per frame. A real ~733 MHz frame is ~12M cycles; the
+    /// budget must be that large or per-frame CPU work that the game does every
+    /// frame — clearing the framebuffer / depth buffer (a ~1 MB byte loop),
+    /// transforming geometry — can't finish in a frame and the game never
+    /// progresses. (HLE traps + the preemption quantum keep a genuine spin loop
+    /// from hanging.)
+    const STEP_BUDGET: u32 = Self::CYCLES_PER_FRAME;
+    /// Round-robin preemption interval (instructions) — sized so a frame yields
+    /// to other threads a few dozen times, not thousands (which churns context
+    /// switches) nor never (which lets a spin-waiter starve a loader).
+    const PREEMPT_QUANTUM: u32 = 256 * 1024;
 
     /// Run a single video frame: step the CPU a fixed instruction budget (until a
     /// fault or HLT), then present. If the CPU has faulted (e.g. it ran into an
@@ -372,7 +381,7 @@ impl Xbox {
                     // Round-robin preemption so a busy-waiting thread can't starve
                     // the loaders/workers it's waiting on.
                     quantum += 1;
-                    if quantum >= 8192 {
+                    if quantum >= Self::PREEMPT_QUANTUM {
                         quantum = 0;
                         crate::hle::preempt(&mut self.cpu);
                     }

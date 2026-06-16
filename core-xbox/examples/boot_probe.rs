@@ -137,6 +137,22 @@ fn main() {
         print!("{:02X} ", xb.mem.ram_read8(i));
     }
     println!();
+    // Register + stack snapshot — helps decode a stuck loop (e.g. a memset whose
+    // count lives at [ebp+0x10]).
+    let r = |i: usize| xb.cpu.reg32(i);
+    println!(
+        "  regs eax={:08X} ecx={:08X} edx={:08X} ebx={:08X} esp={:08X} ebp={:08X} esi={:08X} edi={:08X}",
+        r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7)
+    );
+    let ebp = r(5);
+    println!(
+        "  stack [ebp+8]={:08X} [ebp+C]={:08X} [ebp+10]={:08X} [ebp+14]={:08X}",
+        xb.mem.ram_read32(ebp.wrapping_add(8)),
+        xb.mem.ram_read32(ebp.wrapping_add(0xC)),
+        xb.mem.ram_read32(ebp.wrapping_add(0x10)),
+        xb.mem.ram_read32(ebp.wrapping_add(0x14))
+    );
+
     let imports = xb.kernel_imports();
     println!("--- {} kernel imports (ordinals) ---", imports.len());
     for chunk in imports.chunks(16) {
