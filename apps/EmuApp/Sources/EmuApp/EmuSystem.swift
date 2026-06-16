@@ -180,22 +180,24 @@ enum Btn: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Human label for the controls UI. Face buttons are named by position
-    /// (the per-system bit layout assigns them to A/B/X/Y as appropriate).
+    /// Human label for the controls UI. Face buttons use the standard
+    /// position→letter abstraction (Nintendo / libretro RetroPad): right = A,
+    /// bottom = B, top = X, left = Y. The per-system bit layout translates these
+    /// to each console's actual buttons.
     var label: String {
         switch self {
         case .up: return "Up"
         case .down: return "Down"
         case .left: return "Left"
         case .right: return "Right"
-        case .south: return "South (A / B)"
-        case .east: return "East (B / A)"
-        case .west: return "West (X / Y)"
-        case .north: return "North (Y / X)"
+        case .east: return "A"   // right face
+        case .south: return "B"  // bottom face
+        case .north: return "X"  // top face
+        case .west: return "Y"   // left face
         case .l1: return "L"
         case .r1: return "R"
-        case .l2: return "L2 / ZL"
-        case .r2: return "R2 / ZR"
+        case .l2: return "L2"
+        case .r2: return "R2"
         case .start: return "Start"
         case .select: return "Select"
         }
