@@ -1,4 +1,4 @@
-# gba-recomp
+# emulators
 
 A Game Boy Advance emulator that runs entirely in the browser. Cycle-batched ARM7TDMI interpreter (ARM + THUMB), full PPU (every BG mode, sprites with rotation/scaling, affine, windows, mosaic, blending), DMA, timers, IRQs, PSG + DirectSound audio in stereo, SIO link cable over WebRTC, S-3511A RTC, and autodetected SRAM / Flash / EEPROM saves on an HLE BIOS. The **core is written in Rust and compiled to WebAssembly**; a React + Tailwind UI wraps it with a ROM library, save states, cheats, gamepad/keyboard support, and an installable PWA shell.
 
@@ -25,15 +25,15 @@ The browser app talks to it through `src/ui/wasmEmulator.ts`, an adapter that re
 ## Quick start
 
 ```bash
-git clone git@github.com:ImLunaHey/gba-recomp.git
-cd gba-recomp
+git clone git@github.com:ImLunaHey/emulators.git
+cd emulators
 npm install
 npm run dev
 ```
 
 The compiled wasm core (`core/pkg/`) is committed, so a fresh clone runs and builds without a Rust toolchain. **If you change the Rust core**, rebuild it with `npm run build:wasm` (needs the [Rust toolchain](https://rustup.rs) with the `wasm32-unknown-unknown` target and [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)) and commit the updated `core/pkg/`. `npm run build` / `deploy` consume the committed artifact; `npm run deploy` rebuilds it first.
 
-Open the URL Vite prints. For a stable local URL, `npm run dev:portless` serves `https://gba-recomp.localhost` via [portless](https://www.npmjs.com/package/portless).
+Open the URL Vite prints. For a stable local URL, `npm run dev:portless` serves `https://emulators.localhost` via [portless](https://www.npmjs.com/package/portless).
 
 Open the app, then add a ROM through the library — drag any `.gba` file in, or use the picker. ROMs are stored in your browser's IndexedDB and **never leave the browser**; in-cart saves and save states persist locally too.
 
@@ -137,7 +137,7 @@ ROMs aren't shipped — `public/*.gba` is gitignored.
 
 ## Bugs / requests
 
-[github.com/ImLunaHey/gba-recomp/issues](https://github.com/ImLunaHey/gba-recomp/issues) — please include the game, what you were doing, and (if a visual bug) a screenshot. If you can reproduce it from a fresh boot with a specific sequence of inputs, even better.
+[github.com/ImLunaHey/emulators/issues](https://github.com/ImLunaHey/emulators/issues) — please include the game, what you were doing, and (if a visual bug) a screenshot. If you can reproduce it from a fresh boot with a specific sequence of inputs, even better.
 
 ## Tech
 

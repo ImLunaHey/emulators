@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "gba-recomp",
+  "name": "emulators",
   "compatibility_date": "2026-06-08",
   "main": "src/worker.ts",
   "observability": {
