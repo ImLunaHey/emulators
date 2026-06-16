@@ -1,0 +1,23 @@
+[package]
+name = "emu-desktop"
+version = "0.0.0"
+edition = "2021"
+
+# Cross-platform desktop front-end (Windows / macOS / Linux) for all cores —
+# the portable counterpart to the macOS-only SwiftUI app in apps/EmuApp. Pure
+# Rust: links emu-native directly, renders/UIs with egui, audio via cpal,
+# gamepads via gilrs.
+[[bin]]
+name = "emu-desktop"
+path = "src/main.rs"
+
+[dependencies]
+emu-native = { path = "../../packages/native" }
+eframe = "0.29"
+egui = "0.29"
+cpal = "0.15"
+gilrs = "0.11"
+rfd = "0.15"
+
+[profile.release]
+opt-level = 3
