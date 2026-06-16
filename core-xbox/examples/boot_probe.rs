@@ -137,6 +137,25 @@ fn main() {
         print!("{:02X} ", xb.mem.ram_read8(i));
     }
     println!();
+    // Framebuffer fingerprint: a checksum + non-black pixel count. Comparing the
+    // checksum across different frame counts tells us if the picture is changing
+    // (animating) at all, independent of whether the colours are correct.
+    {
+        let fb = xb.framebuffer();
+        let mut sum: u64 = 0;
+        let mut nonblack = 0u32;
+        let mut i = 0;
+        while i + 3 < fb.len() {
+            let px = u32::from_le_bytes([fb[i], fb[i + 1], fb[i + 2], fb[i + 3]]);
+            sum = sum.wrapping_mul(31).wrapping_add(px as u64);
+            if px & 0x00FF_FFFF != 0 {
+                nonblack += 1;
+            }
+            i += 4;
+        }
+        println!("  fb checksum={sum:016X} nonblack={nonblack}/{}", fb.len() / 4);
+    }
+
     // Register + stack snapshot — helps decode a stuck loop (e.g. a memset whose
     // count lives at [ebp+0x10]).
     let r = |i: usize| xb.cpu.reg32(i);
