@@ -1,0 +1,134 @@
+# Builds and attaches release artifacts. Runs ONLY when a GitHub Release is
+# published (release-please creates the release when its PR is merged), so the
+# heavy native/app builds never run on ordinary pushes/PRs.
+#
+# Artifacts:
+#   - libretro core (RetroArch):  macOS universal .dylib, Linux .so, Windows .dll
+#   - desktop app (eframe):       Windows .exe, macOS, Linux
+#   - macOS app (EmuApp):         signed .app, zipped
+name: release-build
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  libretro:
+    name: libretro core (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   asset: emu_libretro-macos.dylib }
+          - { os: ubuntu-latest,  asset: emu_libretro-linux.so }
+          - { os: windows-latest, asset: emu_libretro-windows.dll }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/libretro
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cd packages/libretro
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/libemu_libretro.dylib \
+            target/x86_64-apple-darwin/release/libemu_libretro.dylib \
+            -output "$GITHUB_WORKSPACE/${{ matrix.asset }}"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd packages/libretro && cargo build --release
+          cp target/release/libemu_libretro.so "$GITHUB_WORKSPACE/${{ matrix.asset }}"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd packages/libretro && cargo build --release
+          cp target/release/emu_libretro.dll "$GITHUB_WORKSPACE/${{ matrix.asset }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+
+  desktop:
+    name: desktop app (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  bin: emu-desktop,     asset: emu-desktop-linux }
+          - { os: macos-latest,   bin: emu-desktop,     asset: emu-desktop-macos }
+          - { os: windows-latest, bin: emu-desktop.exe, asset: emu-desktop-windows.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux deps (egui / cpal / rfd)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop
+
+      - name: Build
+        shell: bash
+        run: cd apps/desktop && cargo build --release
+
+      - name: Stage asset
+        shell: bash
+        run: cp "apps/desktop/target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+
+  emuapp-macos:
+    name: macOS app (EmuApp)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/native
+
+      - name: Build native lib (universal) + sync header
+        run: ./scripts/build-macos.sh --universal
+
+      - name: Build app (universal)
+        run: cd apps/EmuApp && swift build -c release --arch arm64 --arch x86_64
+
+      - name: Bundle .app
+        shell: bash
+        run: |
+          BIN="$(cd apps/EmuApp && swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/EmuApp"
+          APP=EmuApp.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp "$BIN" "$APP/Contents/MacOS/EmuApp"
+          cp apps/EmuApp/Info.plist "$APP/Contents/Info.plist"
+          codesign -s - --force --deep "$APP" || true
+          ditto -c -k --sequesterRsrc --keepParent "$APP" EmuApp-macos.zip
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: EmuApp-macos.zip
