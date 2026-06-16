@@ -464,6 +464,17 @@ impl Xbox {
 
     // ---- shared read/write cores (translate → classify → route) ----
     fn read(&mut self, addr: u32, size: u8) -> u32 {
+        // Fast path: code and data accesses are overwhelmingly to main RAM at the
+        // bottom of the address space (RAM_BASE == 0). Index it directly and skip
+        // translate/classify + the region match — this is the interpreter's
+        // hottest path (every instruction fetch + most operand accesses).
+        if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
+            return match size {
+                1 => self.mem.ram_read8(addr),
+                2 => self.mem.ram_read16(addr),
+                _ => self.mem.ram_read32(addr),
+            };
+        }
         let region = bus::translate(addr);
         if let Some(v) = self.mem.region_read(region, size) {
             return v;
@@ -482,6 +493,15 @@ impl Xbox {
     }
 
     fn write(&mut self, addr: u32, size: u8, v: u32) {
+        // Fast path: direct RAM store (see `read`).
+        if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
+            match size {
+                1 => self.mem.ram_write8(addr, v),
+                2 => self.mem.ram_write16(addr, v),
+                _ => self.mem.ram_write32(addr, v),
+            }
+            return;
+        }
         let region = bus::translate(addr);
         if self.mem.region_write(region, size, v) {
             return;
@@ -671,6 +691,18 @@ impl Bus for Xbox {
     }
     fn write32(&mut self, addr: u32, v: u32) {
         self.write(addr, 4, v)
+    }
+    /// Instruction-fetch byte. Code lives in main RAM (RAM_BASE == 0), so index
+    /// it directly — this runs for every opcode/ModRM/immediate byte and skips
+    /// the full translate → classify → region-match path of `read8`.
+    fn fetch8(&mut self, addr: u32) -> u8 {
+        let i = addr as usize;
+        if i < crate::regions::RAM_SIZE {
+            // SAFETY: bounds-checked against RAM_SIZE; ram is [u8; RAM_SIZE].
+            unsafe { *self.mem.ram.get_unchecked(i) }
+        } else {
+            self.read8(addr) as u8
+        }
     }
 }
 
