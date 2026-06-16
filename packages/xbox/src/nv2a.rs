@@ -179,10 +179,16 @@ pub struct Nv2a {
     verts: Vec<Vertex>,       // accumulated vertices
     vcolor: u32,              // current diffuse color (D3DCOLOR ARGB)
     vx: f32,                  // pending vertex X (until Y completes the vertex)
-    // Vertex-array draw state (DRAW_ARRAYS path): per-attribute RAM offset +
-    // format word (type/size/stride packed as NV097_SET_VERTEX_DATA_ARRAY_FORMAT).
+    // Vertex-array draw state (DRAW_ARRAYS / ARRAY_ELEMENT path): per-attribute
+    // RAM offset + format word (type/size/stride packed as
+    // NV097_SET_VERTEX_DATA_ARRAY_FORMAT).
     va_offset: [u32; 16],
     va_format: [u32; 16],
+    // Viewport transform (NV097_SET_VIEWPORT_SCALE / _OFFSET): screen.xyz =
+    // ndc.xyz * scale + offset. Zero scale ⇒ unset (fall back to an NDC→surface
+    // map). Lets a title drive the exact pixel mapping the GPU would.
+    vp_scale: [f32; 4],
+    vp_offset: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +220,11 @@ mod m {
     pub const VERTEX_DATA_ARRAY_FORMAT: u32 = 0x1760; // +attr*4 (16 attrs)
     pub const VERTEX_DATA_ARRAY_FORMAT_END: u32 = 0x179C;
     pub const DRAW_ARRAYS: u32 = 0x1810; // (count-1)<<24 | start_index
+    pub const ARRAY_ELEMENT16: u32 = 0x1800; // two packed 16-bit vertex indices
+    pub const VIEWPORT_OFFSET: u32 = 0x0A20; // +i*4 (x,y,z,w)
+    pub const VIEWPORT_OFFSET_END: u32 = 0x0A2C;
+    pub const VIEWPORT_SCALE: u32 = 0x0AF0; // +i*4 (x,y,z,w)
+    pub const VIEWPORT_SCALE_END: u32 = 0x0AFC;
     // Immediate-mode drawing.
     pub const SET_BEGIN_END: u32 = 0x17FC; // data 0 = end, else begin(primitive)
     pub const VERTEX_POS_X: u32 = 0x1880; // SET_VERTEX_DATA2F attr0 component0
@@ -335,6 +346,8 @@ impl Nv2a {
             vx: 0.0,
             va_offset: [0; 16],
             va_format: [0; 16],
+            vp_scale: [0.0; 4],
+            vp_offset: [0.0; 4],
         }
     }
 
@@ -643,6 +656,21 @@ impl Nv2a {
                 self.va_format[((method - m::VERTEX_DATA_ARRAY_FORMAT) / 4) as usize] = data;
             }
             m::DRAW_ARRAYS => self.draw_arrays(ram, data),
+            m::ARRAY_ELEMENT16 => {
+                // Two packed 16-bit indices into the vertex arrays (low half
+                // first). Index 0xFFFF in the high half is a padding sentinel.
+                self.array_element(ram, (data & 0xFFFF) as u16);
+                let hi = (data >> 16) as u16;
+                if hi != 0xFFFF {
+                    self.array_element(ram, hi);
+                }
+            }
+            m::VIEWPORT_OFFSET..=m::VIEWPORT_OFFSET_END => {
+                self.vp_offset[((method - m::VIEWPORT_OFFSET) / 4) as usize] = f32::from_bits(data);
+            }
+            m::VIEWPORT_SCALE..=m::VIEWPORT_SCALE_END => {
+                self.vp_scale[((method - m::VIEWPORT_SCALE) / 4) as usize] = f32::from_bits(data);
+            }
             m::SET_BEGIN_END => {
                 if data == 0 {
                     self.draw_primitives(ram); // END: rasterize what we gathered
@@ -705,36 +733,48 @@ impl Nv2a {
     /// viewport; colours are read per the attribute's format (float RGB[A] or a
     /// packed D3DCOLOR). This is the path real nxdk/D3D8 geometry uses (vs. the
     /// immediate SET_VERTEX_DATA2F path).
-    fn draw_arrays(&mut self, ram: &[u8], data: u32) {
-        let count = ((data >> 24) & 0xFF) + 1;
-        let start = data & 0x00FF_FFFF;
-        let (vw, vh) = self.viewport_dims();
-        if vw == 0 || vh == 0 {
-            return;
+    /// Project a clip/NDC position to screen pixels. With a programmed viewport
+    /// (scale != 0): perspective-divide by w, then screen = ndc * scale + offset
+    /// (the exact mapping the GPU applies). Otherwise fall back to mapping NDC
+    /// across the surface (the pre-transformed homebrew path).
+    fn project(&self, x: f32, y: f32, w: f32) -> (f32, f32) {
+        let inv_w = if w != 0.0 { 1.0 / w } else { 1.0 };
+        let (nx, ny) = (x * inv_w, y * inv_w);
+        if self.vp_scale[0] != 0.0 || self.vp_scale[1] != 0.0 {
+            (nx * self.vp_scale[0] + self.vp_offset[0], ny * self.vp_scale[1] + self.vp_offset[1])
+        } else {
+            let (vw, vh) = self.viewport_dims();
+            ((nx + 1.0) * 0.5 * vw as f32, (1.0 - ny) * 0.5 * vh as f32)
         }
-        let pos_off = self.va_offset[VA_POSITION];
-        let pos_stride = (self.va_format[VA_POSITION] >> 8) & 0x00FF_FFFF;
-        let col_off = self.va_offset[VA_DIFFUSE];
+    }
+
+    /// Read vertex `index` from the configured arrays (attr0 position, attr3
+    /// diffuse) and return it as a screen-space vertex. Position may be 3- or
+    /// 4-component (the 4th is w for the perspective divide); colour comes from
+    /// the diffuse array if enabled, else the current diffuse register.
+    fn fetch_vertex(&self, ram: &[u8], index: u32) -> Vertex {
+        let pos_fmt = self.va_format[VA_POSITION];
+        let pos_size = (pos_fmt >> 4) & 0xF;
+        let pos_stride = (pos_fmt >> 8) & 0x00FF_FFFF;
+        let pb = self.va_offset[VA_POSITION].wrapping_add(index.wrapping_mul(pos_stride));
+        let x = f32::from_bits(rd32(ram, pb));
+        let y = f32::from_bits(rd32(ram, pb.wrapping_add(4)));
+        let w = if pos_size >= 4 { f32::from_bits(rd32(ram, pb.wrapping_add(12))) } else { 1.0 };
+        let (sx, sy) = self.project(x, y, w);
         let col_fmt = self.va_format[VA_DIFFUSE];
-        let col_stride = (col_fmt >> 8) & 0x00FF_FFFF;
-        for i in start..start.wrapping_add(count) {
-            let pb = pos_off.wrapping_add(i.wrapping_mul(pos_stride));
-            let x = f32::from_bits(rd32(ram, pb));
-            let y = f32::from_bits(rd32(ram, pb.wrapping_add(4)));
-            // NDC (-1..=1) → screen pixels (Y flipped: NDC +Y is up).
-            let sx = (x + 1.0) * 0.5 * vw as f32;
-            let sy = (1.0 - y) * 0.5 * vh as f32;
-            let color = if col_off != 0 && col_stride != 0 {
-                read_vertex_color(ram, col_off.wrapping_add(i.wrapping_mul(col_stride)), col_fmt)
-            } else {
-                self.vcolor
-            };
-            if self.verts.len() < 4096 {
-                self.verts.push(Vertex { x: sx, y: sy, color });
-            }
-        }
-        // Establish the surface so draw_primitives proceeds and scanout presents
-        // it even when the background clear was done on the CPU side.
+        let color = if self.va_offset[VA_DIFFUSE] != 0 && (col_fmt >> 4) & 0xF != 0 {
+            let stride = (col_fmt >> 8) & 0x00FF_FFFF;
+            read_vertex_color(ram, self.va_offset[VA_DIFFUSE].wrapping_add(index.wrapping_mul(stride)), col_fmt)
+        } else {
+            self.vcolor
+        };
+        Vertex { x: sx, y: sy, color }
+    }
+
+    /// Establish the surface so draw_primitives proceeds and scanout presents it
+    /// even when the background clear was done CPU-side.
+    fn mark_surface(&mut self) {
+        let (vw, vh) = self.viewport_dims();
         if self.width == 0 {
             self.width = vw;
         }
@@ -742,6 +782,30 @@ impl Nv2a {
             self.height = vh;
         }
         self.has_surface = true;
+    }
+
+    /// NV097_DRAW_ARRAYS: pull `count` sequential vertices from the arrays.
+    fn draw_arrays(&mut self, ram: &[u8], data: u32) {
+        let count = ((data >> 24) & 0xFF) + 1;
+        let start = data & 0x00FF_FFFF;
+        for i in start..start.wrapping_add(count) {
+            if self.verts.len() >= 4096 {
+                break;
+            }
+            let v = self.fetch_vertex(ram, i);
+            self.verts.push(v);
+        }
+        self.mark_surface();
+    }
+
+    /// NV097_ARRAY_ELEMENT16: append one indexed vertex from the arrays.
+    fn array_element(&mut self, ram: &[u8], index: u16) {
+        if self.verts.len() >= 4096 {
+            return;
+        }
+        let v = self.fetch_vertex(ram, index as u32);
+        self.verts.push(v);
+        self.mark_surface();
     }
 
     /// Rasterize the gathered vertices for the current primitive into the color
