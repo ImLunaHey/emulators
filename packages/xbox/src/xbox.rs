@@ -58,6 +58,11 @@ pub struct Xbox {
     /// Number of quick-reboot relaunches performed (XLaunchNewImage). Capped so a
     /// game stuck rebooting can't loop forever.
     reboots: u32,
+
+    /// Set once the GPU has drawn geometry at least once. After that, frames are
+    /// only re-scanned out when a draw landed (see `run_frame`), so a clear that
+    /// spans several presented frames doesn't flash black.
+    ever_drew: bool,
 }
 
 impl Default for Xbox {
@@ -84,6 +89,7 @@ impl Xbox {
             last_kernel_ordinal: None,
             nv2a: crate::nv2a::Nv2a::new(),
             reboots: 0,
+            ever_drew: false,
         }
     }
 
@@ -410,14 +416,25 @@ impl Xbox {
             if let Some((addr, pitch, w, h)) = crate::hle::take_display_mode() {
                 self.nv2a.set_display(addr, pitch, w, h);
             }
-            // If the GPU has produced a color surface, scan it out to the screen;
-            // otherwise show the live boot diagnostic.
-            if let Some((w, h)) = self.nv2a.scanout(&self.mem.ram[..], &mut self.gpu.framebuffer) {
-                self.gpu.display_w = w;
-                self.gpu.display_h = h;
-            } else {
-                let lines = self.boot_lines();
-                crash::render(&mut self.gpu, &lines);
+            // Present a *completed* frame only. With a small step budget the
+            // guest's clear→draw spans several presented frames, so scanning out
+            // every frame would catch the surface mid-clear (a black flash). Once
+            // the GPU has started drawing, only re-scan the surface on frames
+            // where a draw actually landed; otherwise hold the last complete
+            // frame. Before any draw (boot / CPU-only framebuffer games) present
+            // normally so those still show.
+            let drew = self.nv2a.take_drew();
+            if drew {
+                self.ever_drew = true;
+            }
+            if drew || !self.ever_drew {
+                if let Some((w, h)) = self.nv2a.scanout(&self.mem.ram[..], &mut self.gpu.framebuffer) {
+                    self.gpu.display_w = w;
+                    self.gpu.display_h = h;
+                } else {
+                    let lines = self.boot_lines();
+                    crash::render(&mut self.gpu, &lines);
+                }
             }
             self.gpu.frames = self.gpu.frames.wrapping_add(1);
             self.frames = self.frames.wrapping_add(1);

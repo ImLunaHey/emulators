@@ -189,6 +189,9 @@ pub struct Nv2a {
     // map). Lets a title drive the exact pixel mapping the GPU would.
     vp_scale: [f32; 4],
     vp_offset: [f32; 4],
+    /// Set when a draw rasterized since the last present (the host presents only
+    /// completed frames to avoid flashing a mid-clear surface).
+    drew_since_present: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -348,6 +351,7 @@ impl Nv2a {
             va_format: [0; 16],
             vp_scale: [0.0; 4],
             vp_offset: [0.0; 4],
+            drew_since_present: false,
         }
     }
 
@@ -851,6 +855,15 @@ impl Nv2a {
             pitch,
         };
         r::draw_triangles_screen(&mut target, None, &verts, prim, r::ShadeMode::Gouraud, None);
+        self.drew_since_present = true;
+    }
+
+    /// Whether a draw landed since the last present (consumed). The host uses
+    /// this to present only completed frames (see `Xbox::run_frame`).
+    pub fn take_drew(&mut self) -> bool {
+        let d = self.drew_since_present;
+        self.drew_since_present = false;
+        d
     }
 
     /// Fill the color surface's clip rect with the clear value, and adopt it as
