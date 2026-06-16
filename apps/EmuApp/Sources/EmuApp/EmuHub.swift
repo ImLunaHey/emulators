@@ -9,6 +9,10 @@ final class EmuHub: ObservableObject {
     @Published var title = ""
     @Published var systemLabel = ""
     @Published var controllerInfo = "No controller"
+    /// Most recent measured frames-per-second (updated ~4×/sec).
+    @Published var fps: Double = 0
+    /// Rolling FPS history for the on-screen graph (oldest first, ~last 6 s).
+    @Published var fpsHistory: [Double] = []
 
     private var emu: Emulator?
     private let input = InputManager()
@@ -102,11 +106,16 @@ final class EmuHub: ObservableObject {
             controllerInfo = info
         }
 
-        // Lightweight frame-rate diagnostic on stdout (once/sec).
+        // Frame-rate measurement — refresh the published value + graph history
+        // ~4×/sec so the on-screen counter is responsive but cheap.
         fpsAccum += 1
         let now = CACurrentMediaTime()
-        if now - fpsClock >= 1.0 {
-            FileHandle.standardError.write("emu: \(fpsAccum) fps, frame \(e.frameCount)\n".data(using: .utf8)!)
+        let dt = now - fpsClock
+        if dt >= 0.25 {
+            let measured = Double(fpsAccum) / dt
+            fps = measured
+            fpsHistory.append(measured)
+            if fpsHistory.count > 240 { fpsHistory.removeFirst(fpsHistory.count - 240) }
             fpsAccum = 0
             fpsClock = now
         }
