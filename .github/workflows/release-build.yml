@@ -1,6 +1,8 @@
-# Builds and attaches release artifacts. Runs ONLY when a GitHub Release is
-# published (release-please creates the release when its PR is merged), so the
-# heavy native/app builds never run on ordinary pushes/PRs.
+# Builds and attaches release artifacts. Invoked by release-please.yml right
+# after it creates a release — a release made with GITHUB_TOKEN does NOT emit a
+# `release: published` event, so we're called directly (workflow_call) rather
+# than triggering off the release event. Heavy native/app builds therefore only
+# run on a real release, never on ordinary pushes/PRs.
 #
 # Artifacts (native per OS, plus the cross-platform RetroArch core):
 #   - libretro core:  macOS universal .dylib, Linux .so, Windows .dll
@@ -9,8 +11,19 @@
 name: release-build
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to attach artifacts to (e.g. v0.1.1)
+        required: true
+        type: string
+  # Allow manual re-runs against an existing tag if a build needs retrying.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to attach artifacts to (e.g. v0.1.1)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,7 +40,7 @@ jobs:
           - { os: windows-latest, asset: emu_libretro-windows.dll }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -62,13 +75,14 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: ${{ matrix.asset }}
 
   emuapp-macos:
     name: macOS app (EmuApp)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
@@ -94,13 +108,14 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: EmuApp-macos.zip
 
   winapp-windows:
     name: Windows app (WinApp)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -131,4 +146,5 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           files: imlunahey-emulator-windows.zip
