@@ -6,11 +6,10 @@
     emu_native.dll (built from packages/native with crate-type cdylib).
 
     Build:
-      1) Build the DLL on Windows:
-           cd packages/native && cargo build --release
-         then copy target/release/emu_native.dll next to this .csproj
-         (or to the build output dir).
-      2) dotnet build -c Release   (or open in Visual Studio)
+      1) Build the DLL on Windows with a cargo release build in
+         packages/native, then copy target/release/emu_native.dll next to
+         this .csproj (or to the build output dir).
+      2) dotnet build (Release config), or open in Visual Studio.
   -->
 
   <PropertyGroup>
