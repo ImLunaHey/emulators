@@ -4,7 +4,7 @@
 // singleton so the Gamepad buttons can fire taps without threading a
 // prop through every control.
 
-const KEY = 'gba-recomp:haptics';
+const KEY = 'emulators:haptics';
 
 function load(): boolean {
   try { return localStorage.getItem(KEY) !== '0'; } catch { return true; }

@@ -4,7 +4,7 @@
 // by the library entry's id and preferred over the looked-up thumbnail
 // everywhere a cover is shown. Separate DB from ROMs/save-states.
 
-const DB_NAME = 'gba-recomp-covers';
+const DB_NAME = 'emulators-covers';
 const STORE = 'covers';
 
 function openDb(): Promise<IDBDatabase> {

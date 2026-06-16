@@ -6,9 +6,9 @@
 // storage. The user supplies their own ROMs; nothing is shipped from the server.
 import { ensureReadPermission } from './fsaccess';
 
-const DB_NAME = 'gba-recomp-roms';
+const DB_NAME = 'emulators-roms';
 const STORE = 'roms';
-const META_KEY = 'gba-recomp:selectedRom';
+const META_KEY = 'emulators:selectedRom';
 
 export interface RomMeta {
   id: string;             // unique slug derived from filename

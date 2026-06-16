@@ -5,7 +5,7 @@ import { useEffect, useReducer } from 'react';
 // the top of the library. Singleton + a thin hook (sync client state,
 // like padSelect/haptics — not TanStack Query territory).
 
-const KEY = 'gba-recomp:favorites';
+const KEY = 'emulators:favorites';
 
 function load(): Set<string> {
   try { return new Set(JSON.parse(localStorage.getItem(KEY) || '[]')); } catch { return new Set(); }

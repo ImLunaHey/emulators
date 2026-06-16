@@ -88,16 +88,16 @@ export function PlayerPage({ romId, onExit }: { romId: string; onExit: () => voi
   const [turbo, setTurbo] = useState(false);
   const effectiveSpeed = turbo ? Math.max(4, speed) : speed;
   // Persisted video/feature settings (localStorage-backed via the hook).
-  const [smooth, changeSmooth] = usePersistedBool('gba-recomp:smooth', false);
-  const [crt, changeCrt] = usePersistedBool('gba-recomp:crt', false);
-  const [colorCorrect, changeColorCorrect] = usePersistedBool('gba-recomp:colorcorrect', false);
-  const [autoResumeOn, changeAutoResume] = usePersistedBool('gba-recomp:autoresume', false);
+  const [smooth, changeSmooth] = usePersistedBool('emulators:smooth', false);
+  const [crt, changeCrt] = usePersistedBool('emulators:crt', false);
+  const [colorCorrect, changeColorCorrect] = usePersistedBool('emulators:colorcorrect', false);
+  const [autoResumeOn, changeAutoResume] = usePersistedBool('emulators:autoresume', false);
   // Turbo/autofire: bitmask of GBA keys that auto-fire while held.
-  const [turboMask, changeTurbo] = usePersistedNumber('gba-recomp:turbo', 0);
+  const [turboMask, changeTurbo] = usePersistedNumber('emulators:turbo', 0);
   useEffect(() => { emu.keypad.turboMask = turboMask; }, [emu, turboMask]);
   // Rewind: opt-in ring of recent savestates the user can scrub back
   // through. rewinding pauses the forward loop and drives frames from it.
-  const [rewindOn, setRewindOn] = usePersistedBool('gba-recomp:rewind', false);
+  const [rewindOn, setRewindOn] = usePersistedBool('emulators:rewind', false);
   const rewindBufRef = useRef<Uint8Array[]>([]);
   const [rewinding, setRewinding] = useState(false);
   const changeRewind = (v: boolean) => {
@@ -209,7 +209,7 @@ export function PlayerPage({ romId, onExit }: { romId: string; onExit: () => voi
     romBufRef.current = bytes;
     const title = new TextDecoder('ascii').decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '');
     const code = new TextDecoder('ascii').decode(bytes.subarray(0xAC, 0xB0));
-    const saveKey = `gba-recomp:save:${code}`;
+    const saveKey = `emulators:save:${code}`;
     saveKeyRef.current = saveKey;
     setHeaderInfo(`${title.trim()} · ${code}`);
     setCurrentRom({ id, filename: title, title, code, system: 'gba', size: bytes.length, addedAt: 0 });
@@ -790,7 +790,7 @@ export function PlayerPage({ romId, onExit }: { romId: string; onExit: () => voi
 
       <div className="w-full max-w-[720px] flex justify-end text-[10px] opacity-50 px-2">
         <a
-          href="https://github.com/ImLunaHey/gba-recomp/issues"
+          href="https://github.com/ImLunaHey/emulators/issues"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:opacity-100 hover:text-[var(--color-accent)]"

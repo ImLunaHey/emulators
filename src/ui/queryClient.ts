@@ -22,6 +22,6 @@ export const queryClient = new QueryClient({
 // orphans, swept by the cleanup pass in hasheous.ts.
 export const persister = createSyncStoragePersister({
   storage: typeof localStorage === 'undefined' ? undefined : localStorage,
-  key: 'gba-recomp:rq:v4',
+  key: 'emulators:rq:v4',
   throttleTime: 1000,
 });

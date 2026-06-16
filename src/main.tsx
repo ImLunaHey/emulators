@@ -16,7 +16,7 @@ createRoot(document.getElementById('root')!).render(
 // tsconfig uses an explicit `types` allowlist.)
 //
 // The dev host includes `*.localhost` — the `portless` proxy serves the app at
-// e.g. https://gba-recomp.localhost. A cache-first SW there intercepts Vite's
+// e.g. https://emulators.localhost. A cache-first SW there intercepts Vite's
 // `/@vite/client`, `/src/*.tsx`, `/@react-refresh` module requests and replays
 // stale/corrupt copies (NS_ERROR_CORRUPTED_CONTENT), so we must NOT register on
 // dev — and we proactively unregister any stale SW + drop its caches so a

@@ -1,5 +1,5 @@
 /*
- * Plain (framework-free) service worker for gba-recomp.
+ * Plain (framework-free) service worker for emulators.
  *
  * Strategy:
  *  - Precache the app shell on install so the app boots offline. We can't
@@ -18,7 +18,7 @@
  * cleaned up on activate.
  */
 const CACHE_VERSION = 'v2';
-const CACHE_NAME = `gba-recomp-${CACHE_VERSION}`;
+const CACHE_NAME = `emulators-${CACHE_VERSION}`;
 
 // Dev-host kill switch. The `portless` dev proxy serves the app at
 // `*.localhost`, where a cache-first SW intercepts Vite's `/@vite/client`,

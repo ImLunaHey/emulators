@@ -13,8 +13,8 @@
 const TARGET_AHEAD_S = 0.06;   // 60ms of buffered audio ahead of playback
 const MAX_AHEAD_S = 0.15;      // drop the queue if we get too far ahead
 
-const VOL_KEY = 'gba-recomp:volume';
-const MUTE_KEY = 'gba-recomp:muted';
+const VOL_KEY = 'emulators:volume';
+const MUTE_KEY = 'emulators:muted';
 
 export class AudioSink {
   ctx: AudioContext | null = null;

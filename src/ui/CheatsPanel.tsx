@@ -26,7 +26,7 @@ const normalizeName = (s: string) => s.replace(/\([^)]*\)/g, '').toLowerCase().r
 // game code so each ROM has its own list. We rehydrate here whenever a
 // new game is loaded — App passes the gameCode + current emu.cheats
 // array in and we hand back updates via onChange.
-const STORAGE_KEY_PREFIX = 'gba-recomp:cheats:';
+const STORAGE_KEY_PREFIX = 'emulators:cheats:';
 
 export function loadCheatsFor(code: string): Cheat[] {
   try {

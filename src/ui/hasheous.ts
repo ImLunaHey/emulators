@@ -85,23 +85,23 @@ export interface HasheousMeta {
 // occupy quota indefinitely.
 // Sweep any stale localStorage keys from the pre-TanStack era so they
 // don't sit forever in quota. The new caching layer lives in
-// queryClient.ts and persists under 'gba-recomp:rq:v1'.
+// queryClient.ts and persists under 'emulators:rq:v1'.
 (() => {
   try {
     const stale: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && (
-        k.startsWith('gba-recomp:hasheous:') ||
-        k.startsWith('gba-recomp:cover:') ||
-        k === 'gba-recomp:rq:v1' ||
-        k === 'gba-recomp:rq:v2'
+        k.startsWith('emulators:hasheous:') ||
+        k.startsWith('emulators:cover:') ||
+        k === 'emulators:rq:v1' ||
+        k === 'emulators:rq:v2'
       )) stale.push(k);
     }
     for (const k of stale) localStorage.removeItem(k);
     for (let i = 0; i < sessionStorage.length; i++) {
       const k = sessionStorage.key(i);
-      if (k && k.startsWith('gba-recomp:cover:')) sessionStorage.removeItem(k);
+      if (k && k.startsWith('emulators:cover:')) sessionStorage.removeItem(k);
     }
   } catch { /* private mode or storage disabled */ }
 })();

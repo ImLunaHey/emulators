@@ -1,6 +1,6 @@
 {
-  "name": "gba-recomp",
-  "short_name": "gba-recomp",
+  "name": "emulators",
+  "short_name": "emulators",
   "description": "A Game Boy Advance emulator that runs in your browser.",
   "display": "standalone",
   "orientation": "any",

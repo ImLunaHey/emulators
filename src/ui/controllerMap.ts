@@ -86,7 +86,7 @@ export const DEFAULT_SONY: Record<number, number> = {
   [Key.UP]: 14, [Key.DOWN]: 15, [Key.LEFT]: 16, [Key.RIGHT]: 17,
 };
 
-const STORAGE_KEY = 'gba-recomp:controllerMap';
+const STORAGE_KEY = 'emulators:controllerMap';
 
 export function loadMap(mapping: string): Record<number, number> {
   try {

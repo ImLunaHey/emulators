@@ -5,7 +5,7 @@
 // slot grid UI. Kept in a separate DB from the ROM library so neither
 // has to version-bump the other.
 
-const DB_NAME = 'gba-recomp-states';
+const DB_NAME = 'emulators-states';
 const STORE = 'states';
 
 export interface StateMeta {

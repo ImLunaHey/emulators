@@ -5,7 +5,7 @@
 // is observable so the Controller panel and the input poller stay in
 // sync without prop-drilling.
 
-const KEY = 'gba-recomp:activePad';
+const KEY = 'emulators:activePad';
 
 let activeId: string | null = (() => {
   try { return localStorage.getItem(KEY); } catch { return null; }

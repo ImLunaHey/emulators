@@ -23,7 +23,7 @@ export const DEFAULT_KEYBOARD_MAP: Record<number, string> = {
   [Key.SELECT]: 'Shift',
 };
 
-const STORAGE_KEY = 'gba-recomp:keymap';
+const STORAGE_KEY = 'emulators:keymap';
 
 // Persisted GBA-key → keyboard-key map (or defaults if none/corrupt).
 export function loadKeyboardMapRaw(): Record<number, string> {
