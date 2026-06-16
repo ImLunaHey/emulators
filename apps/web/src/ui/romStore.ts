@@ -105,7 +105,7 @@ export async function addRom(
   // caller (e.g. the NDS banner) and passed in via opts.title.
   if (system === 'gba') {
     const dec = new TextDecoder('ascii');
-    const t = dec.decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '').trim();
+    const t = dec.decode(bytes.subarray(0xA0, 0xAC)).replaceAll('\0', '').trim();
     code = dec.decode(bytes.subarray(0xAC, 0xB0));
     if (!title) title = t;
   }

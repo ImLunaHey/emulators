@@ -207,7 +207,7 @@ export function PlayerPage({ romId, onExit }: { romId: string; onExit: () => voi
       return;
     }
     romBufRef.current = bytes;
-    const title = new TextDecoder('ascii').decode(bytes.subarray(0xA0, 0xAC)).replace(/\0/g, '');
+    const title = new TextDecoder('ascii').decode(bytes.subarray(0xA0, 0xAC)).replaceAll('\0', '');
     const code = new TextDecoder('ascii').decode(bytes.subarray(0xAC, 0xB0));
     const saveKey = `emulators:save:${code}`;
     saveKeyRef.current = saveKey;

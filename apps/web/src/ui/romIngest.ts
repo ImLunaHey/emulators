@@ -115,7 +115,7 @@ export async function ingestHandles(handles: FileSystemFileHandle[]): Promise<In
         // Header lives in the first 0xB0 bytes — read just that slice.
         const head = new Uint8Array(await file.slice(0, 0xB0).arrayBuffer());
         const dec = new TextDecoder('ascii');
-        opts.title = dec.decode(head.subarray(0xA0, 0xAC)).replace(/\0/g, '').trim() || undefined;
+        opts.title = dec.decode(head.subarray(0xA0, 0xAC)).replaceAll('\0', '').trim() || undefined;
         opts.code = dec.decode(head.subarray(0xAC, 0xB0));
       } else if (system === 'nds' && file.size <= NDS_PARSE_LIMIT) {
         // The NDS banner decoder indexes into the whole ROM; only small enough.

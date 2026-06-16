@@ -308,7 +308,6 @@ function TilesView({ emu }: { emu: Emulator }) {
 
 function SpritesView({ emu }: { emu: Emulator }) {
   useLiveTick(15);
-  const SHAPE_NAMES = ['SQR', 'WIDE', 'TALL', '???'];
   const SIZES = [
     [[8, 8], [16, 16], [32, 32], [64, 64]],
     [[16, 8], [32, 8], [32, 16], [64, 32]],

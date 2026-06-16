@@ -21,7 +21,7 @@ export function getGbaColorLut(): Uint32Array {
     const lr = Math.pow(r5 / 31, lcdGamma);
     const lg = Math.pow(g5 / 31, lcdGamma);
     const lb = Math.pow(b5 / 31, lcdGamma);
-    const r = Math.pow(Math.min(1, (255 * lr + 50 * lg + 0 * lb) / 255), 1 / outGamma);
+    const r = Math.pow(Math.min(1, (255 * lr + 50 * lg) / 255), 1 / outGamma);
     const g = Math.pow(Math.min(1, (10 * lr + 230 * lg + 30 * lb) / 255), 1 / outGamma);
     const b = Math.pow(Math.min(1, (50 * lr + 10 * lg + 220 * lb) / 255), 1 / outGamma);
     const r8 = Math.round(r * 255);
