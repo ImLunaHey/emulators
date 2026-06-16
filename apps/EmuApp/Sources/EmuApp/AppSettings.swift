@@ -18,6 +18,8 @@ final class AppSettings: ObservableObject {
         case scale2x
         /// EPX/Scale3x — triples resolution.
         case scale3x
+        /// MetalFX spatial upscale (GPU, Apple's high-quality scaler).
+        case metalfx
 
         var id: String { rawValue }
         var label: String {
@@ -27,6 +29,7 @@ final class AppSettings: ObservableObject {
             case .smooth: return "Smooth (bilinear)"
             case .scale2x: return "Scale2× (EPX)"
             case .scale3x: return "Scale3× (EPX)"
+            case .metalfx: return "MetalFX (HD)"
             }
         }
         /// EPX upscale factor (1 = no algorithm, just filtering).
@@ -43,19 +46,31 @@ final class AppSettings: ObservableObject {
         var integer: Bool { self == .pixelPerfect }
     }
 
-    /// A retro display overlay drawn on top of the game.
+    /// A retro display shader applied by the Metal renderer.
     enum VideoEffect: String, CaseIterable, Identifiable {
         case none
         case scanlines
         case crt
+        case crtCurved
         case lcd
         var id: String { rawValue }
         var label: String {
             switch self {
             case .none: return "None"
             case .scanlines: return "Scanlines"
-            case .crt: return "CRT"
+            case .crt: return "CRT (flat)"
+            case .crtCurved: return "CRT (curved)"
             case .lcd: return "LCD Grid"
+            }
+        }
+        /// The integer code passed to the fragment shader.
+        var shaderCode: Int32 {
+            switch self {
+            case .none: return 0
+            case .scanlines: return 1
+            case .crt: return 2
+            case .crtCurved: return 3
+            case .lcd: return 4
             }
         }
     }

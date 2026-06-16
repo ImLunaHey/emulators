@@ -1,163 +1,302 @@
-import AppKit
+import MetalFX
+import MetalKit
 import SwiftUI
 
-/// A layer-backed NSView whose `content` layer the render loop writes CGImages
-/// into. Nearest-neighbour by default, aspect-fit, black letterbox. An optional
-/// `effect` overlay layer adds a retro look (scanlines / CRT / LCD grid) on top.
-final class ScreenNSView: NSView {
-    let content = CALayer()
-    /// Static retro-effect overlay above the game; regenerated only on resize or
-    /// effect change (not per frame), so it's cheap.
-    private let effect = CALayer()
-    private var effectKind: AppSettings.VideoEffect = .none
-    /// Snap the picture to an integer multiple of its source size (pixel-perfect).
+// Uniforms shared with the fragment shader. Field order/layout must match the
+// `Uniforms` struct in `shaderSource` below.
+private struct ScreenUniforms {
+    var rectOrigin = SIMD2<Float>(0, 0) // game area within the drawable (0…1)
+    var rectSize = SIMD2<Float>(1, 1)
+    var sourceSize = SIMD2<Float>(1, 1) // game texture size in pixels
+    var outputSize = SIMD2<Float>(1, 1) // drawable size in pixels
+    var effect: Int32 = 0               // 0 none,1 scanlines,2 crt,3 curved,4 lcd
+    var flags: Int32 = 0                // reserved
+    var curvature: Float = 0.10
+    var scanline: Float = 0.30
+    var mask: Float = 0.18
+    var vignette: Float = 0.30
+}
+
+// Embedded Metal shaders: a fullscreen triangle, then a fragment that maps the
+// drawable to the game area and applies the selected retro effect (curved CRT
+// with scanlines + aperture mask + vignette, flat CRT, scanlines, or LCD grid).
+private let shaderSource = """
+#include <metal_stdlib>
+using namespace metal;
+
+struct Uniforms {
+    float2 rectOrigin;
+    float2 rectSize;
+    float2 sourceSize;
+    float2 outputSize;
+    int effect;
+    int flags;
+    float curvature;
+    float scanline;
+    float mask;
+    float vignette;
+};
+
+struct VSOut { float4 pos [[position]]; float2 uv; };
+
+vertex VSOut screen_vtx(uint vid [[vertex_id]]) {
+    float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VSOut o;
+    o.pos = float4(p[vid], 0.0, 1.0);
+    float2 uv = p[vid] * 0.5 + 0.5;
+    o.uv = float2(uv.x, 1.0 - uv.y); // flip Y to image space
+    return o;
+}
+
+fragment float4 screen_frag(VSOut in [[stage_in]],
+                            texture2d<float> tex [[texture(0)]],
+                            sampler smp [[sampler(0)]],
+                            constant Uniforms& u [[buffer(0)]]) {
+    // Map drawable uv -> game uv (0..1 over the centred game area).
+    float2 g = (in.uv - u.rectOrigin) / u.rectSize;
+
+    // Barrel-distort for the curved tube.
+    if (u.effect == 3) {
+        float2 c = g * 2.0 - 1.0;            // -1..1
+        c += c * (dot(c, c)) * u.curvature;  // pull the corners outward
+        g = c * 0.5 + 0.5;
+    }
+
+    // Outside the (warped) screen = black bezel.
+    if (g.x < 0.0 || g.x > 1.0 || g.y < 0.0 || g.y > 1.0) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float3 col = tex.sample(smp, g).rgb;
+
+    // Scanlines (1 scanlines, 2 crt, 3 curved).
+    if (u.effect == 1 || u.effect == 2 || u.effect == 3) {
+        float s = 0.5 + 0.5 * cos(g.y * u.sourceSize.y * 6.2831853);
+        col *= mix(1.0 - u.scanline, 1.0, s);
+    }
+    // Aperture/shadow mask in screen space (2 crt, 3 curved).
+    if (u.effect == 2 || u.effect == 3) {
+        int col3 = int(in.uv.x * u.outputSize.x) % 3;
+        float3 m = float3(1.0 - u.mask);
+        m[col3] = 1.0;
+        col *= m;
+        // Vignette toward the edges.
+        float2 d = g - 0.5;
+        col *= 1.0 - u.vignette * dot(d, d) * 2.2;
+    }
+    // LCD dot-matrix grid (4).
+    if (u.effect == 4) {
+        float2 px = fract(g * u.sourceSize);
+        float grid = step(0.12, px.x) * step(0.12, px.y);
+        col *= mix(0.78, 1.0, grid);
+    }
+
+    return float4(col, 1.0);
+}
+"""
+
+/// Metal-backed game screen. The render loop hands raw RGBA frames to
+/// `updateFrame`; we upload them to a texture and draw a fullscreen pass with
+/// the retro-effect shader. Optionally upscales via MetalFX first.
+final class MetalScreenView: MTKView, MTKViewDelegate {
+    private let queue: MTLCommandQueue
+    private var pipeline: MTLRenderPipelineState!
+    private var nearest: MTLSamplerState!
+    private var linear: MTLSamplerState!
+
+    private var source: MTLTexture?       // current game frame
+    private var sourceSize = CGSize.zero
+
+    // Config (set by `setVideo`).
+    private var smooth = false
     private var integer = false
-    /// Size of the most recently presented frame, for integer snapping.
-    private var sourceSize: CGSize = .zero
+    private var effect: AppSettings.VideoEffect = .none
+    private var useMetalFX = false
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setup()
-    }
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setup()
-    }
+    // MetalFX spatial upscaler (lazily (re)built for the current source size).
+    private var fx: Any?                   // MTLFXSpatialScaler (typed via #available)
+    private var fxOutput: MTLTexture?
+    private var fxInputSize = CGSize.zero
 
-    private func setup() {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        content.magnificationFilter = .nearest
-        content.minificationFilter = .linear
-        content.contentsGravity = .resizeAspect
-        // No implicit fade when the frame image is swapped.
-        content.actions = ["contents": NSNull(), "frame": NSNull(), "bounds": NSNull()]
-        layer?.addSublayer(content)
-
-        effect.contentsGravity = .resize
-        effect.zPosition = 1
-        effect.actions = ["contents": NSNull(), "frame": NSNull(), "bounds": NSNull()]
-        layer?.addSublayer(effect)
+    init() {
+        guard let dev = MTLCreateSystemDefaultDevice(),
+              let q = dev.makeCommandQueue() else { fatalError("Metal is required") }
+        queue = q
+        super.init(frame: .zero, device: dev)
+        colorPixelFormat = .bgra8Unorm
+        framebufferOnly = true
+        isPaused = true                    // we drive draws from the render loop
+        enableSetNeedsDisplay = false
+        autoResizeDrawable = true
+        delegate = self
+        layer?.isOpaque = true
+        _ = buildPipeline(dev)             // best-effort; draw() guards on pipeline
     }
 
-    override func layout() {
-        super.layout()
-        effect.frame = bounds
-        layoutContent()
-        regenerateEffect()
+    required init(coder: NSCoder) { fatalError("not used") }
+
+    @discardableResult
+    private func buildPipeline(_ dev: MTLDevice) -> Bool {
+        do {
+            let lib = try dev.makeLibrary(source: shaderSource, options: nil)
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = lib.makeFunction(name: "screen_vtx")
+            desc.fragmentFunction = lib.makeFunction(name: "screen_frag")
+            desc.colorAttachments[0].pixelFormat = colorPixelFormat
+            pipeline = try dev.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            NSLog("MetalScreen: pipeline build failed: \(error)")
+            return false
+        }
+        let mk: (MTLSamplerMinMagFilter) -> MTLSamplerState? = { f in
+            let s = MTLSamplerDescriptor()
+            s.minFilter = f; s.magFilter = f
+            s.sAddressMode = .clampToEdge; s.tAddressMode = .clampToEdge
+            return dev.makeSamplerState(descriptor: s)
+        }
+        guard let n = mk(.nearest), let l = mk(.linear) else { return false }
+        nearest = n; linear = l
+        return true
     }
 
-    /// The render loop hands each frame here so we can integer-snap the layer to
-    /// the image's pixel grid when pixel-perfect mode is on.
-    func present(_ image: CGImage) {
-        sourceSize = CGSize(width: image.width, height: image.height)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        content.contents = image
-        layoutContent()
-        CATransaction.commit()
-    }
-
-    /// Apply the scaling filter (smooth vs nearest), integer snapping, and the
-    /// retro overlay.
-    func setVideo(smooth: Bool, integer: Bool, effect kind: AppSettings.VideoEffect) {
-        content.magnificationFilter = smooth ? .linear : .nearest
+    /// Apply video settings (filter, integer snapping, effect, MetalFX).
+    func setVideo(smooth: Bool, integer: Bool, effect: AppSettings.VideoEffect, metalFX: Bool) {
+        self.smooth = smooth
         self.integer = integer
-        if kind != effectKind {
-            effectKind = kind
-            regenerateEffect()
-        }
-        layoutContent()
+        self.effect = effect
+        self.useMetalFX = metalFX
+        draw() // redraw with the new look even if paused
     }
 
-    /// Position the game layer: integer-snapped + centered when pixel-perfect,
-    /// otherwise aspect-fit to the whole view.
-    private func layoutContent() {
-        guard bounds.width > 0, bounds.height > 0 else { return }
-        if integer, sourceSize.width > 0, sourceSize.height > 0 {
-            let s = max(1, floor(min(bounds.width / sourceSize.width,
-                                     bounds.height / sourceSize.height)))
-            let w = sourceSize.width * s
-            let h = sourceSize.height * s
-            content.contentsGravity = .resize
-            content.frame = CGRect(x: ((bounds.width - w) / 2).rounded(),
-                                   y: ((bounds.height - h) / 2).rounded(),
-                                   width: w, height: h)
+    /// Upload the latest RGBA8888 frame and draw it.
+    func updateFrame(_ bytes: UnsafeRawPointer, width: Int, height: Int) {
+        guard let dev = device else { return }
+        if source == nil || Int(sourceSize.width) != width || Int(sourceSize.height) != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+            d.usage = [.shaderRead]
+            source = dev.makeTexture(descriptor: d)
+            sourceSize = CGSize(width: width, height: height)
+        }
+        source?.replace(
+            region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
+            withBytes: bytes, bytesPerRow: width * 4)
+        draw()
+    }
+
+    // MTKViewDelegate
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        guard let pipeline,
+              let src = source,
+              let drawable = currentDrawable,
+              let pass = currentRenderPassDescriptor,
+              let cmd = queue.makeCommandBuffer()
+        else { return }
+
+        // Pick the texture the shader samples: MetalFX-upscaled, or the source.
+        let sampleTex = metalFXOutput(for: src, in: cmd) ?? src
+
+        var u = uniforms(for: sampleTex)
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: pass) {
+            enc.setRenderPipelineState(pipeline)
+            enc.setFragmentTexture(sampleTex, index: 0)
+            enc.setFragmentSamplerState(smooth ? linear : nearest, index: 0)
+            enc.setFragmentBytes(&u, length: MemoryLayout<ScreenUniforms>.stride, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            enc.endEncoding()
+        }
+        cmd.present(drawable)
+        cmd.commit()
+    }
+
+    private func uniforms(for sampleTex: MTLTexture) -> ScreenUniforms {
+        var u = ScreenUniforms()
+        let out = CGSize(width: bounds.width * (window?.backingScaleFactor ?? 2),
+                         height: bounds.height * (window?.backingScaleFactor ?? 2))
+        u.outputSize = SIMD2(Float(out.width), Float(out.height))
+        u.sourceSize = SIMD2(Float(sampleTex.width), Float(sampleTex.height))
+        u.effect = effect.shaderCode
+        if effect != .crtCurved { u.curvature = 0 }
+
+        // Fit the game into the drawable: integer-snapped or aspect-fit.
+        let sw = sourceSize.width, sh = sourceSize.height
+        guard sw > 0, sh > 0, out.width > 0, out.height > 0 else { return u }
+        var dispW: CGFloat, dispH: CGFloat
+        if integer {
+            let k = max(1, floor(min(out.width / sw, out.height / sh)))
+            dispW = sw * k; dispH = sh * k
         } else {
-            content.contentsGravity = .resizeAspect
-            content.frame = bounds
-        }
-    }
-
-    private func regenerateEffect() {
-        let scale = window?.backingScaleFactor ?? 2
-        effect.contentsScale = scale
-        effect.contents = Self.effectImage(effectKind, size: bounds.size, scale: scale)
-    }
-
-    /// Build the overlay pattern (or nil for `.none`) at device resolution.
-    private static func effectImage(_ kind: AppSettings.VideoEffect, size: CGSize, scale: CGFloat) -> CGImage? {
-        guard kind != .none, size.width > 1, size.height > 1 else { return nil }
-        let w = Int(size.width * scale)
-        let h = Int(size.height * scale)
-        let cs = CGColorSpaceCreateDeviceRGB()
-        guard w > 0, h > 0,
-              let ctx = CGContext(
-                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
-
-        let lineH = max(1, Int(scale))          // ~1pt line
-        let pitch = max(2, Int(3 * scale))      // every ~3pt
-
-        switch kind {
-        case .none:
-            break
-        case .scanlines, .crt:
-            ctx.setFillColor(CGColor(gray: 0, alpha: 0.35))
-            var y = 0
-            while y < h { ctx.fill(CGRect(x: 0, y: y, width: w, height: lineH)); y += pitch }
-            if kind == .crt {
-                // Darken the corners for a tube vignette.
-                let colors = [CGColor(gray: 0, alpha: 0), CGColor(gray: 0, alpha: 0.55)] as CFArray
-                if let grad = CGGradient(colorsSpace: cs, colors: colors, locations: [0.55, 1.0]) {
-                    let c = CGPoint(x: w / 2, y: h / 2)
-                    ctx.drawRadialGradient(
-                        grad, startCenter: c, startRadius: 0,
-                        endCenter: c, endRadius: CGFloat(max(w, h)) * 0.72, options: [])
-                }
+            let srcAspect = sw / sh
+            if out.width / out.height > srcAspect {
+                dispH = out.height; dispW = out.height * srcAspect
+            } else {
+                dispW = out.width; dispH = out.width / srcAspect
             }
-        case .lcd:
-            // Faint dot-matrix grid (horizontal + vertical lines).
-            ctx.setFillColor(CGColor(gray: 0, alpha: 0.22))
-            var y = 0
-            while y < h { ctx.fill(CGRect(x: 0, y: y, width: w, height: lineH)); y += pitch }
-            var x = 0
-            while x < w { ctx.fill(CGRect(x: x, y: 0, width: lineH, height: h)); x += pitch }
         }
-        return ctx.makeImage()
+        let rsx = Float(dispW / out.width), rsy = Float(dispH / out.height)
+        u.rectSize = SIMD2(rsx, rsy)
+        u.rectOrigin = SIMD2((1 - rsx) / 2, (1 - rsy) / 2)
+        return u
+    }
+
+    // Build/run a MetalFX spatial upscale to 3× when enabled. Returns nil to use
+    // the source unchanged (disabled, unsupported, or on any failure).
+    private func metalFXOutput(for src: MTLTexture, in cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard useMetalFX, let dev = device else { return nil }
+        if #available(macOS 13.0, *) {
+            let outW = src.width * 3, outH = src.height * 3
+            if fx == nil || fxInputSize != sourceSize || fxOutput?.width != outW {
+                let d = MTLFXSpatialScalerDescriptor()
+                d.inputWidth = src.width; d.inputHeight = src.height
+                d.outputWidth = outW; d.outputHeight = outH
+                d.colorTextureFormat = .rgba8Unorm
+                d.outputTextureFormat = .rgba8Unorm
+                d.colorProcessingMode = .perceptual
+                guard let scaler = d.makeSpatialScaler(device: dev) else { return nil }
+                fx = scaler
+                fxInputSize = sourceSize
+                let td = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .rgba8Unorm, width: outW, height: outH, mipmapped: false)
+                td.usage = [.shaderRead, .renderTarget]
+                td.storageMode = .private
+                fxOutput = dev.makeTexture(descriptor: td)
+            }
+            guard let scaler = fx as? MTLFXSpatialScaler, let outTex = fxOutput else { return nil }
+            scaler.colorTexture = src
+            scaler.outputTexture = outTex
+            scaler.encode(commandBuffer: cmd)
+            return outTex
+        }
+        return nil
     }
 }
 
-/// SwiftUI wrapper that hands its content layer to the hub's render loop and
-/// applies the current video settings (filter + retro effect).
+/// SwiftUI wrapper that hands the Metal view to the hub's render loop and keeps
+/// the current video settings applied.
 struct ScreenView: NSViewRepresentable {
     let hub: EmuHub
     @EnvironmentObject var settings: AppSettings
 
-    func makeNSView(context: Context) -> ScreenNSView {
-        let v = ScreenNSView()
+    func makeNSView(context: Context) -> MetalScreenView {
+        let v = MetalScreenView()
         hub.attach(screen: v)
-        v.setVideo(smooth: settings.upscale.smoothFilter,
-                   integer: settings.upscale.integer,
-                   effect: settings.videoEffect)
+        apply(v)
         return v
     }
 
-    func updateNSView(_ nsView: ScreenNSView, context: Context) {
-        nsView.setVideo(smooth: settings.upscale.smoothFilter,
-                        integer: settings.upscale.integer,
-                        effect: settings.videoEffect)
+    func updateNSView(_ nsView: MetalScreenView, context: Context) {
+        apply(nsView)
+    }
+
+    private func apply(_ v: MetalScreenView) {
+        v.setVideo(smooth: settings.upscale.smoothFilter,
+                   integer: settings.upscale.integer,
+                   effect: settings.videoEffect,
+                   metalFX: settings.upscale == .metalfx)
     }
 }

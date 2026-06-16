@@ -21,9 +21,8 @@ final class EmuHub: ObservableObject {
     private var audio: AudioPlayer?
     private var timer: Timer?
     private var keyMonitor: Any?
-    private weak var screenView: ScreenNSView?
+    private weak var screenView: MetalScreenView?
     private var audioBuf = [Float](repeating: 0, count: 16_384)
-    private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private let upscaler = Upscaler()
     private var lastControllerInfo = ""
     private var fpsAccum = 0
@@ -46,7 +45,7 @@ final class EmuHub: ObservableObject {
     /// The view hosting our screen layer; used to tell whether this window is the
     /// key window (so only the focused game consumes input when several run).
     private weak var hostView: NSView?
-    func attach(screen: ScreenNSView) {
+    func attach(screen: MetalScreenView) {
         screenView = screen
         hostView = screen
     }
@@ -194,28 +193,18 @@ final class EmuHub: ObservableObject {
         let h = e.height
         guard w > 0, h > 0 else { return }
         let factor = settings?.upscale.factor ?? 1
-        let image: CGImage? = e.withFramebuffer { ptr, len in
-            guard let ptr, len == w * h * 4 else { return nil }
-            // Optionally run a pixel-art upscaler first (Scale2x/Scale3x).
+        e.withFramebuffer { ptr, len in
+            guard let ptr, len == w * h * 4 else { return }
+            // Optionally run a CPU pixel-art upscaler first (Scale2x/Scale3x);
+            // otherwise hand the raw frame to the Metal view (which does its own
+            // filtering / MetalFX / retro-effect shading).
             if factor > 1, let (buf, ow, oh) = upscaler.scale(ptr, w: w, h: h, factor: factor),
                let base = buf.baseAddress {
-                return makeImage(UnsafeRawPointer(base), byteCount: ow * oh * 4, w: ow, h: oh)
+                screenView?.updateFrame(UnsafeRawPointer(base), width: ow, height: oh)
+            } else {
+                screenView?.updateFrame(UnsafeRawPointer(ptr), width: w, height: h)
             }
-            return makeImage(UnsafeRawPointer(ptr), byteCount: len, w: w, h: h)
         }
-        if let image { screenView?.present(image) }
-    }
-
-    /// Build an RGBA8888 CGImage from a pixel buffer (copies it, since the
-    /// source is only valid until the next frame / upscale).
-    private func makeImage(_ bytes: UnsafeRawPointer, byteCount: Int, w: Int, h: Int) -> CGImage? {
-        let data = Data(bytes: bytes, count: byteCount)
-        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
-        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-        return CGImage(
-            width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: w * 4, space: colorSpace, bitmapInfo: info,
-            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
     private func installKeyMonitor() {
