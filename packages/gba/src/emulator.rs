@@ -93,6 +93,13 @@ pub struct Gba {
     /// exception storm). While set, [`Gba::run_frame`] freezes the CPU and
     /// re-presents the crash screen every frame.
     pub fault: Option<Fault>,
+
+    // Resumable-frame state for `run_slice` (the duo/local-link path). A frame
+    // may be run across several `run_slice` calls when it pauses mid-frame on a
+    // link transfer; these persist the per-frame bookkeeping (turbo tick +
+    // exception baseline) so it runs once per frame, not once per slice.
+    frame_in_progress: bool,
+    exc_before: u64,
 }
 
 impl Default for Gba {
@@ -135,6 +142,8 @@ impl Gba {
             watch: None,
             watch_log: Vec::new(),
             fault: None,
+            frame_in_progress: false,
+            exc_before: 0,
         }
     }
 
@@ -268,24 +277,62 @@ impl Gba {
 
     // ---- the frame loop (ported from emulator.ts runFrame, interpreter-only) ----
     pub fn run_frame(&mut self) {
+        // Non-pausing: run whole slices until the visual frame completes. With
+        // `pause_on_link = false` this is byte-for-byte the old behavior — a
+        // parked master link transfer just waits out the frame as before (the
+        // WebRTC path + single-player rely on this), and the loop runs exactly
+        // one frame because `frame_done` fires at the frame boundary.
+        loop {
+            let (_, frame_done, _) = self.run_slice_inner(CYCLES_PER_FRAME, false);
+            if frame_done {
+                break;
+            }
+        }
+    }
+
+    /// Run up to `max_cycles` CPU cycles of the *current* frame, pausing early
+    /// when a master link transfer parks awaiting the host. Returns
+    /// `(cycles_ran, frame_done, paused_on_link)`:
+    ///   - `frame_done`  — the visual frame completed (post-frame work ran); the
+    ///                     next call starts a fresh frame.
+    ///   - `paused_on_link` — a multiplay transfer kicked off and is waiting for
+    ///                     `deliver_multiplay`. Resolve the exchange, then call
+    ///                     again to resume the same frame.
+    /// Frame state persists across calls, so a synchronous local-link host (the
+    /// duo view) can interleave two cores slice-by-slice and feed each transfer
+    /// within the frame the game expects it — instead of the one-transfer-per-
+    /// frame cadence that starves the slave's link watchdog.
+    pub fn run_slice(&mut self, max_cycles: u32) -> (u32, bool, bool) {
+        self.run_slice_inner(max_cycles, true)
+    }
+
+    fn run_slice_inner(&mut self, max_cycles: u32, pause_on_link: bool) -> (u32, bool, bool) {
         // Once faulted, freeze: keep presenting the crash screen, run no code.
+        // Report a completed frame so non-pausing callers don't spin.
         if self.fault.is_some() {
             self.present_crash();
-            return;
+            self.frame_in_progress = false;
+            return (0, true, false);
         }
 
-        self.keypad.tick_turbo();
-        let exc_before = self.cpu.exceptions;
-        // Take the CPU out once for the whole frame so `self` can serve as its
-        // bus inside the batch loop. Nothing reachable between batches (PPU /
-        // timers / DMA / SIO / cheats) touches `self.cpu`, so a single
-        // take/restore replaces the per-batch swap (~4400 struct copies/frame).
+        // Per-frame setup runs once, on the first slice of a frame.
+        if !self.frame_in_progress {
+            self.keypad.tick_turbo();
+            self.exc_before = self.cpu.exceptions;
+            self.frame_in_progress = true;
+        }
+
+        // Take the CPU out for this slice so `self` can serve as its bus inside
+        // the batch loop. (Resumable frames take/restore per slice rather than
+        // once per frame; slices are many batches, so the overhead is small.)
         let mut cpu = std::mem::take(&mut self.cpu);
-        let mut executed: u32 = 0;
-        while executed < CYCLES_PER_FRAME {
+        let mut ran: u32 = 0;
+        let mut frame_done = false;
+        let mut paused = false;
+        while ran < max_cycles {
             let line_remaining = CYC_PER_LINE - self.ppu.cycles_accum as i64;
             let mut batch = if line_remaining < 64 { line_remaining } else { 64 };
-            let rem = (CYCLES_PER_FRAME - executed) as i64;
+            let rem = (max_cycles - ran) as i64;
             if batch > rem {
                 batch = rem;
             }
@@ -332,36 +379,47 @@ impl Gba {
             self.sound.step(i as i32);
             self.sio.step(i as i32, &mut self.irq);
 
-            executed += i;
+            ran += i;
             if self.ppu.frame_done {
                 self.ppu.frame_done = false;
+                frame_done = true;
+                break;
+            }
+            // Pause the moment a master multiplay transfer parks: the host must
+            // resolve it (and, in the duo, feed the slave) before we resume.
+            if pause_on_link && self.sio.awaiting_link() {
+                paused = true;
                 break;
             }
         }
         // Restore the frame-scoped CPU before any post-frame work that reads it.
         self.cpu = cpu;
 
-        // BIOS IntrCheck flag: set bit 0 of *(u16*)0x03007FF8 each VBlank.
-        self.mem.iwram[0x7FF8] |= 0x01;
+        if frame_done {
+            // BIOS IntrCheck flag: set bit 0 of *(u16*)0x03007FF8 each VBlank.
+            self.mem.iwram[0x7FF8] |= 0x01;
 
-        // Re-apply enabled cheats once per frame (after the game updated RAM).
-        if !self.cheats.is_empty() {
-            let cheats = std::mem::take(&mut self.cheats);
-            apply_cheats(self, &cheats);
-            self.cheats = cheats;
-        }
+            // Re-apply enabled cheats once per frame (after the game updated RAM).
+            if !self.cheats.is_empty() {
+                let cheats = std::mem::take(&mut self.cheats);
+                apply_cheats(self, &cheats);
+                self.cheats = cheats;
+            }
 
-        // Fault-loop detection: a storm of undefined-instruction / abort
-        // exceptions this frame means the CPU is wedged re-faulting; capture the
-        // cause and switch to the crash screen (presented now and every frame
-        // hereafter).
-        if self.cpu.exceptions.wrapping_sub(exc_before) > FAULT_THRESHOLD {
-            self.fault = Some(Fault {
-                pc: self.cpu.last_exc_pc,
-                kind: self.cpu.last_exc_kind,
-            });
-            self.present_crash();
+            // Fault-loop detection: a storm of undefined-instruction / abort
+            // exceptions this frame means the CPU is wedged re-faulting; capture
+            // the cause and switch to the crash screen (presented now and every
+            // frame hereafter).
+            if self.cpu.exceptions.wrapping_sub(self.exc_before) > FAULT_THRESHOLD {
+                self.fault = Some(Fault {
+                    pc: self.cpu.last_exc_pc,
+                    kind: self.cpu.last_exc_kind,
+                });
+                self.present_crash();
+            }
+            self.frame_in_progress = false;
         }
+        (ran, frame_done, paused)
     }
 
     /// Draw the crash screen into the PPU framebuffer from the latched

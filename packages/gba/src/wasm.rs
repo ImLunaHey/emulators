@@ -31,6 +31,24 @@ impl WasmGba {
         self.inner.run_frame();
     }
 
+    /// Resumable frame runner for the synchronous local-link (duo) path. Runs up
+    /// to `max_cycles` of the current frame and returns a status:
+    ///   0 = slice exhausted (frame not done, no pending transfer) — call again
+    ///   1 = visual frame completed — start the next frame
+    ///   2 = paused on a pending master link transfer — resolve it, then resume
+    /// Lets the host interleave two cores slice-by-slice so each multiplay
+    /// transfer is exchanged within the frame the game expects it.
+    pub fn run_slice(&mut self, max_cycles: u32) -> u32 {
+        let (_, frame_done, paused) = self.inner.run_slice(max_cycles);
+        if frame_done {
+            1
+        } else if paused {
+            2
+        } else {
+            0
+        }
+    }
+
     /// 240×160 RGBA8888 framebuffer (copied into a fresh JS `Uint8Array`).
     /// Prefer the zero-copy `framebuffer_ptr`/`framebuffer_len` pair on the hot
     /// present path; this copying variant is kept for callers that want an
@@ -177,6 +195,14 @@ impl WasmGba {
             Some(v) => (v & 0xFFFF) as i32,
             None => -1,
         }
+    }
+
+    /// Non-consuming read of the current SIOMLT_SEND word (0..0xFFFF). The slave
+    /// side reads this to answer the master's `mlt-req` with its own data — the
+    /// slave never stages `outgoing` (it doesn't master a transfer), so
+    /// `sio_take_outgoing` always returns -1 for it.
+    pub fn sio_peek_mlt_send(&self) -> u32 {
+        self.inner.sio_peek_mlt_send()
     }
 
     /// Master-side completion: deliver the synchronized 4-slot result the host

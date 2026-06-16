@@ -182,6 +182,14 @@ impl Gba {
         self.sio.take_outgoing()
     }
 
+    /// Non-consuming read of the current SIOMLT_SEND word, for the slave side
+    /// of a Multi-play exchange (which never stages `outgoing` of its own). The
+    /// host reads this when answering the master's `mlt-req` so the master
+    /// receives the slave's data rather than 0xFFFF.
+    pub fn sio_peek_mlt_send(&self) -> u32 {
+        self.sio.peek_mlt_send()
+    }
+
     /// Master-side completion: latch the synchronized 4-slot result, bump
     /// transfer_seq, clear START, raise the SIO IRQ if enabled.
     pub fn sio_deliver_multiplay(&mut self, m0: u32, m1: u32, m2: u32, m3: u32, error: bool) {

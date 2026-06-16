@@ -169,6 +169,22 @@ const MULTI_CYCLES_BY_BAUD: [i32; 4] = [115000, 29000, 19000, 9500];
 const NORMAL_CYCLES_SLOW: i32 = 2048;
 const NORMAL_CYCLES_FAST: i32 = 256;
 
+// Dropped-peer safety timeout for the JS-driven (WebRTC/WebSocket) multiplay
+// path, in CPU cycles. This must be *much* longer than a real network
+// round-trip, otherwise the master's transfer "times out" and completes with
+// no-peer/error data before the peer's response can possibly arrive — the
+// master then free-runs through thousands of garbage transfers and the link
+// handshake never converges (observed: seq racing to 10000+ with M0/M1=0).
+//
+// The host-side relay (`sio-signal.ts`) already guarantees completion within
+// its own 250 ms REQ_TIMEOUT (it delivers an explicit error result if the peer
+// doesn't answer), and resolves immediately on peer-leave/disconnect. So this
+// cycle budget only needs to catch the case where the JS layer itself is
+// wedged (e.g. a throttled background tab that stopped pumping). One second of
+// emulated time (~16.78 MHz) is comfortably past the 250 ms JS timeout, so the
+// real response always wins, while still un-sticking a truly dead link.
+const LINK_MULTI_TIMEOUT_CYCLES: i32 = 16_780_000;
+
 // SIOCNT[13:12] mode encoding:
 //   00 = Normal-8, 01 = Normal-32, 10 = Multi-play, 11 = UART.
 // Normal-8 and Normal-32 share a state path; UART is accepted but no
@@ -419,6 +435,29 @@ impl Sio {
         self.outgoing.take()
     }
 
+    // Non-consuming read of the current SIOMLT_SEND word. Unlike
+    // `take_outgoing` (master-only, take-once), this just reports whatever the
+    // game last wrote to 0x12A, regardless of master/slave role or transfer
+    // state. The slave never *starts* a transfer (so it never stages
+    // `outgoing`), but in Multi-play every GBA still puts its SIOMLT_SEND on
+    // the wire each transfer — that value lands in SIOMULTI[id] on all units.
+    // The host reads this on the slave when answering the master's `mlt-req`
+    // so the master actually receives the slave's word (e.g. the slave's half
+    // of a Pokemon trade) instead of the 0xFFFF "no data" sentinel.
+    pub fn peek_mlt_send(&self) -> u32 {
+        self.mlt_send & 0xFFFF
+    }
+
+    // True while a JS-driven master multiplay transfer is parked waiting for the
+    // host to deliver the peer's 4-slot result (see `awaiting_peer`). The
+    // resumable frame runner (`Gba::run_slice`) polls this to pause mid-frame at
+    // the exact moment a transfer kicks off, so a host driving a synchronous
+    // local link (the duo view) can resolve the exchange and resume — letting
+    // the game's per-frame burst of transfers complete within one frame.
+    pub fn awaiting_link(&self) -> bool {
+        self.awaiting_peer
+    }
+
     // Master-side completion driven by the host once it has the synchronized
     // 4-slot result from the peer(s). Mirrors `complete()`'s multiplay arm:
     // latch SIOMULTI, set/clear the error flag, clear START, bump
@@ -626,6 +665,12 @@ impl Sio {
             if self.link_drives_multiplay() {
                 self.awaiting_peer = true;
                 self.outgoing = Some(self.mlt_send & 0xFFFF);
+                // Replace the short per-baud transfer time (which models local
+                // shift-register timing, ~7 ms) with a long dropped-peer
+                // safety timeout. The real completion comes from the host's
+                // `deliver_multiplay` after the WebRTC round-trip; the cycle
+                // budget must not pre-empt it. See LINK_MULTI_TIMEOUT_CYCLES.
+                self.cycles_until_done = LINK_MULTI_TIMEOUT_CYCLES;
                 return;
             }
 
@@ -870,10 +915,15 @@ mod tests {
         // Master starts a multiplay transfer (baud 0), with IRQ enabled.
         sio.write16(0x128, (MODE_MULTI << 12) | 0x4000 | 0x0080, &mut irq);
         assert!(sio.awaiting_peer);
-        // Host hands the payload to JS but the peer never responds. The cycle
-        // budget runs out and `complete()` finishes with the error fallback.
+        // Host hands the payload to JS but the peer never responds *and* the JS
+        // layer is wedged (never calls deliver). Only after the long
+        // dropped-peer safety timeout does `complete()` finish with the error
+        // fallback — a short per-baud step must NOT pre-empt the round-trip.
         assert_eq!(sio.take_outgoing(), Some(0xCAFE));
         sio.step(MULTI_CYCLES_BY_BAUD[0], &mut irq);
+        assert!(sio.awaiting_peer, "short step must not time out the JS path");
+        assert_eq!(sio.transfer_seq, 0);
+        sio.step(LINK_MULTI_TIMEOUT_CYCLES, &mut irq);
         assert_eq!(sio.multi[0], 0xCAFE); // own payload echoes in slot 0
         assert_eq!(sio.multi[1], 0xFFFF); // no partner
         assert_ne!(sio.siocnt & 0x0040, 0); // error flag set
@@ -907,6 +957,26 @@ mod tests {
         assert_eq!(sio.siocnt & 0x80, 0);
         assert_eq!(sio.transfer_seq, 0);
         assert_ne!(irq.iflag & IRQ_SIO, 0);
+    }
+
+    #[test]
+    fn slave_peek_mlt_send_surfaces_written_word() {
+        // A slave never stages `outgoing` (it doesn't master a transfer), so
+        // take_outgoing() must return None — but peek_mlt_send() must report
+        // whatever the game last wrote to SIOMLT_SEND (0x12A), non-destructively
+        // and regardless of role. This is the slave's half of a Multi-play
+        // exchange (e.g. a Pokemon trade word) that the host relays to the
+        // master in answer to its mlt-req.
+        let mut sio = Sio::new();
+        let mut irq = Irq::new();
+        sio.set_link(true, false); // connected slave
+        sio.write16(0x12A, 0x7654, &mut irq); // game writes SIOMLT_SEND
+        assert_eq!(sio.take_outgoing(), None); // slave stages nothing
+        assert_eq!(sio.peek_mlt_send(), 0x7654);
+        assert_eq!(sio.peek_mlt_send(), 0x7654); // non-consuming
+        // A later write is reflected immediately.
+        sio.write16(0x12A, 0x00AB, &mut irq);
+        assert_eq!(sio.peek_mlt_send(), 0x00AB);
     }
 
     #[test]

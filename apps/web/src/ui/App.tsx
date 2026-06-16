@@ -21,6 +21,7 @@ import { NgpcPlayer } from './NgpcPlayer';
 import { WonderSwanPlayer } from './WonderSwanPlayer';
 import { VirtualBoyPlayer } from './VirtualBoyPlayer';
 import { N64Player } from './N64Player';
+import { DuoGbaPlayer } from './DuoGbaPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -39,6 +40,17 @@ export function App() {
   if (!audioRef.current) audioRef.current = new AudioSink();
 
   const [playing, setPlaying] = useState<{ id: string; system: string } | null>(null);
+
+  // Dev/local route: `?duo` opens the single-page two-player GBA link harness
+  // (two cores, one clock, in-memory cable — Pokémon trading on one machine).
+  // Kept out of the main flow so it can't affect normal play.
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('duo')) {
+    return (
+      <ToastProvider>
+        <DuoGbaPlayer onExit={() => { window.location.href = window.location.pathname; }} />
+      </ToastProvider>
+    );
+  }
 
   return (
     <PersistQueryClientProvider

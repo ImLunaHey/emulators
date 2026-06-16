@@ -42,6 +42,10 @@ export interface LinkBridge {
   // SIOMLT_SEND value once (take semantics) after a master transfer kicks
   // off over a connected link, or -1 when there's nothing to send.
   linkTakeOutgoing(): number;
+  // Non-consuming read of the current SIOMLT_SEND word (0..0xFFFF). The slave
+  // uses this to answer the master's mlt-req with its own data — it never
+  // masters a transfer, so linkTakeOutgoing() always returns -1 for it.
+  linkPeekOutgoing(): number;
   // Master-side completion: deliver the synchronized 4-slot result.
   linkDeliver(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
   // Slave-side: apply the remote master's broadcast.
@@ -297,11 +301,13 @@ export class SignalTransport {
         if (this.master) break;
         if (msg.from === this.peerId && msg.payload) {
           const p = msg.payload as { reqId: number; masterData: number };
-          // The slave's outgoing word: poll the bridge (returns -1 if the
-          // core hasn't staged one — the slave doesn't master, so it usually
-          // hasn't; fall back to 0xFFFF "no data").
-          const staged = this.link.linkTakeOutgoing();
-          const slaveData = staged >= 0 ? (staged & 0xFFFF) : 0xFFFF;
+          // The slave's outgoing word is whatever the game last wrote to
+          // SIOMLT_SEND. The slave never masters a transfer, so it never stages
+          // an `outgoing` payload (linkTakeOutgoing would return -1) — we read
+          // the live register non-destructively instead, so the master
+          // actually receives the slave's data (its half of a trade) rather
+          // than the 0xFFFF "no data" sentinel.
+          const slaveData = this.link.linkPeekOutgoing() & 0xFFFF;
           const result: MultiplayResult = {
             d0: p.masterData & 0xFFFF,
             d1: slaveData,

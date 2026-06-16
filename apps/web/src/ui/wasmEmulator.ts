@@ -345,6 +345,7 @@ export class WasmEmulator implements WasmCore {
   private get linkApi(): {
     sio_set_link(connected: boolean, master: boolean): void;
     sio_take_outgoing(): number;
+    sio_peek_mlt_send(): number;
     sio_deliver_multiplay(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
     sio_apply_remote_multiplay(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
     sio_set_wireless_adapter(enabled: boolean): void;
@@ -364,6 +365,7 @@ export class WasmEmulator implements WasmCore {
   // ---- async link-cable bridge (SignalTransport drives these) ------------
   linkSetState(connected: boolean, master: boolean): void { this.linkApi?.sio_set_link(connected, master); }
   linkTakeOutgoing(): number { return this.linkApi?.sio_take_outgoing() ?? -1; }
+  linkPeekOutgoing(): number { return this.linkApi?.sio_peek_mlt_send() ?? 0xFFFF; }
   linkDeliver(m0: number, m1: number, m2: number, m3: number, error: boolean): void {
     this.linkApi?.sio_deliver_multiplay(m0, m1, m2, m3, error);
   }
@@ -425,12 +427,31 @@ export class WasmEmulator implements WasmCore {
     this.gba.run_frame();
     // Drive the async link transport (WebRTC) once per frame.
     this.pumpLink();
-    // Mirror the save-dirty -> onChange contract the UI relies on.
     if (this.gba.save_dirty()) {
       this.gba.clear_save_dirty();
       this.save.onChange?.();
     }
     return { frames: this.gba.frame_count() };
+  }
+
+  /**
+   * Resumable slice runner for the synchronous local-link (duo) path. Runs up to
+   * `maxCycles` of the current frame and returns: 0 = slice exhausted (call
+   * again), 1 = frame completed, 2 = paused on a pending master link transfer
+   * (resolve it via the link bridge, then call again to resume). Keys must be
+   * pushed before the frame's first slice. No-op (returns 1) until ready.
+   */
+  runSlice(maxCycles: number): number {
+    if (!this.gba) return 1;
+    // Keep the keypad register current for this slice (cheap, idempotent).
+    this.gba.set_keys(this.keypad.pressed & 0x3ff);
+    const st = (this.gba as unknown as { run_slice(n: number): number }).run_slice(maxCycles);
+    // On frame completion, mirror the save-dirty -> onChange contract.
+    if (st === 1 && this.gba.save_dirty()) {
+      this.gba.clear_save_dirty();
+      this.save.onChange?.();
+    }
+    return st;
   }
 
   // ---- save states -------------------------------------------------------
