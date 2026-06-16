@@ -347,6 +347,16 @@ export class WasmEmulator implements WasmCore {
     sio_take_outgoing(): number;
     sio_deliver_multiplay(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
     sio_apply_remote_multiplay(m0: number, m1: number, m2: number, m3: number, error: boolean): void;
+    sio_set_wireless_adapter(enabled: boolean): void;
+    sio_wl_update(frames: number): void;
+    sio_wl_host_add_client(): number;
+    sio_wl_client_set_connected(devid: number, clnum: number): void;
+    sio_wl_disconnect_peer(): void;
+    sio_wl_deliver_packet(bytes: Uint8Array): void;
+    sio_wl_take_outgoing(): Uint8Array | undefined;
+    sio_wl_add_scanned_host(devid: number, data: Uint32Array): void;
+    sio_wl_clear_scanned_hosts(): void;
+    sio_wl_broadcast(): Uint32Array | undefined;
   } | undefined {
     return this.gba as unknown as never;
   }
@@ -360,6 +370,35 @@ export class WasmEmulator implements WasmCore {
   linkApplyRemote(m0: number, m1: number, m2: number, m3: number, error: boolean): void {
     this.linkApi?.sio_apply_remote_multiplay(m0, m1, m2, m3, error);
   }
+  /**
+   * Attach (or detach) the GBA Wireless Adapter as the SIO Normal-32 peripheral.
+   * When attached, wireless-capable games detect the adapter and reach their
+   * multiplayer / Download-Play menus (single-player HLE — no radio peers yet).
+   */
+  setWirelessAdapter(enabled: boolean): void { this.linkApi?.sio_set_wireless_adapter(enabled); }
+
+  // ---- Wireless Adapter peer seam ----------------------------------------
+  // A wireless transport (RFU packets over the same WebSocket room as the link
+  // cable) drives these; no-ops unless the adapter is the active transport.
+  /** Advance the adapter's wait timeout by `frames` (call once per frame). */
+  wlUpdate(frames: number): void { this.linkApi?.sio_wl_update(frames); }
+  /** Register a connected client (host side); returns its device ID, or 0. */
+  wlHostAddClient(): number { return this.linkApi?.sio_wl_host_add_client() ?? 0; }
+  /** Finalize this adapter as a client the host accepted. */
+  wlClientSetConnected(devid: number, clnum: number): void { this.linkApi?.sio_wl_client_set_connected(devid, clnum); }
+  /** Drop the peer link (wakes a parked wait with a disconnect event). */
+  wlDisconnectPeer(): void { this.linkApi?.sio_wl_disconnect_peer(); }
+  /** Inject a packet received from the peer. */
+  wlDeliverPacket(bytes: Uint8Array): void { this.linkApi?.sio_wl_deliver_packet(bytes); }
+  /** Take the packet the game queued to send, if any. */
+  wlTakeOutgoing(): Uint8Array | undefined { return this.linkApi?.sio_wl_take_outgoing(); }
+  /** Surface a discovered host: device ID + 6 broadcast words. */
+  wlAddScannedHost(devid: number, data: Uint32Array): void { this.linkApi?.sio_wl_add_scanned_host(devid, data); }
+  /** Clear the discovered-hosts list. */
+  wlClearScannedHosts(): void { this.linkApi?.sio_wl_clear_scanned_hosts(); }
+  /** This host's broadcast to announce: `[devid, w0..w5]`, or undefined. */
+  wlBroadcast(): Uint32Array | undefined { return this.linkApi?.sio_wl_broadcast(); }
+
   /** Drive one frame's worth of the async link transport, if one is set. */
   pumpLink(): void { this.io.sio.transport.pump?.(); }
 
@@ -367,6 +406,16 @@ export class WasmEmulator implements WasmCore {
   loadRom(bytes: Uint8Array): void {
     if (this.gba) this.gba.load_rom(bytes);
     else this._pendingRom = bytes;
+  }
+
+  /**
+   * Boot a multiboot (`.mb`) image as a child unit (Single-Pak link receive):
+   * it runs from EWRAM at 0x020000C0. Returns false if the image won't fit.
+   * `load_multiboot` isn't in the shipped .d.ts yet, so reach it via a cast.
+   */
+  loadMultiboot(bytes: Uint8Array): boolean {
+    const g = this.gba as unknown as { load_multiboot(b: Uint8Array): boolean } | undefined;
+    return g?.load_multiboot(bytes) ?? false;
   }
 
   runFrame(): { frames: number } {

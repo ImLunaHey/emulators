@@ -69,8 +69,8 @@ export const MATRICES: Record<string, MatrixGroup[]> = {
       rows: [
         { feature: 'Link cable — multiplayer / trading', support: 'testing', note: 'SIO multiplay over WebRTC; needs broader real-game verification' },
         { feature: 'GameCube ↔ GBA link (JOY-bus)', support: 'no', note: 'Registers accepted but non-functional' },
-        { feature: 'Single-Pak link (multiboot)', support: 'no' },
-        { feature: 'Wireless Adapter', support: 'no' },
+        { feature: 'Single-Pak link (multiboot)', support: 'partial', note: 'Child-receive boots .mb images from EWRAM; SWI 0x25 MultiBoot validates params + reports no-slaves failure. Encryption/CRC primitives done; parent-side transfer needs a child peer over the link transport' },
+        { feature: 'Wireless Adapter', support: 'partial', note: 'HLE adapter (RFU): NINTENDO handshake + full command FSM (detect, host/scan/connect, send/recv) plus a host↔1-client peer seam (packet inject/extract, wait-event push). No JS RFU-over-WebSocket transport wired yet' },
         { feature: 'Mobile Adapter GB', support: 'no' },
       ],
     },

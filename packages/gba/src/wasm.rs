@@ -20,6 +20,13 @@ impl WasmGba {
         self.inner.load_rom(bytes);
     }
 
+    /// Boot a multiboot (`.mb`) image as a child unit (Single-Pak link receive):
+    /// the image runs from EWRAM at `0x020000C0`. Returns `false` if the image
+    /// is too small or too large for EWRAM.
+    pub fn load_multiboot(&mut self, bytes: &[u8]) -> bool {
+        self.inner.load_multiboot(bytes)
+    }
+
     pub fn run_frame(&mut self) {
         self.inner.run_frame();
     }
@@ -190,6 +197,71 @@ impl WasmGba {
         error: bool,
     ) {
         self.inner.sio_apply_remote_multiplay(m0, m1, m2, m3, error);
+    }
+
+    /// Attach (`true`) or detach (`false`) the GBA Wireless Adapter as the SIO
+    /// Normal-32 peripheral. When attached, wireless-capable games detect the
+    /// adapter and walk its command protocol (single-player HLE: no peers).
+    pub fn sio_set_wireless_adapter(&mut self, enabled: bool) {
+        self.inner.sio_set_wireless_adapter(enabled);
+    }
+
+    // ---- Wireless Adapter peer seam (the JS transport drives these) ----
+    // No-ops unless the wireless adapter is the active transport.
+
+    /// Advance the adapter's wait timeout by `frames` (call once per frame).
+    pub fn sio_wl_update(&mut self, frames: u32) {
+        self.inner.wl_update(frames);
+    }
+
+    /// Register a connected client (host side); returns its device ID, or 0.
+    pub fn sio_wl_host_add_client(&mut self) -> u16 {
+        self.inner.wl_host_add_client()
+    }
+
+    /// Finalize this adapter as a client the host accepted.
+    pub fn sio_wl_client_set_connected(&mut self, devid: u16, clnum: u16) {
+        self.inner.wl_client_set_connected(devid, clnum);
+    }
+
+    /// Drop the peer link (wakes a parked wait with a disconnect event).
+    pub fn sio_wl_disconnect_peer(&mut self) {
+        self.inner.wl_disconnect_peer();
+    }
+
+    /// Inject a packet received from the peer.
+    pub fn sio_wl_deliver_packet(&mut self, bytes: &[u8]) {
+        self.inner.wl_deliver_packet(bytes);
+    }
+
+    /// Take the packet the game queued to send, if any (Uint8Array | undefined).
+    pub fn sio_wl_take_outgoing(&mut self) -> Option<Vec<u8>> {
+        self.inner.wl_take_outgoing()
+    }
+
+    /// Surface a discovered host: `devid` + 6 broadcast words (`data.len() == 6`).
+    pub fn sio_wl_add_scanned_host(&mut self, devid: u16, data: &[u32]) {
+        let mut d = [0u32; 6];
+        for (slot, &v) in d.iter_mut().zip(data.iter()) {
+            *slot = v;
+        }
+        self.inner.wl_add_scanned_host(devid, d);
+    }
+
+    /// Clear the discovered-hosts list.
+    pub fn sio_wl_clear_scanned_hosts(&mut self) {
+        self.inner.wl_clear_scanned_hosts();
+    }
+
+    /// This host's broadcast to announce: `[devid, w0, w1, w2, w3, w4, w5]`, or
+    /// undefined when the adapter isn't active.
+    pub fn sio_wl_broadcast(&mut self) -> Option<Vec<u32>> {
+        self.inner.wl_broadcast().map(|(devid, data)| {
+            let mut out = Vec::with_capacity(7);
+            out.push(devid as u32);
+            out.extend_from_slice(&data);
+            out
+        })
     }
 
     // ---- IWRAM write-watch (LinkPanel's IwramWatch) ----
