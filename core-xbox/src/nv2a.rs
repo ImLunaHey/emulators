@@ -605,6 +605,23 @@ impl Nv2a {
         }
     }
 
+    /// Absolute RAM address of the color surface origin.
+    ///
+    /// `SET_SURFACE_COLOR_OFFSET` is an offset *relative to the color DMA object*
+    /// (the framebuffer the game programmed through `AvSetDisplayMode`), not an
+    /// absolute RAM address — pbkit submits offset 0 ("start of the framebuffer
+    /// DMA object"). Treating it as absolute makes a clear at offset 0 zero RAM
+    /// from address 0, scribbling over the game's own code. So resolve it against
+    /// the display framebuffer base. The homebrew test path programs no display
+    /// (`disp_addr == 0`) and submits an absolute offset, so it's used as-is.
+    fn surface_base(&self) -> u32 {
+        if self.disp_addr != 0 {
+            self.disp_addr.wrapping_add(self.surface_offset)
+        } else {
+            self.surface_offset
+        }
+    }
+
     /// Rasterize the gathered vertices for the current primitive into the color
     /// surface, using the shared software rasterizer in [`crate::nv2a_render`]
     /// (top-left fill rule, perspective-correct interpolation). The immediate-mode
@@ -637,7 +654,7 @@ impl Nv2a {
         };
         // The rasterizer addresses pixels from the surface base; offset the RAM
         // slice so (0,0) maps to the surface origin.
-        let base = self.surface_offset as usize;
+        let base = self.surface_base() as usize;
         if base >= ram.len() {
             return;
         }
@@ -662,8 +679,9 @@ impl Nv2a {
         } else {
             self.surface_pitch
         };
+        let surface_base = self.surface_base();
         for y in y0..y0 + h {
-            let row = self.surface_offset.wrapping_add(y * pitch);
+            let row = surface_base.wrapping_add(y * pitch);
             for x in x0..x0 + w {
                 wr32(ram, row.wrapping_add(x * 4), self.clear_color);
             }
@@ -693,7 +711,7 @@ impl Nv2a {
         let (base, pitch, w, h) = if self.has_surface {
             let w = self.width as u32;
             let pitch = if self.surface_pitch == 0 { w * 4 } else { self.surface_pitch };
-            (self.surface_offset, pitch, w, self.height as u32)
+            (self.surface_base(), pitch, w, self.height as u32)
         } else if self.disp_w != 0 && self.disp_h != 0 {
             // PCRTC_START, when the driver set it, is the live front buffer; fall
             // back to the AvSetDisplayMode address otherwise.
