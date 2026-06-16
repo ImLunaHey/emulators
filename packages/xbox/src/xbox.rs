@@ -453,64 +453,126 @@ impl Xbox {
         self.frames = self.frames.wrapping_add(1);
     }
 
-    /// Step the CPU exactly one instruction, split-borrowing it out of `self` so
-    /// the executor can use `self` as its `&mut dyn Bus` (the contract's
-    /// `mem::take` pattern). `Cpu: Default`.
+    /// Step the CPU exactly one instruction. The executor only needs the memory
+    /// + GPU as its `Bus`, never `self.cpu`, so hand it a [`BusView`] over those
+    /// fields and step the CPU in place. This is a disjoint split-borrow of
+    /// `self.cpu` vs the rest — no per-instruction `Cpu` copy (the old
+    /// `mem::take` pattern moved 136 bytes out and back every instruction) and
+    /// no `unsafe` aliasing.
     fn step_cpu(&mut self) {
-        let mut cpu = std::mem::take(&mut self.cpu);
-        cpu.step(self);
-        self.cpu = cpu;
+        let mut view = BusView { mem: &mut self.mem, nv2a: &mut self.nv2a };
+        self.cpu.step(&mut view);
     }
 
     // ---- shared read/write cores (translate → classify → route) ----
     fn read(&mut self, addr: u32, size: u8) -> u32 {
-        // Fast path: code and data accesses are overwhelmingly to main RAM at the
-        // bottom of the address space (RAM_BASE == 0). Index it directly and skip
-        // translate/classify + the region match — this is the interpreter's
-        // hottest path (every instruction fetch + most operand accesses).
-        if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
-            return match size {
-                1 => self.mem.ram_read8(addr),
-                2 => self.mem.ram_read16(addr),
-                _ => self.mem.ram_read32(addr),
-            };
-        }
-        let region = bus::translate(addr);
-        if let Some(v) = self.mem.region_read(region, size) {
-            return v;
-        }
-        match region {
-            // MMIO band: the NV2A GPU window lives at the bottom (0xFD00_0000);
-            // route it there. Other devices are still open-bus.
-            Region::Mmio(off) => {
-                trace_mmio(addr);
-                self.nv2a.mmio_read(off, size)
-            }
-            Region::Unmapped => 0,
-            // RAM/flash handled by region_read above.
-            Region::Ram(_) | Region::Flash(_) => unreachable!(),
-        }
+        bus_read(&mut self.mem, &mut self.nv2a, addr, size)
     }
 
     fn write(&mut self, addr: u32, size: u8, v: u32) {
-        // Fast path: direct RAM store (see `read`).
-        if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
-            match size {
-                1 => self.mem.ram_write8(addr, v),
-                2 => self.mem.ram_write16(addr, v),
-                _ => self.mem.ram_write32(addr, v),
-            }
-            return;
+        bus_write(&mut self.mem, &mut self.nv2a, addr, size, v);
+    }
+}
+
+// ---- bus access core, shared by the `Xbox` Bus impl and the step-time
+// `BusView`. Free functions over (mem, nv2a) so both a `&mut Xbox` and a
+// disjoint `{&mut mem, &mut nv2a}` split-borrow can route memory accesses. ----
+
+/// Read 1/2/4 bytes at `addr` through the memory map.
+#[inline]
+fn bus_read(mem: &mut Mem, nv2a: &mut crate::nv2a::Nv2a, addr: u32, size: u8) -> u32 {
+    // Fast path: code and data accesses are overwhelmingly to main RAM at the
+    // bottom of the address space (RAM_BASE == 0). Index it directly and skip
+    // translate/classify + the region match — the interpreter's hottest path.
+    if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
+        return match size {
+            1 => mem.ram_read8(addr),
+            2 => mem.ram_read16(addr),
+            _ => mem.ram_read32(addr),
+        };
+    }
+    let region = bus::translate(addr);
+    if let Some(v) = mem.region_read(region, size) {
+        return v;
+    }
+    match region {
+        // MMIO band: the NV2A GPU window lives at the bottom (0xFD00_0000).
+        Region::Mmio(off) => {
+            trace_mmio(addr);
+            nv2a.mmio_read(off, size)
         }
-        let region = bus::translate(addr);
-        if self.mem.region_write(region, size, v) {
-            return;
+        Region::Unmapped => 0,
+        // RAM/flash handled by region_read above.
+        Region::Ram(_) | Region::Flash(_) => unreachable!(),
+    }
+}
+
+/// Write 1/2/4 bytes of `v` at `addr` through the memory map.
+#[inline]
+fn bus_write(mem: &mut Mem, nv2a: &mut crate::nv2a::Nv2a, addr: u32, size: u8, v: u32) {
+    // Fast path: direct RAM store (see `bus_read`).
+    if (addr as usize) + size as usize <= crate::regions::RAM_SIZE {
+        match size {
+            1 => mem.ram_write8(addr, v),
+            2 => mem.ram_write16(addr, v),
+            _ => mem.ram_write32(addr, v),
         }
-        match region {
-            Region::Mmio(off) => self.nv2a.mmio_write(off, v, size, &mut self.mem.ram[..]),
-            Region::Unmapped => {}
-            Region::Ram(_) | Region::Flash(_) => {}
-        }
+        return;
+    }
+    let region = bus::translate(addr);
+    if mem.region_write(region, size, v) {
+        return;
+    }
+    match region {
+        Region::Mmio(off) => nv2a.mmio_write(off, v, size, &mut mem.ram[..]),
+        Region::Unmapped => {}
+        Region::Ram(_) | Region::Flash(_) => {}
+    }
+}
+
+/// Instruction-fetch byte. Code lives in main RAM (RAM_BASE == 0), so index it
+/// directly — this runs for every opcode/ModRM/immediate byte and skips the full
+/// translate → classify → region-match path.
+#[inline]
+fn bus_fetch8(mem: &mut Mem, nv2a: &mut crate::nv2a::Nv2a, addr: u32) -> u8 {
+    let i = addr as usize;
+    if i < crate::regions::RAM_SIZE {
+        // SAFETY: bounds-checked against RAM_SIZE; ram is [u8; RAM_SIZE].
+        unsafe { *mem.ram.get_unchecked(i) }
+    } else {
+        bus_read(mem, nv2a, addr, 1) as u8
+    }
+}
+
+/// A `Bus` over just the memory + GPU. Used to step the CPU without moving it
+/// out of `Xbox`: `step_cpu` borrows `self.cpu` and `BusView { mem, nv2a }`
+/// disjointly, so there's no per-instruction copy.
+struct BusView<'a> {
+    mem: &'a mut Mem,
+    nv2a: &'a mut crate::nv2a::Nv2a,
+}
+
+impl Bus for BusView<'_> {
+    fn read8(&mut self, addr: u32) -> u32 {
+        bus_read(self.mem, self.nv2a, addr, 1)
+    }
+    fn read16(&mut self, addr: u32) -> u32 {
+        bus_read(self.mem, self.nv2a, addr, 2)
+    }
+    fn read32(&mut self, addr: u32) -> u32 {
+        bus_read(self.mem, self.nv2a, addr, 4)
+    }
+    fn write8(&mut self, addr: u32, v: u32) {
+        bus_write(self.mem, self.nv2a, addr, 1, v & 0xFF)
+    }
+    fn write16(&mut self, addr: u32, v: u32) {
+        bus_write(self.mem, self.nv2a, addr, 2, v & 0xFFFF)
+    }
+    fn write32(&mut self, addr: u32, v: u32) {
+        bus_write(self.mem, self.nv2a, addr, 4, v)
+    }
+    fn fetch8(&mut self, addr: u32) -> u8 {
+        bus_fetch8(self.mem, self.nv2a, addr)
     }
 }
 
@@ -692,17 +754,8 @@ impl Bus for Xbox {
     fn write32(&mut self, addr: u32, v: u32) {
         self.write(addr, 4, v)
     }
-    /// Instruction-fetch byte. Code lives in main RAM (RAM_BASE == 0), so index
-    /// it directly — this runs for every opcode/ModRM/immediate byte and skips
-    /// the full translate → classify → region-match path of `read8`.
     fn fetch8(&mut self, addr: u32) -> u8 {
-        let i = addr as usize;
-        if i < crate::regions::RAM_SIZE {
-            // SAFETY: bounds-checked against RAM_SIZE; ram is [u8; RAM_SIZE].
-            unsafe { *self.mem.ram.get_unchecked(i) }
-        } else {
-            self.read8(addr) as u8
-        }
+        bus_fetch8(&mut self.mem, &mut self.nv2a, addr)
     }
 }
 
