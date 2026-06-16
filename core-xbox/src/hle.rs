@@ -169,6 +169,21 @@ const SYNC_HANDLE_BASE: u32 = 0x2000_0000;
 static SYNC_NEXT: AtomicU32 = AtomicU32::new(SYNC_HANDLE_BASE);
 /// Backing KTHREAD block returned by KeGetCurrentThread (lazily allocated).
 static CURRENT_KTHREAD: AtomicU32 = AtomicU32::new(0);
+/// Open symbolic-link handles → the link's source path (so a later
+/// NtQuerySymbolicLinkObject can report the device it resolves to).
+static SYMLINKS: Mutex<Option<std::collections::HashMap<u32, String>>> = Mutex::new(None);
+
+/// The device path an Xbox drive-letter symlink resolves to.
+fn symlink_target(src: &str) -> &'static str {
+    let s = src.to_ascii_uppercase();
+    if s.contains("C:") {
+        "\\Device\\Harddisk0\\Partition2"
+    } else if s.contains("T:") || s.contains("U:") {
+        "\\Device\\Harddisk0\\Partition1"
+    } else {
+        "\\Device\\CdRom0" // D: and anything else: the game disc
+    }
+}
 fn alloc_sync_handle() -> u32 {
     SYNC_NEXT.fetch_add(4, Ordering::SeqCst)
 }
@@ -423,6 +438,8 @@ fn close_file(h: u32) -> bool {
 
 static KDATA: Mutex<Option<std::collections::HashMap<u32, u32>>> = Mutex::new(None);
 const ORD_KE_TICK_COUNT: u32 = 156;
+const ORD_KE_INTERRUPT_TIME: u32 = 120;
+const ORD_KE_SYSTEM_TIME: u32 = 154;
 const ORD_XBOX_KRNL_VERSION: u32 = 324;
 /// `HalDiskCachePartitionCount` (DATA export, ordinal 40) — the number of HDD
 /// cache partitions. On a real console this is non-zero (the X/Y/Z game-cache
@@ -482,10 +499,26 @@ pub fn data_export_addr(ordinal: u32, mem: &mut Mem) -> u32 {
 /// Advance the system tick count (call once per emulated frame).
 pub fn tick_clock(mem: &mut Mem) {
     let g = KDATA.lock().unwrap();
-    if let Some(map) = g.as_ref() {
-        if let Some(&addr) = map.get(&ORD_KE_TICK_COUNT) {
-            let v = mem.ram_read32(addr).wrapping_add(KTICK_PER_FRAME);
-            mem.ram_write32(addr, v);
+    let map = match g.as_ref() {
+        Some(m) => m,
+        None => return,
+    };
+    // KeTickCount: milliseconds since boot (32-bit).
+    if let Some(&addr) = map.get(&ORD_KE_TICK_COUNT) {
+        let v = mem.ram_read32(addr).wrapping_add(KTICK_PER_FRAME);
+        mem.ram_write32(addr, v);
+    }
+    // KeInterruptTime / KeSystemTime: 100 ns ticks (64-bit). Advancing these too
+    // lets time-based delay loops (e.g. pbkit's encoder settle waits) make
+    // progress across frames instead of spinning forever on a frozen clock.
+    const HUNDRED_NS_PER_FRAME: u64 = KTICK_PER_FRAME as u64 * 10_000;
+    for ord in [ORD_KE_INTERRUPT_TIME, ORD_KE_SYSTEM_TIME] {
+        if let Some(&addr) = map.get(&ord) {
+            let lo = mem.ram_read32(addr) as u64;
+            let hi = mem.ram_read32(addr.wrapping_add(4)) as u64;
+            let v = ((hi << 32) | lo).wrapping_add(HUNDRED_NS_PER_FRAME);
+            mem.ram_write32(addr, v as u32);
+            mem.ram_write32(addr.wrapping_add(4), (v >> 32) as u32);
         }
     }
 }
@@ -622,6 +655,7 @@ pub fn reset() {
     SAVED_DATA_ADDR.store(0, Ordering::SeqCst);
     SYNC_NEXT.store(SYNC_HANDLE_BASE, Ordering::SeqCst);
     CURRENT_KTHREAD.store(0, Ordering::SeqCst);
+    *SYMLINKS.lock().unwrap() = None;
     *PERSISTED.lock().unwrap() = None;
     *LAUNCH_DATA.lock().unwrap() = None;
     *DISPLAY_MODE.lock().unwrap() = None;
@@ -1109,6 +1143,7 @@ fn read_obj_path(mem: &Mem, oa: u32) -> String {
 const ORD_DBG_PRINT: u32 = 8;
 const ORD_KE_INITIALIZE_DPC: u32 = 107;
 const ORD_KE_INSERT_QUEUE_DPC: u32 = 119;
+const ORD_KE_REMOVE_QUEUE_DPC: u32 = 137;
 const ORD_MM_ALLOCATE_CONTIGUOUS_MEMORY: u32 = 165;
 const ORD_MM_ALLOCATE_CONTIGUOUS_MEMORY_EX: u32 = 166;
 const ORD_MM_ALLOCATE_SYSTEM_MEMORY: u32 = 167;
@@ -1147,8 +1182,11 @@ const ORD_NT_QUERY_INFORMATION_FILE: u32 = 211;
 const ORD_NT_SET_INFORMATION_FILE: u32 = 226;
 const ORD_NT_QUERY_FULL_ATTRIBUTES_FILE: u32 = 210;
 const ORD_NT_DEVICE_IO_CONTROL_FILE: u32 = 196;
+const ORD_NT_OPEN_SYMBOLIC_LINK_OBJECT: u32 = 203;
+const ORD_NT_QUERY_SYMBOLIC_LINK_OBJECT: u32 = 215;
 const ORD_NT_CREATE_MUTANT: u32 = 192;
 const ORD_NT_RELEASE_MUTANT: u32 = 221;
+const ORD_NT_CREATE_EVENT: u32 = 189;
 const ORD_KE_GET_CURRENT_THREAD: u32 = 104;
 const ORD_KE_GET_CURRENT_IRQL: u32 = 103;
 const ORD_KE_RAISE_IRQL_TO_DPC: u32 = 129;
@@ -1364,6 +1402,12 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             stdcall_return(cpu, mem, 0, 12);
             Dispatch::Handled("KeInitializeDpc")
         }
+        ORD_KE_REMOVE_QUEUE_DPC => {
+            // BOOLEAN KeRemoveQueueDpc(Dpc) — we run DPCs synchronously on insert,
+            // so none are ever pending: report "not queued" (FALSE).
+            stdcall_return(cpu, mem, 0, 4);
+            Dispatch::Handled("KeRemoveQueueDpc")
+        }
         ORD_KE_INSERT_QUEUE_DPC => {
             // BOOLEAN KeInsertQueueDpc(Dpc, SystemArgument1, SystemArgument2).
             // Run the DPC routine now (DeferredRoutine(Dpc, Context, Arg1, Arg2)):
@@ -1508,6 +1552,51 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+        ORD_NT_OPEN_SYMBOLIC_LINK_OBJECT => {
+            // NtOpenSymbolicLinkObject(PHANDLE, POBJECT_ATTRIBUTES) — 8 bytes.
+            let h_out = arg(cpu, mem, 0);
+            let path = read_obj_path(mem, arg(cpu, mem, 1));
+            let h = alloc_sync_handle();
+            SYMLINKS
+                .lock()
+                .unwrap()
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(h, path);
+            if h_out != 0 {
+                mem.ram_write32(h_out, h);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 8);
+            Dispatch::Handled("NtOpenSymbolicLinkObject")
+        }
+        ORD_NT_QUERY_SYMBOLIC_LINK_OBJECT => {
+            // NtQuerySymbolicLinkObject(HANDLE, POBJECT_STRING LinkTarget,
+            //   PULONG ReturnedLength) — 12 bytes. OBJECT_STRING is
+            //   { USHORT Length, USHORT MaximumLength, PCHAR Buffer }.
+            let h = arg(cpu, mem, 0);
+            let out_str = arg(cpu, mem, 1);
+            let ret_len = arg(cpu, mem, 2);
+            let src = SYMLINKS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&h).cloned())
+                .unwrap_or_default();
+            let target = symlink_target(&src);
+            if out_str != 0 {
+                let maxlen = mem.ram_read16(out_str.wrapping_add(2)) & 0xFFFF;
+                let buf = mem.ram_read32(out_str.wrapping_add(4));
+                let n = (target.len() as u32).min(maxlen);
+                for (i, b) in target.bytes().take(n as usize).enumerate() {
+                    mem.ram_write8(buf.wrapping_add(i as u32), b as u32);
+                }
+                mem.ram_write16(out_str, n); // Length
+            }
+            if ret_len != 0 {
+                mem.ram_write32(ret_len, target.len() as u32);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 12);
+            Dispatch::Handled("NtQuerySymbolicLinkObject")
         }
         ORD_NT_CREATE_MUTANT => {
             // NtCreateMutant(PHANDLE, POBJECT_ATTRIBUTES, BOOLEAN InitialOwner) —
@@ -1662,6 +1751,17 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             }
             stdcall_return(cpu, mem, 0, 8);
             Dispatch::Handled("XcSHAFinal")
+        }
+        ORD_NT_CREATE_EVENT => {
+            // NtCreateEvent(PHANDLE, POBJECT_ATTRIBUTES, EVENT_TYPE,
+            //   BOOLEAN InitialState) — 16 bytes. Hand back a sync handle;
+            //   handle-based waits don't block in this model.
+            let h_out = arg(cpu, mem, 0);
+            if h_out != 0 {
+                mem.ram_write32(h_out, alloc_sync_handle());
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 16);
+            Dispatch::Handled("NtCreateEvent")
         }
         ORD_NT_RELEASE_MUTANT => {
             // NtReleaseMutant(HANDLE, PLONG PreviousCount) — 8 bytes.
