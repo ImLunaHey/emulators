@@ -1,0 +1,38 @@
+[package]
+name = "emu-native"
+version = "0.0.0"
+edition = "2021"
+
+# Unified native FFI for the whole emulator: a single C ABI (`emu_*`) over an
+# opaque handle that wraps every core (GBA/PS1/NDS/NES/SMS+GG/GBC/Xbox/SNES/
+# Genesis/PCE/Atari2600/NGPC/WonderSwan/VirtualBoy/N64). Built as
+# a static archive for linking into native apps — primarily the macOS SwiftPM app
+# under `apps/EmuApp`, which exists so large media (e.g. a 4.7 GB Xbox disc) can
+# be handled outside the browser's 4 GB wasm32 address space. Sibling of the
+# iOS-only `core-ffi` (GBA only); this one is multi-core and macOS-first.
+[lib]
+name = "emu_native"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+gba-core = { path = "../gba" }
+ps1-core = { path = "../ps1" }
+nds-core = { path = "../nds" }
+nes-core = { path = "../nes" }
+sms-core = { path = "../sms" }
+gbc-core = { path = "../gbc" }
+xbox-core = { path = "../xbox" }
+snes-core = { path = "../snes" }
+genesis-core = { path = "../genesis" }
+pce-core = { path = "../pce" }
+atari2600-core = { path = "../atari2600" }
+ngpc-core = { path = "../ngpc" }
+wonderswan-core = { path = "../wonderswan" }
+virtualboy-core = { path = "../virtualboy" }
+n64-core = { path = "../n64" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the GBA core as an iOS xcframework for the (future) React Native module.
 #
-# Output: core-ffi/build/GbaCore.xcframework, bundling the device slice and a
+# Output: packages/ffi/build/GbaCore.xcframework, bundling the device slice and a
 # fat simulator slice (arm64 + x86_64), plus the C header. Drop the xcframework
 # into the RN app's iOS project and call the `gba_*` C ABI from the Swift
 # TurboModule.
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-FFI=core-ffi
+FFI=packages/ffi
 LIB=libgba_core_ffi.a
 OUT=$FFI/build
 mkdir -p "$OUT"

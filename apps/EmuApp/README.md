@@ -4,7 +4,7 @@ A SwiftUI desktop app that runs the emulator cores **natively**, so it isn't
 bound by the browser's 4 GB wasm32 address space — you can open large media like
 a 4.7 GB Xbox disc.
 
-It links the unified [`emu-native`](../../core-native) static library (all cores:
+It links the unified [`emu-native`](../../packages/native) static library (all cores:
 GBA, PS1, NDS, NES, SMS/GG, GBC, Xbox) through a thin C ABI.
 
 ## Build & run
@@ -55,4 +55,4 @@ disc and read its title** (the foundation core can't boot games yet).
 - The framebuffer is RGBA8888; the screen layer renders nearest-neighbour,
   aspect-fit.
 - `Sources/CEmuNative/include/emu_native.h` is a synced copy of the canonical
-  header in `core-native/include/`; `build-macos.sh` refreshes it.
+  header in `packages/native/include/`; `build-macos.sh` refreshes it.

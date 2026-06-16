@@ -1,0 +1,18 @@
+{
+  "name": "@emulators/gbc",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/gbc_core.js",
+  "types": "./pkg/gbc_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/gbc_core.d.ts",
+      "default": "./pkg/gbc_core.js"
+    }
+  },
+  "files": ["pkg"],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release"
+  }
+}

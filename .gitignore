@@ -25,9 +25,13 @@ public/*.cue
 **/pkg/
 
 # rust mobile FFI crate (native libs / xcframework build output)
-core-ffi/build
-core-ffi/Cargo.lock
+packages/ffi/build
+packages/ffi/Cargo.lock
 **/*.rs.bk
+
+# turborepo cache
+.turbo
+**/.turbo
 
 # swift package / native app build output
 .build/

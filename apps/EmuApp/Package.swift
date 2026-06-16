@@ -17,7 +17,7 @@ let package = Package(
             linkerSettings: [
                 // The Rust static archive (built by scripts/build-macos.sh).
                 .unsafeFlags([
-                    "-L../../core-native/target/release",
+                    "-L../../packages/native/target/release",
                     "-lemu_native",
                 ]),
                 .linkedFramework("AppKit"),

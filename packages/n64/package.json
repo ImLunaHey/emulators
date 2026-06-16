@@ -1,0 +1,18 @@
+{
+  "name": "@emulators/n64",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/n64_core.js",
+  "types": "./pkg/n64_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/n64_core.d.ts",
+      "default": "./pkg/n64_core.js"
+    }
+  },
+  "files": ["pkg"],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release"
+  }
+}

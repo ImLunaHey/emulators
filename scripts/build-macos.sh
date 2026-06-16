@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FFI="$ROOT/core-native"
+FFI="$ROOT/packages/native"
 APP="$ROOT/apps/EmuApp"
 LIB="libemu_native.a"
 

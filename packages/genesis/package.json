@@ -1,0 +1,18 @@
+{
+  "name": "@emulators/genesis",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/genesis_core.js",
+  "types": "./pkg/genesis_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/genesis_core.d.ts",
+      "default": "./pkg/genesis_core.js"
+    }
+  },
+  "files": ["pkg"],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release"
+  }
+}

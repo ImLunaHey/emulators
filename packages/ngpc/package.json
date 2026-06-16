@@ -1,0 +1,18 @@
+{
+  "name": "@emulators/ngpc",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/ngpc_core.js",
+  "types": "./pkg/ngpc_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/ngpc_core.d.ts",
+      "default": "./pkg/ngpc_core.js"
+    }
+  },
+  "files": ["pkg"],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release"
+  }
+}

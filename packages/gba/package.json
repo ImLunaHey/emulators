@@ -1,0 +1,21 @@
+{
+  "name": "@emulators/gba",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/gba_core.js",
+  "types": "./pkg/gba_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/gba_core.d.ts",
+      "default": "./pkg/gba_core.js"
+    }
+  },
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release",
+    "test": "cargo test --manifest-path Cargo.toml"
+  }
+}

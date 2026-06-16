@@ -13,7 +13,7 @@ import { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 const SRC = 'vendor/libretro-database/cht/Nintendo - Game Boy Advance';
-const OUT = 'public/cheats-gba.json';
+const OUT = 'apps/web/public/cheats-gba.json';
 
 // Normalize a title for fuzzy matching: drop "(...)" region/rev groups,
 // keep only lowercase alphanumerics. "Pokemon - FireRed Version (USA,

@@ -10,16 +10,19 @@ jobs:
   test:
     name: Test + build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
+          cache: 'pnpm'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,33 +35,28 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            core/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('core/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('packages/*/Cargo.lock') }}
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
-      # Rust core unit tests (235 vectors: CPU/PPU/sound/DMA/timers/save/sio).
+      # Rust core unit tests (gba package's `test` script: cargo test).
       - name: Rust tests
-        run: cargo test --manifest-path core/Cargo.toml
+        run: pnpm turbo run test
 
-      # Build the wasm core the web app imports (core/pkg is gitignored).
-      - name: Build wasm core
-        run: npm run build:wasm
+      # Build the web app and every wasm core it depends on. Turbo's `^build`
+      # builds all packages/* cores (wasm-pack -> pkg/) BEFORE the web build's
+      # `tsc && vite build`, so typecheck sees the generated .d.ts files.
+      - name: Build web + cores
+        run: pnpm turbo run build --filter=@emulators/web
 
       - name: Lint
-        run: npm run lint
+        run: pnpm turbo run lint --filter=@emulators/web
 
-      - name: Typecheck
-        run: npx tsc --noEmit
-
-      - name: Build web app
-        run: npx vite build
-
-  # Build the wasm core + web app here and push the prebuilt output to
+  # Build the wasm cores + web app here and push the prebuilt output to
   # Cloudflare, instead of letting Cloudflare's git integration build it.
   # NOTE: disable the Cloudflare-side build (Workers > Settings > Builds) so
   # the two don't race. Requires repo secrets CLOUDFLARE_API_TOKEN and
@@ -66,18 +64,21 @@ jobs:
   deploy:
     name: Deploy to Cloudflare
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: 'npm'
+          cache: 'pnpm'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,24 +91,21 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            core/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('core/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('packages/*/Cargo.lock') }}
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
-      # Same build the deploy script runs locally: wasm core, then the web app.
-      - name: Build wasm core
-        run: npm run build:wasm
-
-      - name: Build web app
-        run: npm run build
+      # Builds all wasm cores, then the web app (apps/web/dist) via turbo.
+      - name: Build web + cores
+        run: pnpm turbo run build --filter=@emulators/web
 
       - name: Deploy with Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/web

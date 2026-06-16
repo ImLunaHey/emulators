@@ -36,8 +36,8 @@ final class Library: ObservableObject {
         // Repo root is two levels up from the SwiftPM executable's package dir.
         let repoRoot = "/Users/luna/code/imlunahey/emulator"
         let candidates = [
-            "\(repoRoot)/core-xbox/demos/triangle.xbe",
-            "\(repoRoot)/core-xbox/demos/hello.xbe",
+            "\(repoRoot)/packages/xbox/demos/triangle.xbe",
+            "\(repoRoot)/packages/xbox/demos/hello.xbe",
             "/Users/luna/Downloads/Halo - Combat Evolved (USA).xiso.iso",
             "/Users/luna/Downloads/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko)/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko).xiso.iso",
         ]

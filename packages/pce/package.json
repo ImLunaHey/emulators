@@ -1,0 +1,18 @@
+{
+  "name": "@emulators/pce",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./pkg/pce_core.js",
+  "types": "./pkg/pce_core.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/pce_core.d.ts",
+      "default": "./pkg/pce_core.js"
+    }
+  },
+  "files": ["pkg"],
+  "scripts": {
+    "build": "wasm-pack build . --target web --out-dir pkg --release"
+  }
+}

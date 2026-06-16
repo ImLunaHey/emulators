@@ -1,0 +1,28 @@
+[package]
+name = "gba-core-ffi"
+version = "0.0.0"
+edition = "2021"
+
+# C-ABI wrapper around `gba-core` for the React Native / mobile targets.
+# Hermes has no WebAssembly, so RN links this native library (static for iOS,
+# shared for Android) and calls it over a JSI / TurboModule bridge. The web
+# target keeps using `../core` directly through wasm-bindgen; this crate is the
+# *binding-agnostic* core's second consumer and is not yet wired into an app.
+#
+# Standalone (not a workspace member) on purpose: building this never disturbs
+# `wasm-pack build core`, and its release profile below applies to the whole
+# dependency graph (including gba-core) for native builds.
+
+[lib]
+name = "gba_core_ffi"
+# staticlib → iOS .a (linked into an xcframework); cdylib → Android .so.
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+gba-core = { path = "../gba" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

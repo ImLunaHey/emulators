@@ -2,58 +2,24 @@
   "name": "emulators",
   "private": true,
   "version": "0.0.0",
-  "type": "module",
-  "portless": "emulators",
+  "packageManager": "pnpm@10.17.1",
   "scripts": {
-    "dev": "vite",
-    "dev:portless": "portless emulators vite",
-    "build:wasm": "wasm-pack build core --target web --out-dir pkg --release",
-    "build:wasm:nds": "wasm-pack build core-nds --target web --out-dir pkg --release",
-    "build:wasm:ps1": "wasm-pack build core-ps1 --target web --out-dir pkg --release",
-    "build:wasm:nes": "wasm-pack build core-nes --target web --out-dir pkg --release",
-    "build:wasm:sms": "wasm-pack build core-sms --target web --out-dir pkg --release",
-    "build:wasm:gbc": "wasm-pack build core-gbc --target web --out-dir pkg --release",
-    "build:wasm:xbox": "wasm-pack build core-xbox --target web --out-dir pkg --release",
-    "build:wasm:snes": "wasm-pack build core-snes --target web --out-dir pkg --release",
-    "build:wasm:genesis": "wasm-pack build core-genesis --target web --out-dir pkg --release",
-    "build:wasm:pce": "wasm-pack build core-pce --target web --out-dir pkg --release",
-    "build:wasm:atari2600": "wasm-pack build core-atari2600 --target web --out-dir pkg --release",
-    "build:wasm:ngpc": "wasm-pack build core-ngpc --target web --out-dir pkg --release",
-    "build:wasm:wonderswan": "wasm-pack build core-wonderswan --target web --out-dir pkg --release",
-    "build:wasm:virtualboy": "wasm-pack build core-virtualboy --target web --out-dir pkg --release",
-    "build:wasm:n64": "wasm-pack build core-n64 --target web --out-dir pkg --release",
-    "build": "tsc && vite build",
-    "preview": "npm run build && wrangler dev",
-    "gen:cheats": "tsx scripts/gen-cheats.ts",
-    "test": "cargo test --manifest-path core/Cargo.toml",
-    "lint": "oxlint src",
-    "deploy": "npm run build:wasm && npm run build:wasm:nds && npm run build:wasm:nes && npm run build:wasm:sms && npm run build:wasm:gbc && npm run build:wasm:ps1 && npm run build:wasm:xbox && npm run build:wasm:snes && npm run build:wasm:genesis && npm run build:wasm:pce && npm run build:wasm:atari2600 && npm run build:wasm:ngpc && npm run build:wasm:wonderswan && npm run build:wasm:virtualboy && npm run build:wasm:n64 && npm run build && wrangler deploy"
+    "build": "turbo run build",
+    "dev": "turbo run dev --filter=@emulators/web",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "deploy": "turbo run deploy --filter=@emulators/web",
+    "gen:cheats": "tsx scripts/gen-cheats.ts"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.40.0",
-    "@cloudflare/workers-types": "^4.20260608.1",
-    "@tailwindcss/vite": "^4.3.0",
-    "@types/node": "^25.9.2",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.2",
-    "@vitest/coverage-v8": "^4.1.8",
-    "oxlint": "^1.68.0",
-    "portless": "^0.13.0",
-    "tailwindcss": "^4.3.0",
     "tsx": "^4.22.4",
-    "typescript": "^5.6.3",
-    "vite": "^8.0.16",
-    "vitest": "^4.1.8",
-    "wrangler": "^4.98.0"
+    "turbo": "^2.5.0"
   },
-  "dependencies": {
-    "@tanstack/query-sync-storage-persister": "^5.101.0",
-    "@tanstack/react-query": "^5.101.0",
-    "@tanstack/react-query-persist-client": "^5.101.0",
-    "fflate": "^0.8.3",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "react-router-dom": "^7.17.0"
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
   }
 }

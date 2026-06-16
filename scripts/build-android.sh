@@ -2,7 +2,7 @@
 # Build the GBA core as Android shared libraries (.so per ABI) for the (future)
 # React Native module.
 #
-# Output: core-ffi/build/jniLibs/<abi>/libgba_core_ffi.so for each ABI. Point
+# Output: packages/ffi/build/jniLibs/<abi>/libgba_core_ffi.so for each ABI. Point
 # the RN app's android `sourceSets ... jniLibs.srcDirs` at that folder and call
 # the `gba_*` C ABI over JNI from the Kotlin TurboModule.
 #
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-FFI=core-ffi
+FFI=packages/ffi
 OUT=$FFI/build/jniLibs
 
 : "${ANDROID_NDK_HOME:?set ANDROID_NDK_HOME to your Android NDK path}"
