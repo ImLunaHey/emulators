@@ -192,6 +192,17 @@ pub struct Nv2a {
     /// Set when a draw rasterized since the last present (the host presents only
     /// completed frames to avoid flashing a mid-clear surface).
     drew_since_present: bool,
+    /// Vertex-program constant file (c[0..191] × 4 floats, flat). The transform
+    /// matrices live here; the vertex shader multiplies POSITION by them. We
+    /// don't run the shader bytecode — we apply the matrix chain c[96]·c[100]·
+    /// c[104] (model·view·proj; viewport folded in), which is what every nxdk/
+    /// D3D vertex program does for position.
+    consts: Box<[f32; 768]>,
+    /// Float cursor for SET_TRANSFORM_CONSTANT writes (set by CONSTANT_LOAD).
+    const_cursor: usize,
+    /// True once any transform constant was uploaded (else fall back to the
+    /// viewport-register NDC map for pre-transformed geometry).
+    consts_written: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -228,6 +239,14 @@ mod m {
     pub const VIEWPORT_OFFSET_END: u32 = 0x0A2C;
     pub const VIEWPORT_SCALE: u32 = 0x0AF0; // +i*4 (x,y,z,w)
     pub const VIEWPORT_SCALE_END: u32 = 0x0AFC;
+    // Vertex-program constant file. The shaders multiply POSITION by transform
+    // matrices uploaded here (model/view/proj at c[96]/c[100]/c[104]); CONSTANT
+    // auto-advances the cursor set by CONSTANT_LOAD.
+    pub const SET_TRANSFORM_CONSTANT_LOAD: u32 = 0x1EA4; // cursor = vec4 index
+    // SET_TRANSFORM_CONSTANT[0..31]: an increasing run of 32 method slots, each
+    // writing one float at the auto-advancing cursor.
+    pub const SET_TRANSFORM_CONSTANT: u32 = 0x0B80;
+    pub const SET_TRANSFORM_CONSTANT_END: u32 = 0x0BFC;
     // Immediate-mode drawing.
     pub const SET_BEGIN_END: u32 = 0x17FC; // data 0 = end, else begin(primitive)
     pub const VERTEX_POS_X: u32 = 0x1880; // SET_VERTEX_DATA2F attr0 component0
@@ -260,6 +279,35 @@ fn wr32(ram: &mut [u8], addr: u32, v: u32) {
     if i + 4 <= ram.len() {
         ram[i..i + 4].copy_from_slice(&v.to_le_bytes());
     }
+}
+
+/// 4×4 row-major matrix product (row-vector convention): (a·b)[i][j] = Σ_k
+/// a[i][k]·b[k][j].
+#[inline]
+fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut r = [0.0f32; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += a[i * 4 + k] * b[k * 4 + j];
+            }
+            r[i * 4 + j] = s;
+        }
+    }
+    r
+}
+
+/// Row vector × 4×4 matrix: result[j] = Σ_i v[i]·m[i][j] (D3D `mul(v, M)`).
+#[inline]
+fn vec4_mat4(v: [f32; 4], m: &[f32; 16]) -> [f32; 4] {
+    let mut r = [0.0f32; 4];
+    for j in 0..4 {
+        for i in 0..4 {
+            r[j] += v[i] * m[i * 4 + j];
+        }
+    }
+    r
 }
 
 /// Read a diffuse-colour vertex attribute into a packed D3DCOLOR (0xAARRGGBB),
@@ -352,6 +400,20 @@ impl Nv2a {
             vp_scale: [0.0; 4],
             vp_offset: [0.0; 4],
             drew_since_present: false,
+            consts: {
+                // c[96]/c[100]/c[104] default to identity so a demo that uploads
+                // only some matrices (e.g. the triangle's single viewport matrix)
+                // leaves the rest as no-ops in the chain.
+                let mut c = Box::new([0.0f32; 768]);
+                for base in [96usize, 100, 104] {
+                    for i in 0..4 {
+                        c[base * 4 + i * 4 + i] = 1.0;
+                    }
+                }
+                c
+            },
+            const_cursor: 0,
+            consts_written: false,
         }
     }
 
@@ -675,6 +737,14 @@ impl Nv2a {
             m::VIEWPORT_SCALE..=m::VIEWPORT_SCALE_END => {
                 self.vp_scale[((method - m::VIEWPORT_SCALE) / 4) as usize] = f32::from_bits(data);
             }
+            m::SET_TRANSFORM_CONSTANT_LOAD => self.const_cursor = (data as usize) * 4,
+            m::SET_TRANSFORM_CONSTANT..=m::SET_TRANSFORM_CONSTANT_END => {
+                if let Some(slot) = self.consts.get_mut(self.const_cursor) {
+                    *slot = f32::from_bits(data);
+                    self.consts_written = true;
+                }
+                self.const_cursor += 1;
+            }
             m::SET_BEGIN_END => {
                 if data == 0 {
                     self.draw_primitives(ram); // END: rasterize what we gathered
@@ -756,6 +826,19 @@ impl Nv2a {
     /// diffuse) and return it as a screen-space vertex. Position may be 3- or
     /// 4-component (the 4th is w for the perspective divide); colour comes from
     /// the diffuse array if enabled, else the current diffuse register.
+    /// The transform matrix the vertex program multiplies POSITION by:
+    /// model·view·proj (each defaulting to identity). The viewport is folded into
+    /// the projection by the demos, so the result (after perspective divide) is
+    /// already in screen space.
+    fn composite_matrix(&self) -> [f32; 16] {
+        let mat = |base: usize| -> [f32; 16] {
+            let mut m = [0.0f32; 16];
+            m.copy_from_slice(&self.consts[base * 4..base * 4 + 16]);
+            m
+        };
+        mat4_mul(&mat4_mul(&mat(96), &mat(100)), &mat(104))
+    }
+
     fn fetch_vertex(&self, ram: &[u8], index: u32) -> Vertex {
         let pos_fmt = self.va_format[VA_POSITION];
         let pos_size = (pos_fmt >> 4) & 0xF;
@@ -763,8 +846,19 @@ impl Nv2a {
         let pb = self.va_offset[VA_POSITION].wrapping_add(index.wrapping_mul(pos_stride));
         let x = f32::from_bits(rd32(ram, pb));
         let y = f32::from_bits(rd32(ram, pb.wrapping_add(4)));
+        let z = if pos_size >= 3 { f32::from_bits(rd32(ram, pb.wrapping_add(8))) } else { 0.0 };
         let w = if pos_size >= 4 { f32::from_bits(rd32(ram, pb.wrapping_add(12))) } else { 1.0 };
-        let (sx, sy) = self.project(x, y, w);
+        // Run the vertex transform: multiply POSITION by the model·view·proj
+        // chain and perspective-divide (the demos bake the viewport into proj, so
+        // this lands in screen space). Falls back to the viewport-register NDC map
+        // for pre-transformed geometry that uploads no matrices.
+        let (sx, sy) = if self.consts_written {
+            let c = vec4_mat4([x, y, z, 1.0], &self.composite_matrix());
+            let cw = if c[3].abs() > 1e-6 { c[3] } else { 1.0 };
+            (c[0] / cw, c[1] / cw)
+        } else {
+            self.project(x, y, w)
+        };
         let col_fmt = self.va_format[VA_DIFFUSE];
         let color = if self.va_offset[VA_DIFFUSE] != 0 && (col_fmt >> 4) & 0xF != 0 {
             let stride = (col_fmt >> 8) & 0x00FF_FFFF;
