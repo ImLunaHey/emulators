@@ -1218,6 +1218,8 @@ const ORD_MM_CLAIM_GPU_INSTANCE_MEMORY: u32 = 168;
 const ORD_HAL_READ_WRITE_PCI_SPACE: u32 = 46;
 const ORD_HAL_RETURN_TO_FIRMWARE: u32 = 49;
 const ORD_AV_SEND_TV_ENCODER_OPTION: u32 = 2;
+/// AvSendTVEncoderOption "get settings" option — reports AV pack + video standard.
+const AV_ENC_GET_SETTINGS: u32 = 6;
 const ORD_AV_SET_DISPLAY_MODE: u32 = 3;
 const ORD_AV_GET_SAVED_DATA_ADDRESS: u32 = 1;
 const ORD_AV_SET_SAVED_DATA_ADDRESS: u32 = 4;
@@ -2150,10 +2152,17 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
         // ---- Display / TV encoder (Av*) ----
         ORD_AV_SEND_TV_ENCODER_OPTION => {
             // AvSendTVEncoderOption(RegisterBase, Option, Param, ULONG *Result).
-            // No encoder modeled; report success and a zero result.
+            // The only query that matters for bring-up is GET_SETTINGS (option 6):
+            // it reports the connected AV pack + video standard, which the video
+            // HAL matches against its mode table. Returning 0 means "no display"
+            // (AV_PACK_NONE) so no mode is found and the title never calls
+            // AvSetDisplayMode. Report a standard AV cable + NTSC-M
+            // (adapter=AV_PACK_STANDARD=0x01, standard=NTSC-M=0x0100).
+            let option = arg(cpu, mem, 1);
             let result = arg(cpu, mem, 3);
             if result != 0 {
-                mem.ram_write32(result, 0);
+                let val = if option == AV_ENC_GET_SETTINGS { 0x0000_0101 } else { 0 };
+                mem.ram_write32(result, val);
             }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 16);
             Dispatch::Handled("AvSendTVEncoderOption")
