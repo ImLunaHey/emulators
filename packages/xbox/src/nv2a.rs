@@ -167,6 +167,10 @@ pub struct Nv2a {
     clip_y: u16,
     clip_w: u16,
     clip_h: u16,
+    /// Clear-rect window (NV097_SET_CLEAR_RECT_*), defaulting to "unset" so the
+    /// first clear falls back to the full surface clip. Once a game programs it,
+    /// CLEAR_SURFACE is bounded to this rect.
+    clear_rect: Option<(u16, u16, u16, u16)>, // (x0, y0, x1, y1)
     pub width: u16,
     pub height: u16,
 
@@ -175,6 +179,10 @@ pub struct Nv2a {
     verts: Vec<Vertex>,       // accumulated vertices
     vcolor: u32,              // current diffuse color (D3DCOLOR ARGB)
     vx: f32,                  // pending vertex X (until Y completes the vertex)
+    // Vertex-array draw state (DRAW_ARRAYS path): per-attribute RAM offset +
+    // format word (type/size/stride packed as NV097_SET_VERTEX_DATA_ARRAY_FORMAT).
+    va_offset: [u32; 16],
+    va_format: [u32; 16],
 }
 
 #[derive(Clone, Copy)]
@@ -192,6 +200,20 @@ mod m {
     pub const SET_SURFACE_COLOR_OFFSET: u32 = 0x0210;
     pub const SET_COLOR_CLEAR_VALUE: u32 = 0x1D90;
     pub const CLEAR_SURFACE: u32 = 0x1D94;
+    // Clear-rect window (NV097_SET_CLEAR_RECT_*): bounds CLEAR_SURFACE to a
+    // sub-rectangle. pbkit's on-screen text is drawn as a sequence of small
+    // clear-rects, so honouring this is what keeps a clear from whitening the
+    // whole screen.
+    pub const SET_CLEAR_RECT_HORIZONTAL: u32 = 0x1D98; // (x1<<16)|x0
+    pub const SET_CLEAR_RECT_VERTICAL: u32 = 0x1D9C; // (y1<<16)|y0
+    // Vertex-array draw path (NV097_SET_VERTEX_DATA_ARRAY_*): per-attribute RAM
+    // offset + format (type/size/stride), then DRAW_ARRAYS pulls vertices from
+    // those arrays. attr 0 = position, attr 3 = diffuse colour.
+    pub const VERTEX_DATA_ARRAY_OFFSET: u32 = 0x1720; // +attr*4 (16 attrs)
+    pub const VERTEX_DATA_ARRAY_OFFSET_END: u32 = 0x175C;
+    pub const VERTEX_DATA_ARRAY_FORMAT: u32 = 0x1760; // +attr*4 (16 attrs)
+    pub const VERTEX_DATA_ARRAY_FORMAT_END: u32 = 0x179C;
+    pub const DRAW_ARRAYS: u32 = 0x1810; // (count-1)<<24 | start_index
     // Immediate-mode drawing.
     pub const SET_BEGIN_END: u32 = 0x17FC; // data 0 = end, else begin(primitive)
     pub const VERTEX_POS_X: u32 = 0x1880; // SET_VERTEX_DATA2F attr0 component0
@@ -199,11 +221,15 @@ mod m {
     pub const VERTEX_DIFFUSE: u32 = 0x194C; // SET_VERTEX_DATA4UB attr3 (diffuse)
 }
 
-/// NV2A primitive types (the ones we rasterize).
-const PRIM_TRIANGLES: u32 = 4;
-const PRIM_TRIANGLE_STRIP: u32 = 5;
-const PRIM_TRIANGLE_FAN: u32 = 6;
+/// NV2A primitive types (NV097_SET_BEGIN_END op codes — the wire values the GPU
+/// driver actually submits).
+const PRIM_TRIANGLES: u32 = 5;
+const PRIM_TRIANGLE_STRIP: u32 = 6;
+const PRIM_TRIANGLE_FAN: u32 = 7;
 const PRIM_QUADS: u32 = 8;
+/// Vertex-array attribute slots we read in the DRAW_ARRAYS path.
+const VA_POSITION: usize = 0;
+const VA_DIFFUSE: usize = 3;
 
 #[inline]
 fn rd32(ram: &[u8], addr: u32) -> u32 {
@@ -219,6 +245,25 @@ fn wr32(ram: &mut [u8], addr: u32, v: u32) {
     let i = addr as usize;
     if i + 4 <= ram.len() {
         ram[i..i + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Read a diffuse-colour vertex attribute into a packed D3DCOLOR (0xAARRGGBB),
+/// honouring the attribute format's element type. Type 2 = float components
+/// (RGB or RGBA in 0..=1); anything else is treated as an already-packed u32.
+#[inline]
+fn read_vertex_color(ram: &[u8], addr: u32, format: u32) -> u32 {
+    let elem_type = format & 0xF;
+    let size = (format >> 4) & 0xF;
+    if elem_type == 2 {
+        let f = |o: u32| (f32::from_bits(rd32(ram, addr.wrapping_add(o))).clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+        let r = f(0);
+        let g = f(4);
+        let b = f(8);
+        let a = if size >= 4 { f(12) } else { 0xFF };
+        (a << 24) | (r << 16) | (g << 8) | b
+    } else {
+        rd32(ram, addr) | 0xFF00_0000
     }
 }
 
@@ -279,6 +324,7 @@ impl Nv2a {
             clip_y: 0,
             clip_w: 640,
             clip_h: 480,
+            clear_rect: None,
             // The displayed surface size is established by the first clear
             // (grown to the largest cleared extent); 0 until then.
             width: 0,
@@ -287,6 +333,8 @@ impl Nv2a {
             verts: Vec::new(),
             vcolor: 0xFFFF_FFFF,
             vx: 0.0,
+            va_offset: [0; 16],
+            va_format: [0; 16],
         }
     }
 
@@ -572,12 +620,29 @@ impl Nv2a {
                 self.surface_offset = data & (crate::regions::RAM_SIZE as u32 - 1)
             }
             m::SET_COLOR_CLEAR_VALUE => self.clear_color = data,
+            m::SET_CLEAR_RECT_HORIZONTAL => {
+                let (x0, x1) = ((data & 0xFFFF) as u16, (data >> 16) as u16);
+                let (y0, y1) = self.clear_rect.map(|(_, y0, _, y1)| (y0, y1)).unwrap_or((0, 0));
+                self.clear_rect = Some((x0, y0, x1, y1));
+            }
+            m::SET_CLEAR_RECT_VERTICAL => {
+                let (y0, y1) = ((data & 0xFFFF) as u16, (data >> 16) as u16);
+                let (x0, x1) = self.clear_rect.map(|(x0, _, x1, _)| (x0, x1)).unwrap_or((0, 0));
+                self.clear_rect = Some((x0, y0, x1, y1));
+            }
             m::CLEAR_SURFACE => {
                 // bit 0x40 = clear color buffer (NV097_CLEAR_SURFACE_COLOR).
                 if data & 0xF0 != 0 {
                     self.clear_color_buffer(ram);
                 }
             }
+            m::VERTEX_DATA_ARRAY_OFFSET..=m::VERTEX_DATA_ARRAY_OFFSET_END => {
+                self.va_offset[((method - m::VERTEX_DATA_ARRAY_OFFSET) / 4) as usize] = data;
+            }
+            m::VERTEX_DATA_ARRAY_FORMAT..=m::VERTEX_DATA_ARRAY_FORMAT_END => {
+                self.va_format[((method - m::VERTEX_DATA_ARRAY_FORMAT) / 4) as usize] = data;
+            }
+            m::DRAW_ARRAYS => self.draw_arrays(ram, data),
             m::SET_BEGIN_END => {
                 if data == 0 {
                     self.draw_primitives(ram); // END: rasterize what we gathered
@@ -620,6 +685,63 @@ impl Nv2a {
         } else {
             self.surface_offset
         }
+    }
+
+    /// Viewport the DRAW_ARRAYS path maps NDC into: the display dimensions if the
+    /// game programmed the encoder, else the surface clip, else 640×480.
+    fn viewport_dims(&self) -> (u16, u16) {
+        if self.disp_w != 0 && self.disp_h != 0 {
+            (self.disp_w, self.disp_h)
+        } else if self.clip_w != 0 && self.clip_h != 0 {
+            (self.clip_w, self.clip_h)
+        } else {
+            (640, 480)
+        }
+    }
+
+    /// Pull `count` vertices from the configured vertex arrays (attr 0 position,
+    /// attr 3 diffuse) and append them as screen-space vertices for the current
+    /// BEGIN..END primitive. Positions are read as NDC and mapped through the
+    /// viewport; colours are read per the attribute's format (float RGB[A] or a
+    /// packed D3DCOLOR). This is the path real nxdk/D3D8 geometry uses (vs. the
+    /// immediate SET_VERTEX_DATA2F path).
+    fn draw_arrays(&mut self, ram: &[u8], data: u32) {
+        let count = ((data >> 24) & 0xFF) + 1;
+        let start = data & 0x00FF_FFFF;
+        let (vw, vh) = self.viewport_dims();
+        if vw == 0 || vh == 0 {
+            return;
+        }
+        let pos_off = self.va_offset[VA_POSITION];
+        let pos_stride = (self.va_format[VA_POSITION] >> 8) & 0x00FF_FFFF;
+        let col_off = self.va_offset[VA_DIFFUSE];
+        let col_fmt = self.va_format[VA_DIFFUSE];
+        let col_stride = (col_fmt >> 8) & 0x00FF_FFFF;
+        for i in start..start.wrapping_add(count) {
+            let pb = pos_off.wrapping_add(i.wrapping_mul(pos_stride));
+            let x = f32::from_bits(rd32(ram, pb));
+            let y = f32::from_bits(rd32(ram, pb.wrapping_add(4)));
+            // NDC (-1..=1) → screen pixels (Y flipped: NDC +Y is up).
+            let sx = (x + 1.0) * 0.5 * vw as f32;
+            let sy = (1.0 - y) * 0.5 * vh as f32;
+            let color = if col_off != 0 && col_stride != 0 {
+                read_vertex_color(ram, col_off.wrapping_add(i.wrapping_mul(col_stride)), col_fmt)
+            } else {
+                self.vcolor
+            };
+            if self.verts.len() < 4096 {
+                self.verts.push(Vertex { x: sx, y: sy, color });
+            }
+        }
+        // Establish the surface so draw_primitives proceeds and scanout presents
+        // it even when the background clear was done on the CPU side.
+        if self.width == 0 {
+            self.width = vw;
+        }
+        if self.height == 0 {
+            self.height = vh;
+        }
+        self.has_surface = true;
     }
 
     /// Rasterize the gathered vertices for the current primitive into the color
@@ -670,26 +792,40 @@ impl Nv2a {
     /// Fill the color surface's clip rect with the clear value, and adopt it as
     /// the displayed surface.
     fn clear_color_buffer(&mut self, ram: &mut [u8]) {
-        let x0 = self.clip_x as u32;
-        let y0 = self.clip_y as u32;
-        let w = self.clip_w.max(1) as u32;
-        let h = self.clip_h.max(1) as u32;
+        // The clear is bounded by the clear-rect window if the game set one
+        // (pbkit draws text as many small clear-rects — without this we'd clear
+        // the whole screen for each glyph and whiten everything); otherwise it
+        // falls back to the full surface clip.
+        let (x0, y0, x1, y1) = match self.clear_rect {
+            Some((rx0, ry0, rx1, ry1)) => (rx0 as u32, ry0 as u32, rx1 as u32, ry1 as u32),
+            None => {
+                let x0 = self.clip_x as u32;
+                let y0 = self.clip_y as u32;
+                (x0, y0, x0 + self.clip_w.max(1) as u32, y0 + self.clip_h.max(1) as u32)
+            }
+        };
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        // The row stride is the full surface pitch — NOT the rect width — so a
+        // sub-rect clear writes the correct pixels.
+        let (vw, _) = self.viewport_dims();
         let pitch = if self.surface_pitch == 0 {
-            (x0 + w) * 4
+            vw.max(x1 as u16) as u32 * 4
         } else {
             self.surface_pitch
         };
         let surface_base = self.surface_base();
-        for y in y0..y0 + h {
+        for y in y0..y1 {
             let row = surface_base.wrapping_add(y * pitch);
-            for x in x0..x0 + w {
+            for x in x0..x1 {
                 wr32(ram, row.wrapping_add(x * 4), self.clear_color);
             }
         }
         // The displayed surface grows to the largest cleared extent (so a small
         // sub-rect clear after a full-screen clear doesn't shrink the screen).
-        self.width = self.width.max((x0 + w) as u16);
-        self.height = self.height.max((y0 + h) as u16);
+        self.width = self.width.max(x1 as u16);
+        self.height = self.height.max(y1 as u16);
         self.has_surface = true;
     }
 

@@ -101,6 +101,19 @@ fn main() {
     for _ in 0..frames {
         xb.run_frame();
     }
+    // Optional: dump the framebuffer to a PPM (P6) for visual inspection.
+    if let Ok(path) = std::env::var("XBOX_PPM") {
+        let fb = xb.framebuffer();
+        let (w, h) = (xb.width() as usize, xb.height() as usize);
+        if w > 0 && h > 0 && fb.len() >= w * h * 4 {
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for px in fb.chunks_exact(4) {
+                out.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+            std::fs::write(&path, out).expect("write ppm");
+            eprintln!("wrote {path} ({w}x{h})");
+        }
+    }
     xbox_core::xbox::dump_eip_hist(); // top spin EIPs when XBOX_TRACE_EIP is set
     if let Ok(a) = std::env::var("XBOX_DUMP_ADDR") {
         let base = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or(0);
