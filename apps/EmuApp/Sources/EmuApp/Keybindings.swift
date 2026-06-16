@@ -129,11 +129,36 @@ enum PadInput: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// Default controller layout (DualSense-style), matching the original hard-coded
-/// mapping.
+extension PadInput {
+    /// A short glyph for the binding chips (PlayStation face symbols, arrows).
+    var glyph: String {
+        switch self {
+        case .a: return "✕"
+        case .b: return "◯"
+        case .x: return "□"
+        case .y: return "△"
+        case .dpadUp: return "↑"
+        case .dpadDown: return "↓"
+        case .dpadLeft: return "←"
+        case .dpadRight: return "→"
+        case .l1: return "L1"
+        case .r1: return "R1"
+        case .l2: return "L2"
+        case .r2: return "R2"
+        case .menu: return "Menu"
+        case .options: return "Share"
+        }
+    }
+}
+
+/// Default controller layout (PlayStation): Cross → A, Circle → B (matching the
+/// web front-end), with the face diamond mapped by position.
 enum DefaultPadBindings {
     static let map: [Btn: PadInput] = [
-        .south: .a, .east: .b, .west: .x, .north: .y,
+        .east: .a,    // emulator "A" ← Cross (✕)
+        .south: .b,   // emulator "B" ← Circle (◯)
+        .west: .x,    // "Y" (left) ← Square (□)
+        .north: .y,   // "X" (top)  ← Triangle (△)
         .up: .dpadUp, .down: .dpadDown, .left: .dpadLeft, .right: .dpadRight,
         .l1: .l1, .r1: .r1, .l2: .l2, .r2: .r2,
         .start: .menu, .select: .options,

@@ -218,142 +218,275 @@ private struct StorageDetail: View {
 
 // ---- Controls (keyboard remapping) ----
 
+// ---- Controls (keyboard + controller remapping) ----
+
 private struct ControlsSettingsView: View {
-    @EnvironmentObject var settings: AppSettings
-    // Keyboard capture.
-    @State private var capturing: Btn?
-    @State private var monitor: Any?
-    // Controller capture (polled, since there's no event stream).
-    @State private var capturingPad: Btn?
-    @State private var padTimer: Timer?
+    private enum Mode: String, CaseIterable, Identifiable { case keyboard, controller; var id: String { rawValue } }
+    @State private var mode: Mode = .keyboard
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Form {
-                Section {
-                    ForEach(Btn.bindOrder) { btn in
-                        HStack {
-                            Text(btn.label)
-                            Spacer()
-                            Button { beginCapture(btn) } label: {
-                                Text(capturing == btn
-                                     ? "Press a key…"
-                                     : (settings.binding(for: btn)?.label ?? "—"))
-                                    .frame(minWidth: 96)
-                            }
-                            .tint(capturing == btn ? .accentColor : nil)
-                        }
-                    }
-                } header: {
-                    Text("Keyboard")
-                } footer: {
-                    Text("Click a button, then press the key to bind it (Esc cancels).")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-
-                Section {
-                    ForEach(Btn.bindOrder) { btn in
-                        HStack {
-                            Text(btn.label)
-                            Spacer()
-                            Button { beginPadCapture(btn) } label: {
-                                Text(capturingPad == btn
-                                     ? "Press a button…"
-                                     : (settings.padBinding(for: btn)?.label ?? "—"))
-                                    .frame(minWidth: 110)
-                            }
-                            .tint(capturingPad == btn ? .accentColor : nil)
-                            .disabled(firstGamepad == nil)
-                        }
-                    }
-                } header: {
-                    Text("Controller")
-                } footer: {
-                    Text(firstGamepad == nil
-                         ? "Connect a controller to remap it."
-                         : "Click a button, then press the controller button to bind it. "
-                            + "The left stick always works as the D-pad.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+        VStack(spacing: 0) {
+            Picker("", selection: $mode) {
+                Text("Keyboard").tag(Mode.keyboard)
+                Text("Controller").tag(Mode.controller)
             }
-            .formStyle(.grouped)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding([.horizontal, .top], 14)
+            .padding(.bottom, 6)
 
-            HStack {
-                Spacer()
-                Button("Reset to Defaults") {
-                    cancelCapture()
-                    cancelPadCapture()
-                    settings.resetBindings()
-                    settings.resetPadBindings()
-                }
+            if mode == .keyboard {
+                KeyboardBindingsView()
+            } else {
+                ControllerBindingsView()
             }
-            .padding(.horizontal)
-            .padding(.bottom, 12)
-        }
-        .onDisappear {
-            cancelCapture()
-            cancelPadCapture()
         }
     }
+}
 
-    // ---- keyboard capture ----
+// ---- keyboard ----
+
+private struct KeyboardBindingsView: View {
+    @EnvironmentObject var settings: AppSettings
+    @State private var capturing: Btn?
+    @State private var monitor: Any?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 6) {
+                    ForEach(Btn.bindOrder) { btn in
+                        BindRow(name: btn.label,
+                                value: capturing == btn ? "Press a key…" : (settings.binding(for: btn)?.label ?? "—"),
+                                active: capturing == btn) { beginCapture(btn) }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+            }
+            Divider()
+            HStack {
+                Text("Click a binding, then press a key (Esc cancels).")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset") { cancelCapture(); settings.resetBindings() }
+            }
+            .padding(12)
+        }
+        .onDisappear(perform: cancelCapture)
+    }
 
     private func beginCapture(_ btn: Btn) {
         cancelCapture()
-        cancelPadCapture()
         capturing = btn
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { ev in
-            handleCapture(ev)
-            return nil
+            handleCapture(ev); return nil
         }
     }
-
     private func handleCapture(_ ev: NSEvent) {
         guard let btn = capturing else { return }
         switch ev.type {
         case .keyDown:
-            if ev.keyCode == 53 { cancelCapture(); return } // Esc cancels
-            settings.setBinding(.key(ev.keyCode), for: btn)
-            cancelCapture()
+            if ev.keyCode == 53 { cancelCapture(); return }
+            settings.setBinding(.key(ev.keyCode), for: btn); cancelCapture()
         case .flagsChanged:
             for m in KeyBind.Modifier.allCases where ev.modifierFlags.contains(m.flag) {
-                settings.setBinding(.modifier(m), for: btn)
-                cancelCapture()
-                return
+                settings.setBinding(.modifier(m), for: btn); cancelCapture(); return
             }
-        default:
-            break
+        default: break
         }
     }
-
     private func cancelCapture() {
         capturing = nil
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
     }
+}
 
-    // ---- controller capture (poll for a fresh press) ----
+// ---- controller (live diagram + chip bindings) ----
 
-    private func beginPadCapture(_ btn: Btn) {
-        cancelCapture()
-        cancelPadCapture()
-        guard let pad = firstGamepad else { return }
-        capturingPad = btn
-        // Buttons already held when capture starts don't count, so the user makes
-        // a deliberate fresh press.
-        let initial = Set(PadInput.allCases.filter { $0.isPressed(pad) })
-        padTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-            guard let pad = firstGamepad else { return }
-            if let hit = PadInput.allCases.first(where: { $0.isPressed(pad) && !initial.contains($0) }) {
-                settings.setPadBinding(hit, for: btn)
-                cancelPadCapture()
+private struct ControllerBindingsView: View {
+    @EnvironmentObject var settings: AppSettings
+    @State private var capturing: Btn?
+    @State private var pressed: Set<PadInput> = []
+    @State private var poll: Timer?
+    @State private var connected = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if !connected {
+                emptyState("Connect a controller and press any button.\nPS5 DualSense, Xbox, or any USB/Bluetooth pad works.")
+            } else {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        PadDiagram(pressed: pressed)
+                            .padding(.horizontal, 14)
+                            .padding(.top, 8)
+                        VStack(spacing: 6) {
+                            ForEach(Btn.bindOrder) { btn in
+                                BindRow(name: btn.label,
+                                        value: capturing == btn ? "Press a button…" : (settings.padBinding(for: btn)?.glyph ?? "—"),
+                                        active: capturing == btn,
+                                        highlight: isLit(btn)) { beginCapture(btn) }
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                    }
+                    .padding(.bottom, 8)
+                }
+            }
+            Divider()
+            HStack {
+                Text(connected ? "Click a binding, then press a controller button. Left stick = D-pad."
+                               : "No controller connected.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset") { capturing = nil; settings.resetPadBindings() }
+                    .disabled(!connected)
+            }
+            .padding(12)
+        }
+        .onAppear(perform: startPolling)
+        .onDisappear { poll?.invalidate(); poll = nil }
+    }
+
+    private func isLit(_ btn: Btn) -> Bool {
+        if let b = settings.padBinding(for: btn) { return pressed.contains(b) }
+        return false
+    }
+
+    private func startPolling() {
+        poll?.invalidate()
+        poll = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { _ in
+            guard let pad = firstGamepad else {
+                if connected { connected = false }
+                if !pressed.isEmpty { pressed = [] }
+                return
+            }
+            if !connected { connected = true }
+            let now = Set(PadInput.allCases.filter { $0.isPressed(pad) })
+            if now != pressed {
+                // While capturing, bind the first newly-pressed input.
+                if let btn = capturing, let hit = now.subtracting(pressed).first {
+                    settings.setPadBinding(hit, for: btn)
+                    capturing = nil
+                }
+                pressed = now
             }
         }
     }
 
-    private func cancelPadCapture() {
-        capturingPad = nil
-        padTimer?.invalidate()
-        padTimer = nil
+    private func beginCapture(_ btn: Btn) { capturing = (capturing == btn) ? nil : btn }
+}
+
+/// One binding row: name on the left, a clickable chip on the right.
+private struct BindRow: View {
+    let name: String
+    let value: String
+    var active = false
+    var highlight = false
+    let action: () -> Void
+
+    var body: some View {
+        HStack {
+            Text(name).font(.system(size: 12))
+            Spacer()
+            Button(action: action) {
+                Text(value)
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(minWidth: 96)
+                    .padding(.vertical, 5)
+                    .background(active ? Color.accentColor.opacity(0.85)
+                                       : (highlight ? Color.green.opacity(0.7) : Color.gray.opacity(0.18)))
+                    .foregroundColor(active || highlight ? .white : .primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
+        .background(Color.primary.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// A live PS-style controller diagram; elements light up as buttons are pressed.
+private struct PadDiagram: View {
+    let pressed: Set<PadInput>
+    private func on(_ i: PadInput) -> Bool { pressed.contains(i) }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            // Left: triggers + d-pad.
+            VStack(spacing: 14) {
+                HStack(spacing: 6) { pill("L2", on(.l2)); pill("L1", on(.l1)) }
+                dpad
+            }
+            Spacer(minLength: 0)
+            VStack(spacing: 8) {
+                HStack(spacing: 6) { pill("Share", on(.options)); pill("Menu", on(.menu)) }
+            }
+            .padding(.top, 18)
+            Spacer(minLength: 0)
+            // Right: triggers + face diamond.
+            VStack(spacing: 14) {
+                HStack(spacing: 6) { pill("R1", on(.r1)); pill("R2", on(.r2)) }
+                diamond
+            }
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 18)
+        .background(Color.black.opacity(0.35))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.08)))
+    }
+
+    private var dpad: some View {
+        let s: CGFloat = 26
+        return ZStack {
+            VStack(spacing: 2) {
+                arrow("arrowtriangle.up.fill", on(.dpadUp))
+                HStack(spacing: 2) {
+                    arrow("arrowtriangle.left.fill", on(.dpadLeft))
+                    Color.clear.frame(width: s, height: s)
+                    arrow("arrowtriangle.right.fill", on(.dpadRight))
+                }
+                arrow("arrowtriangle.down.fill", on(.dpadDown))
+            }
+        }
+    }
+
+    private var diamond: some View {
+        VStack(spacing: 2) {
+            face("△", .green, on(.y))
+            HStack(spacing: 2) {
+                face("□", .pink, on(.x))
+                Color.clear.frame(width: 30, height: 30)
+                face("◯", .red, on(.b))
+            }
+            face("✕", .blue, on(.a))
+        }
+    }
+
+    private func face(_ sym: String, _ color: Color, _ lit: Bool) -> some View {
+        Text(sym)
+            .font(.system(size: 14, weight: .bold))
+            .frame(width: 30, height: 30)
+            .background(Circle().fill(lit ? color : color.opacity(0.22)))
+            .foregroundColor(lit ? .white : color)
+    }
+    private func arrow(_ sym: String, _ lit: Bool) -> some View {
+        Image(systemName: sym)
+            .font(.system(size: 11))
+            .frame(width: 26, height: 26)
+            .background(RoundedRectangle(cornerRadius: 5).fill(lit ? Color.accentColor : Color.gray.opacity(0.25)))
+            .foregroundColor(lit ? .white : .secondary)
+    }
+    private func pill(_ label: String, _ lit: Bool) -> some View {
+        Text(label)
+            .font(.system(size: 10, weight: .semibold))
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .background(Capsule().fill(lit ? Color.accentColor : Color.gray.opacity(0.22)))
+            .foregroundColor(lit ? .white : .secondary)
     }
 }
 
