@@ -34,10 +34,22 @@ cargo run --release --manifest-path core-xbox/Cargo.toml \
   --example boot_probe -- core-xbox/demos/triangle.xbe 60
 ```
 
-## Current stop point (as of this commit)
+## Current status
 
-Both XBEs boot (`boot_xbe = true`) but stop at **`STOP KERNEL 192
-(NTCREATEMUTANT)` after 53 instructions** — nxdk's CRT calls `NtCreateMutant`
-during startup, before any graphics. So `triangle` does not yet reach the
-scanout path; the punch list to a first rendered frame begins with
-`NtCreateMutant` (192) and the CRT/graphics-init seams that follow it.
+Both XBEs boot and run their real code (53 → tens of millions of instructions).
+The CRT-init + video-init seams have been implemented (NtCreateMutant, real
+SHA-1, Interlocked atomics, IRQL, TLS, time exports, symlink objects, disk
+IOCTLs, events, RDMSR, the AV-encoder GET_SETTINGS reply, and the NV2A GPU
+PLL/PFB config registers).
+
+`triangle.xbe` now:
+- passes `pb_init` and calls **`AvSetDisplayMode`**;
+- drives the **NV2A scanout with its own framebuffer** — the host surface flips
+  from the boot diagnostic (`#060E06`) to the game's cleared screen (`#000000`);
+- **pushes ~237 real NV2A pushbuffer methods** (Kelvin pipeline setup) through
+  the PFIFO/PGRAPH.
+
+Remaining to a visible triangle: the full Kelvin **vertex/draw pipeline**
+(`BEGIN_END` + vertex arrays → `nv2a_render` rasterize) and the **double-buffer
+flip** (PCRTC_START update). That's focused NV2A PGRAPH work — the scanout +
+rasterizer are now proven reachable by real third-party geometry.
