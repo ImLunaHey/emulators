@@ -397,6 +397,130 @@ impl Emu {
             }
         }
     }
+
+    /// Current persistent save data (battery SRAM/Flash/EEPROM), or empty for
+    /// cores without battery-backed storage. The bytes are the core's native
+    /// `.sav` image — directly interchangeable with other emulators. (`.to_vec`
+    /// normalizes the cores that hand back a borrowed slice vs an owned Vec.)
+    fn save_data(&self) -> Vec<u8> {
+        match &self.inner {
+            Inner::Gba(c) => c.save_ram().to_vec(),
+            Inner::Gbc(c) => c.save_ram().to_vec(),
+            Inner::Snes(c) => c.save_ram().to_vec(),
+            Inner::Genesis(c) => c.save_ram().to_vec(),
+            Inner::Sms(c) => c.save_ram().to_vec(),
+            Inner::WonderSwan(c) => c.save_ram().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Load a previously-saved `.sav` image into the core's battery store.
+    /// No-op for cores without one.
+    fn load_save(&mut self, bytes: &[u8]) {
+        match &mut self.inner {
+            Inner::Gba(c) => c.load_save_ram(bytes),
+            Inner::Gbc(c) => c.load_save_ram(bytes),
+            Inner::Snes(c) => c.load_save_ram(bytes),
+            Inner::Genesis(c) => c.load_save_ram(bytes),
+            Inner::Sms(c) => c.load_save_ram(bytes),
+            Inner::WonderSwan(c) => c.load_save_ram(bytes),
+            _ => {}
+        }
+    }
+
+    /// Whether the save store changed since the last `clear_save_dirty` — the
+    /// host polls this to decide when to flush a `.sav` to disk.
+    fn save_dirty(&self) -> bool {
+        match &self.inner {
+            Inner::Gba(c) => c.save_dirty(),
+            Inner::Gbc(c) => c.save_dirty(),
+            Inner::Snes(c) => c.save_dirty(),
+            Inner::Genesis(c) => c.save_dirty(),
+            Inner::Sms(c) => c.save_dirty(),
+            Inner::WonderSwan(c) => c.save_dirty(),
+            _ => false,
+        }
+    }
+
+    fn clear_save_dirty(&mut self) {
+        match &mut self.inner {
+            Inner::Gba(c) => c.clear_save_dirty(),
+            Inner::Gbc(c) => c.clear_save_dirty(),
+            Inner::Snes(c) => c.clear_save_dirty(),
+            Inner::Genesis(c) => c.clear_save_dirty(),
+            Inner::Sms(c) => c.clear_save_dirty(),
+            Inner::WonderSwan(c) => c.clear_save_dirty(),
+            _ => {}
+        }
+    }
+
+    /// Attach (or detach) a link peripheral. Returns true if the core applied it.
+    /// Today only the GBA models attachments: the Wireless Adapter swaps the SIO
+    /// transport; Link Cable / None use the default serial loopback.
+    fn set_attachment(&mut self, attachment: Attachment) {
+        if let Inner::Gba(c) = &mut self.inner {
+            c.sio_set_wireless_adapter(attachment == Attachment::WirelessAdapter);
+        }
+    }
+}
+
+/// Link peripherals a core can present on its serial port. The Swift front-end
+/// shows the ones in `System::supported_attachments` and applies the choice via
+/// `emu_set_attachment`.
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Attachment {
+    None = 0,
+    LinkCable = 1,
+    WirelessAdapter = 2,
+}
+
+impl Attachment {
+    fn from_u32(v: u32) -> Attachment {
+        match v {
+            1 => Attachment::LinkCable,
+            2 => Attachment::WirelessAdapter,
+            _ => Attachment::None,
+        }
+    }
+}
+
+// Bitmask flags returned by `emu_supported_attachments` (1 << kind).
+const ATTACH_LINK_CABLE: u32 = 1 << 1;
+const ATTACH_WIRELESS_ADAPTER: u32 = 1 << 2;
+
+/// On-disk save category for a system, so the front-end picks the right file
+/// extension and management UI. Mirrors `EMU_SAVE_*` in emu_native.h.
+const SAVE_KIND_NONE: u32 = 0;
+const SAVE_KIND_BATTERY: u32 = 1; // .sav (SRAM/Flash/EEPROM)
+const SAVE_KIND_MEMORY_CARD: u32 = 2; // .mcr (PS1)
+const SAVE_KIND_HDD: u32 = 3; // raw HDD image (Xbox)
+
+impl System {
+    /// Bitmask of supported link attachments (`ATTACH_*`).
+    fn supported_attachments(self) -> u32 {
+        match self {
+            // The GBA link port: a plain cable or the Wireless Adapter.
+            System::Gba => ATTACH_LINK_CABLE | ATTACH_WIRELESS_ADAPTER,
+            _ => 0,
+        }
+    }
+
+    /// On-disk save category (`SAVE_KIND_*`).
+    fn save_kind(self) -> u32 {
+        match self {
+            System::Gba
+            | System::Gbc
+            | System::Snes
+            | System::Genesis
+            | System::Sms
+            | System::GameGear
+            | System::WonderSwan => SAVE_KIND_BATTERY,
+            System::Ps1 => SAVE_KIND_MEMORY_CARD,
+            System::Xbox => SAVE_KIND_HDD,
+            _ => SAVE_KIND_NONE,
+        }
+    }
 }
 
 // ============================ C ABI ============================
@@ -567,6 +691,99 @@ pub unsafe extern "C" fn emu_frame_count(emu: *const Emu) -> u32 {
     (*emu).frame_count()
 }
 
+// ---- saves / memory cards / HDD ----
+
+/// Byte length of the current save image (0 if the core has no battery store).
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_save_data_len(emu: *const Emu) -> usize {
+    if emu.is_null() {
+        return 0;
+    }
+    (*emu).save_data().len()
+}
+
+/// Copy the save image into `out` (capacity `max` bytes). Returns the number of
+/// bytes written (`min(save_len, max)`). Pair with `emu_save_data_len`.
+///
+/// # Safety
+/// `emu` valid; `out` valid for `max` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_save_data(emu: *const Emu, out: *mut u8, max: usize) -> usize {
+    if emu.is_null() || out.is_null() || max == 0 {
+        return 0;
+    }
+    let data = (*emu).save_data();
+    let n = data.len().min(max);
+    std::ptr::copy_nonoverlapping(data.as_ptr(), out, n);
+    n
+}
+
+/// Load a `.sav` image into the core's battery store (call right after
+/// `emu_load_rom`).
+///
+/// # Safety
+/// `emu` valid; `data` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_load_save(emu: *mut Emu, data: *const u8, len: usize) {
+    if emu.is_null() || (data.is_null() && len != 0) {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    (*emu).load_save(bytes);
+}
+
+/// Whether the save store changed since the last `emu_clear_save_dirty`.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_save_dirty(emu: *const Emu) -> bool {
+    !emu.is_null() && (*emu).save_dirty()
+}
+
+/// Clear the save-dirty flag (call after persisting the `.sav`).
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_clear_save_dirty(emu: *mut Emu) {
+    if !emu.is_null() {
+        (*emu).clear_save_dirty();
+    }
+}
+
+/// On-disk save category for `system` (`EMU_SAVE_*`): 0 none, 1 battery (.sav),
+/// 2 memory card (.mcr), 3 HDD image. Lets the front-end pick the extension and
+/// management UI without a live handle.
+#[no_mangle]
+pub extern "C" fn emu_save_kind(system: u32) -> u32 {
+    System::from_u32(system).map_or(SAVE_KIND_NONE, System::save_kind)
+}
+
+// ---- link attachments ----
+
+/// Bitmask of link attachments `system` supports (`EMU_ATTACH_*`: bit 1 = link
+/// cable, bit 2 = wireless adapter). 0 if the system has no link port modeled.
+#[no_mangle]
+pub extern "C" fn emu_supported_attachments(system: u32) -> u32 {
+    System::from_u32(system).map_or(0, System::supported_attachments)
+}
+
+/// Select the active link attachment (0 none, 1 link cable, 2 wireless adapter).
+/// No-op for cores that don't model the chosen attachment.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_set_attachment(emu: *mut Emu, attachment: u32) {
+    if !emu.is_null() {
+        (*emu).set_attachment(Attachment::from_u32(attachment));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +816,58 @@ mod tests {
             assert!(emu_frame_count(e) >= 1);
             assert!(emu_framebuffer_len(e) > 0);
             emu_free(e);
+        }
+    }
+
+    #[test]
+    fn save_kinds_and_attachments_by_system() {
+        // Battery cores report .sav; PS1 a memory card; Xbox an HDD; the rest none.
+        assert_eq!(emu_save_kind(System::Gba as u32), SAVE_KIND_BATTERY);
+        assert_eq!(emu_save_kind(System::Snes as u32), SAVE_KIND_BATTERY);
+        assert_eq!(emu_save_kind(System::Ps1 as u32), SAVE_KIND_MEMORY_CARD);
+        assert_eq!(emu_save_kind(System::Xbox as u32), SAVE_KIND_HDD);
+        assert_eq!(emu_save_kind(System::Nes as u32), SAVE_KIND_NONE);
+        assert_eq!(emu_save_kind(999), SAVE_KIND_NONE);
+        // Only the GBA models link attachments today.
+        assert_eq!(
+            emu_supported_attachments(System::Gba as u32),
+            ATTACH_LINK_CABLE | ATTACH_WIRELESS_ADAPTER
+        );
+        assert_eq!(emu_supported_attachments(System::Ps1 as u32), 0);
+    }
+
+    #[test]
+    fn gba_save_roundtrips_through_ffi() {
+        let e = emu_new(System::Gba as u32);
+        unsafe {
+            emu_load_rom(e, [0u8; 0x100].as_ptr(), 0x100);
+            // GBA defaults to a 128 KB save image.
+            let len = emu_save_data_len(e);
+            assert!(len > 0, "battery-backed core exposes a save image");
+            // Load a save pattern, read it back through the copy-out path.
+            let pattern = vec![0xABu8; len];
+            emu_load_save(e, pattern.as_ptr(), pattern.len());
+            let mut out = vec![0u8; len];
+            let n = emu_save_data(e, out.as_mut_ptr(), out.len());
+            assert_eq!(n, len);
+            assert_eq!(out, pattern);
+            emu_free(e);
+        }
+    }
+
+    #[test]
+    fn set_attachment_is_safe_for_all_systems() {
+        // Applying any attachment to any system must never crash, even where the
+        // core ignores it.
+        for id in 0..=15u32 {
+            let e = emu_new(id);
+            unsafe {
+                emu_set_attachment(e, 2); // wireless adapter
+                emu_set_attachment(e, 1); // link cable
+                emu_set_attachment(e, 0); // none
+                emu_run_frame(e);
+                emu_free(e);
+            }
         }
     }
 }

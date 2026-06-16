@@ -84,6 +84,51 @@ uint32_t emu_channels(const Emu *emu);
 /* Frames completed since reset. */
 uint32_t emu_frame_count(const Emu *emu);
 
+/* ---- saves / memory cards / HDD ---- */
+
+/* On-disk save category for a system (pick the right extension + manager UI). */
+typedef enum {
+    EMU_SAVE_NONE = 0,        /* no persistent storage */
+    EMU_SAVE_BATTERY = 1,     /* .sav (SRAM/Flash/EEPROM) */
+    EMU_SAVE_MEMORY_CARD = 2, /* .mcr (PS1) */
+    EMU_SAVE_HDD = 3          /* raw HDD image (Xbox) */
+} EmuSaveKind;
+
+/* Save category for `system` (does not need a live handle). */
+uint32_t emu_save_kind(uint32_t system);
+
+/* Byte length of the current save image (0 if the core has no battery store). */
+size_t emu_save_data_len(const Emu *emu);
+
+/* Copy the save image into `out` (capacity `max`). Returns bytes written. */
+size_t emu_save_data(const Emu *emu, uint8_t *out, size_t max);
+
+/* Load a .sav image into the core's battery store (after emu_load_rom). */
+void emu_load_save(Emu *emu, const uint8_t *data, size_t len);
+
+/* Whether the save store changed since the last emu_clear_save_dirty. */
+bool emu_save_dirty(const Emu *emu);
+
+/* Clear the save-dirty flag (call after persisting the .sav). */
+void emu_clear_save_dirty(Emu *emu);
+
+/* ---- link attachments ---- */
+
+/* Attachment kinds + the supported-bitmask flags (1 << kind). */
+typedef enum {
+    EMU_ATTACH_NONE = 0,
+    EMU_ATTACH_LINK_CABLE = 1,
+    EMU_ATTACH_WIRELESS_ADAPTER = 2
+} EmuAttachment;
+#define EMU_ATTACH_FLAG_LINK_CABLE (1u << 1)
+#define EMU_ATTACH_FLAG_WIRELESS_ADAPTER (1u << 2)
+
+/* Bitmask of attachments `system` supports (EMU_ATTACH_FLAG_*); 0 if none. */
+uint32_t emu_supported_attachments(uint32_t system);
+
+/* Select the active link attachment (EmuAttachment). No-op if unsupported. */
+void emu_set_attachment(Emu *emu, uint32_t attachment);
+
 #ifdef __cplusplus
 }
 #endif
