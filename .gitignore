@@ -13,6 +13,9 @@ coverage
 *.bin
 *.cue
 *.nds
+# ...except the open-source PS1 BIOS (PCSX-Redux OpenBIOS, redistributable),
+# which the web app bundles through Vite's asset pipeline.
+!apps/web/src/assets/openbios.bin
 public/*.gba
 public/*.sav
 public/*.bin
