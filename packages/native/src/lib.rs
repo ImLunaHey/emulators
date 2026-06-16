@@ -541,6 +541,23 @@ impl Emu {
         self.set_keys(self.system.button_mask(logical));
     }
 
+    /// Snapshot the full machine state for a save state, or `None` if the core
+    /// doesn't support save states yet. (Currently GBA only.)
+    pub fn save_state(&self) -> Option<Vec<u8>> {
+        match &self.inner {
+            Inner::Gba(c) => Some(c.save_state()),
+            _ => None,
+        }
+    }
+
+    /// Restore a previously-saved state. Returns false if unsupported or invalid.
+    pub fn load_state(&mut self, data: &[u8]) -> bool {
+        match &mut self.inner {
+            Inner::Gba(c) => c.load_state(data).is_ok(),
+            _ => false,
+        }
+    }
+
     /// Refresh the cached framebuffer + dimensions from the core.
     fn refresh(&mut self) {
         self.fb.clear();
@@ -1101,4 +1118,5 @@ mod tests {
         }
     }
 }
+
 

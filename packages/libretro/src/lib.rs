@@ -420,18 +420,42 @@ pub extern "C" fn retro_run() {
     }
 }
 
-// Save state / memory / cheats: not yet wired through the FFI.
+// Save states (cores that support it — currently GBA; others report size 0,
+// which RetroArch reads as "save states unsupported").
 #[no_mangle]
 pub extern "C" fn retro_serialize_size() -> usize {
-    0
+    state()
+        .emu
+        .as_ref()
+        .and_then(|e| e.save_state())
+        .map_or(0, |v| v.len())
 }
+
 #[no_mangle]
-pub extern "C" fn retro_serialize(_data: *mut c_void, _size: usize) -> bool {
-    false
+pub unsafe extern "C" fn retro_serialize(data: *mut c_void, size: usize) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    let Some(state_blob) = state().emu.as_ref().and_then(|e| e.save_state()) else {
+        return false;
+    };
+    if state_blob.len() > size {
+        return false;
+    }
+    core::ptr::copy_nonoverlapping(state_blob.as_ptr(), data as *mut u8, state_blob.len());
+    true
 }
+
 #[no_mangle]
-pub extern "C" fn retro_unserialize(_data: *const c_void, _size: usize) -> bool {
-    false
+pub unsafe extern "C" fn retro_unserialize(data: *const c_void, size: usize) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    let blob = core::slice::from_raw_parts(data as *const u8, size);
+    match state().emu.as_mut() {
+        Some(emu) => emu.load_state(blob),
+        None => false,
+    }
 }
 #[no_mangle]
 pub extern "C" fn retro_cheat_reset() {}
