@@ -161,6 +161,16 @@ struct FileHandle {
 
 /// The mounted disc image (the XISO bytes). Empty when none is loaded.
 static DISC: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Distinct handles for kernel sync objects (mutant/semaphore). Each create
+/// hands back a unique handle in a range clear of file handles; the cooperative
+/// scheduler never contends them, so they're acquirable immediately (waits on a
+/// handle return signalled — see NtWaitForSingleObject).
+const SYNC_HANDLE_BASE: u32 = 0x2000_0000;
+static SYNC_NEXT: AtomicU32 = AtomicU32::new(SYNC_HANDLE_BASE);
+fn alloc_sync_handle() -> u32 {
+    SYNC_NEXT.fetch_add(4, Ordering::SeqCst)
+}
+
 /// Open-file table; the guest handle is `FILE_HANDLE_BASE + index`.
 static FILES: Mutex<Vec<Option<FileHandle>>> = Mutex::new(Vec::new());
 const FILE_HANDLE_BASE: u32 = 0x0001_0000;
@@ -507,6 +517,84 @@ fn filetime_to_fields(t: u64) -> (i16, i16, i16, i16, i16, i16, i16, i16) {
     (year, m, d, hour, minute, second, ms, weekday)
 }
 
+// ---------------------------------------------------------------------------
+// SHA-1 (XcSHAInit/Update/Final). Real implementation — nxdk's rand() seed and
+// any title that hashes data depend on a correct digest. The context is opaque
+// to the caller (a >=96-byte buffer), so we lay it out as:
+//   +0  total byte count (u64)   +8  state H0..H4 (5×u32)
+//   +28 buffer fill (u32)        +32 64-byte block buffer
+// ---------------------------------------------------------------------------
+
+const SHA1_H0: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+
+fn sha1_block(state: &mut [u32; 5], block: &[u8; 64]) {
+    let mut w = [0u32; 80];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+    }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
+    for (i, &wi) in w.iter().enumerate() {
+        let (f, k) = match i {
+            0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+            20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+            _ => (b ^ c ^ d, 0xCA62_C1D6),
+        };
+        let tmp = a
+            .rotate_left(5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(wi);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = tmp;
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+}
+
+struct Sha1Ctx {
+    total: u64,
+    state: [u32; 5],
+    buf: [u8; 64],
+    buflen: usize,
+}
+
+fn sha1_load(mem: &Mem, ctx: u32) -> Sha1Ctx {
+    let total = (mem.ram_read32(ctx) as u64) | ((mem.ram_read32(ctx.wrapping_add(4)) as u64) << 32);
+    let mut state = [0u32; 5];
+    for (i, s) in state.iter_mut().enumerate() {
+        *s = mem.ram_read32(ctx.wrapping_add(8 + i as u32 * 4));
+    }
+    let buflen = (mem.ram_read32(ctx.wrapping_add(28)) as usize).min(63);
+    let mut buf = [0u8; 64];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = mem.ram_read8(ctx.wrapping_add(32 + i as u32)) as u8;
+    }
+    Sha1Ctx { total, state, buf, buflen }
+}
+
+fn sha1_store(mem: &mut Mem, ctx: u32, c: &Sha1Ctx) {
+    mem.ram_write32(ctx, c.total as u32);
+    mem.ram_write32(ctx.wrapping_add(4), (c.total >> 32) as u32);
+    for (i, &s) in c.state.iter().enumerate() {
+        mem.ram_write32(ctx.wrapping_add(8 + i as u32 * 4), s);
+    }
+    mem.ram_write32(ctx.wrapping_add(28), c.buflen as u32);
+    for (i, &b) in c.buf.iter().enumerate() {
+        mem.ram_write8(ctx.wrapping_add(32 + i as u32), b as u32);
+    }
+}
+
 /// Current system tick in milliseconds (the KeTickCount export's value, or 0
 /// before it's been allocated).
 fn current_tick_ms(mem: &Mem) -> u32 {
@@ -530,6 +618,7 @@ pub fn reset() {
     DISC.lock().unwrap().clear();
     REBOOT.store(false, Ordering::SeqCst);
     SAVED_DATA_ADDR.store(0, Ordering::SeqCst);
+    SYNC_NEXT.store(SYNC_HANDLE_BASE, Ordering::SeqCst);
     *PERSISTED.lock().unwrap() = None;
     *LAUNCH_DATA.lock().unwrap() = None;
     *DISPLAY_MODE.lock().unwrap() = None;
@@ -1055,6 +1144,11 @@ const ORD_NT_QUERY_INFORMATION_FILE: u32 = 211;
 const ORD_NT_SET_INFORMATION_FILE: u32 = 226;
 const ORD_NT_QUERY_FULL_ATTRIBUTES_FILE: u32 = 210;
 const ORD_NT_DEVICE_IO_CONTROL_FILE: u32 = 196;
+const ORD_NT_CREATE_MUTANT: u32 = 192;
+const ORD_NT_RELEASE_MUTANT: u32 = 230;
+const ORD_XC_SHA_INIT: u32 = 335;
+const ORD_XC_SHA_UPDATE: u32 = 336;
+const ORD_XC_SHA_FINAL: u32 = 337;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x0007_0000;
 const IOCTL_DISK_GET_PARTITION_INFO: u32 = 0x0007_4004;
 const ORD_NT_FS_CONTROL_FILE: u32 = 200;
@@ -1400,6 +1494,90 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+        ORD_NT_CREATE_MUTANT => {
+            // NtCreateMutant(PHANDLE, POBJECT_ATTRIBUTES, BOOLEAN InitialOwner) —
+            // 12 bytes. Hand back an opaque handle; waits on it don't block.
+            let h_out = arg(cpu, mem, 0);
+            if h_out != 0 {
+                mem.ram_write32(h_out, alloc_sync_handle());
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 12);
+            Dispatch::Handled("NtCreateMutant")
+        }
+        ORD_XC_SHA_INIT => {
+            // VOID XcSHAInit(PUCHAR Context) — reset to the SHA-1 initial state.
+            let ctx = arg(cpu, mem, 0);
+            sha1_store(mem, ctx, &Sha1Ctx { total: 0, state: SHA1_H0, buf: [0; 64], buflen: 0 });
+            stdcall_return(cpu, mem, 0, 4);
+            Dispatch::Handled("XcSHAInit")
+        }
+        ORD_XC_SHA_UPDATE => {
+            // VOID XcSHAUpdate(PUCHAR Context, PUCHAR Input, ULONG Length).
+            let ctx = arg(cpu, mem, 0);
+            let input = arg(cpu, mem, 1);
+            let len = arg(cpu, mem, 2);
+            let mut c = sha1_load(mem, ctx);
+            for i in 0..len {
+                c.buf[c.buflen] = mem.ram_read8(input.wrapping_add(i)) as u8;
+                c.buflen += 1;
+                if c.buflen == 64 {
+                    let block = c.buf;
+                    sha1_block(&mut c.state, &block);
+                    c.buflen = 0;
+                }
+            }
+            c.total = c.total.wrapping_add(len as u64);
+            sha1_store(mem, ctx, &c);
+            stdcall_return(cpu, mem, 0, 12);
+            Dispatch::Handled("XcSHAUpdate")
+        }
+        ORD_XC_SHA_FINAL => {
+            // VOID XcSHAFinal(PUCHAR Context, PUCHAR Digest) — pad + emit 20 bytes.
+            let ctx = arg(cpu, mem, 0);
+            let digest = arg(cpu, mem, 1);
+            let mut c = sha1_load(mem, ctx);
+            let bit_len = c.total.wrapping_mul(8);
+            // Append 0x80, pad with zeros to a 56-byte boundary, then the 64-bit
+            // big-endian bit length.
+            c.buf[c.buflen] = 0x80;
+            c.buflen += 1;
+            if c.buflen == 64 {
+                let b = c.buf;
+                sha1_block(&mut c.state, &b);
+                c.buflen = 0;
+            }
+            while c.buflen != 56 {
+                if c.buflen == 64 {
+                    let b = c.buf;
+                    sha1_block(&mut c.state, &b);
+                    c.buflen = 0;
+                }
+                c.buf[c.buflen] = 0;
+                c.buflen += 1;
+            }
+            for i in 0..8 {
+                c.buf[56 + i] = (bit_len >> (56 - i * 8)) as u8;
+            }
+            let b = c.buf;
+            sha1_block(&mut c.state, &b);
+            for (i, &s) in c.state.iter().enumerate() {
+                let bytes = s.to_be_bytes();
+                for (j, &by) in bytes.iter().enumerate() {
+                    mem.ram_write8(digest.wrapping_add((i * 4 + j) as u32), by as u32);
+                }
+            }
+            stdcall_return(cpu, mem, 0, 8);
+            Dispatch::Handled("XcSHAFinal")
+        }
+        ORD_NT_RELEASE_MUTANT => {
+            // NtReleaseMutant(HANDLE, PLONG PreviousCount) — 8 bytes.
+            let prev = arg(cpu, mem, 1);
+            if prev != 0 {
+                mem.ram_write32(prev, 0);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 8);
+            Dispatch::Handled("NtReleaseMutant")
         }
         ORD_RTL_TIME_TO_TIME_FIELDS => {
             // VOID RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS Fields).
@@ -1971,6 +2149,50 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
 mod tests {
     use super::*;
     use crate::cpu::state::ESP;
+
+    #[test]
+    fn sha1_matches_known_vector() {
+        // Drive the same block function the XcSHA* handlers use.
+        fn oneshot(data: &[u8]) -> [u8; 20] {
+            let mut state = SHA1_H0;
+            let mut buf = [0u8; 64];
+            let mut n = 0usize;
+            for &byte in data {
+                buf[n] = byte;
+                n += 1;
+                if n == 64 {
+                    sha1_block(&mut state, &buf);
+                    n = 0;
+                }
+            }
+            let bits = (data.len() as u64) * 8;
+            buf[n] = 0x80;
+            n += 1;
+            if n == 64 {
+                sha1_block(&mut state, &buf);
+                n = 0;
+            }
+            while n != 56 {
+                if n == 64 {
+                    sha1_block(&mut state, &buf);
+                    n = 0;
+                }
+                buf[n] = 0;
+                n += 1;
+            }
+            for i in 0..8 {
+                buf[56 + i] = (bits >> (56 - i * 8)) as u8;
+            }
+            sha1_block(&mut state, &buf);
+            let mut out = [0u8; 20];
+            for i in 0..5 {
+                out[i * 4..i * 4 + 4].copy_from_slice(&state[i].to_be_bytes());
+            }
+            out
+        }
+        let hex: String = oneshot(b"abc").iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
 
     #[test]
     fn filetime_to_fields_known_dates() {
