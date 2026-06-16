@@ -30,11 +30,36 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// A pixel-art upscaler run on the framebuffer before display.
+    enum Upscale: String, CaseIterable, Identifiable {
+        case none
+        case scale2x
+        case scale3x
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .none: return "None"
+            case .scale2x: return "Scale2× (EPX)"
+            case .scale3x: return "Scale3× (EPX)"
+            }
+        }
+        var factor: Int {
+            switch self {
+            case .none: return 1
+            case .scale2x: return 2
+            case .scale3x: return 3
+            }
+        }
+    }
+
     @Published var videoFilter: VideoFilter {
         didSet { d.set(videoFilter.rawValue, forKey: K.videoFilter) }
     }
     @Published var videoEffect: VideoEffect {
         didSet { d.set(videoEffect.rawValue, forKey: K.videoEffect) }
+    }
+    @Published var upscale: Upscale {
+        didSet { d.set(upscale.rawValue, forKey: K.upscale) }
     }
     @Published var integerScale: Bool {
         didSet { d.set(integerScale, forKey: K.integerScale) }
@@ -67,6 +92,7 @@ final class AppSettings: ObservableObject {
     private enum K {
         static let videoFilter = "settings.video.filter"
         static let videoEffect = "settings.video.effect"
+        static let upscale = "settings.video.upscale"
         static let integerScale = "settings.video.integerScale"
         static let audioEnabled = "settings.audio.enabled"
         static let volume = "settings.audio.volume"
@@ -79,6 +105,7 @@ final class AppSettings: ObservableObject {
         d = defaults
         videoFilter = VideoFilter(rawValue: d.string(forKey: K.videoFilter) ?? "") ?? .sharp
         videoEffect = VideoEffect(rawValue: d.string(forKey: K.videoEffect) ?? "") ?? .none
+        upscale = Upscale(rawValue: d.string(forKey: K.upscale) ?? "") ?? .none
         integerScale = d.object(forKey: K.integerScale) as? Bool ?? false
         audioEnabled = d.object(forKey: K.audioEnabled) as? Bool ?? true
         volume = d.object(forKey: K.volume) as? Double ?? 1.0

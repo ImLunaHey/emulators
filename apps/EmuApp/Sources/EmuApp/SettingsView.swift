@@ -33,6 +33,11 @@ private struct GeneralSettingsView: View {
                         Text(f.label).tag(f)
                     }
                 }
+                Picker("Upscaler", selection: $settings.upscale) {
+                    ForEach(AppSettings.Upscale.allCases) { u in
+                        Text(u.label).tag(u)
+                    }
+                }
                 Picker("Retro effect", selection: $settings.videoEffect) {
                     ForEach(AppSettings.VideoEffect.allCases) { e in
                         Text(e.label).tag(e)

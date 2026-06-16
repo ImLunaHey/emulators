@@ -24,6 +24,7 @@ final class EmuHub: ObservableObject {
     private weak var screenLayer: CALayer?
     private var audioBuf = [Float](repeating: 0, count: 16_384)
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private let upscaler = Upscaler()
     private var lastControllerInfo = ""
     private var fpsAccum = 0
     private var fpsClock = CACurrentMediaTime()
@@ -199,16 +200,15 @@ final class EmuHub: ObservableObject {
         let w = e.width
         let h = e.height
         guard w > 0, h > 0 else { return }
+        let factor = settings?.upscale.factor ?? 1
         let image: CGImage? = e.withFramebuffer { ptr, len in
             guard let ptr, len == w * h * 4 else { return nil }
-            let data = Data(bytes: ptr, count: len) // copy: ptr is valid only until next runFrame
-            guard let provider = CGDataProvider(data: data as CFData) else { return nil }
-            let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-            return CGImage(
-                width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                bytesPerRow: w * 4, space: colorSpace, bitmapInfo: info,
-                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
-            )
+            // Optionally run a pixel-art upscaler first (Scale2x/Scale3x).
+            if factor > 1, let (buf, ow, oh) = upscaler.scale(ptr, w: w, h: h, factor: factor),
+               let base = buf.baseAddress {
+                return makeImage(UnsafeRawPointer(base), byteCount: ow * oh * 4, w: ow, h: oh)
+            }
+            return makeImage(UnsafeRawPointer(ptr), byteCount: len, w: w, h: h)
         }
         if let image {
             CATransaction.begin()
@@ -216,6 +216,18 @@ final class EmuHub: ObservableObject {
             screenLayer?.contents = image
             CATransaction.commit()
         }
+    }
+
+    /// Build an RGBA8888 CGImage from a pixel buffer (copies it, since the
+    /// source is only valid until the next frame / upscale).
+    private func makeImage(_ bytes: UnsafeRawPointer, byteCount: Int, w: Int, h: Int) -> CGImage? {
+        let data = Data(bytes: bytes, count: byteCount)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        return CGImage(
+            width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: w * 4, space: colorSpace, bitmapInfo: info,
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
 
     private func installKeyMonitor() {
