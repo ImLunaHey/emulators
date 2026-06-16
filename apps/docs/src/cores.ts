@@ -24,6 +24,31 @@ export interface TestedGame {
   notes?: string;
 }
 
+// Per-capability support state for a core's feature matrix.
+//   yes      — implemented and exercised
+//   partial  — implemented but incomplete / approximate (needs work)
+//   testing  — implemented but under-verified (needs testing)
+//   no       — not implemented yet (to add)
+export type Support = 'yes' | 'partial' | 'testing' | 'no';
+
+export const SUPPORT_LABEL: Record<Support, string> = {
+  yes: 'Supported',
+  partial: 'Partial',
+  testing: 'Needs testing',
+  no: 'Not yet',
+};
+
+export interface MatrixRow {
+  feature: string;
+  support: Support;
+  note?: string;
+}
+
+export interface MatrixGroup {
+  group: string;
+  rows: MatrixRow[];
+}
+
 export interface Core {
   id: string;
   /** Full system name. */
@@ -51,6 +76,12 @@ export interface Core {
   /** One sentence describing the cargo test suite. */
   tests: string;
   testedGames: TestedGame[];
+  /**
+   * Optional fine-grained capability matrix (supported / partial / needs
+   * testing / to-add), grouped by subsystem. Rendered as a table when present.
+   * Currently authored for the flagship GBA core.
+   */
+  matrix?: MatrixGroup[];
 }
 
 export const CORES: Core[] = [
@@ -80,16 +111,20 @@ export const CORES: Core[] = [
       'Windows + alpha/brightness color blending',
       '4 DMA channels with immediate/VBlank/HBlank/special timing',
       '4 timers with prescaler and count-up chaining',
-      'Cartridge RTC (Seiko S-3511A) via GPIO bit-banging',
+      'Cartridge RTC (Seiko S-3511A) — drives the Pokémon Ruby/Sapphire/Emerald time events',
       'BIOS HLE (stub vectors, IRQ handler, cartridge boot bypass)',
-      'Save states (full machine snapshot) + GameShark/Action Replay cheats',
-      'Link cable over WebRTC with multiplay synchronization',
+      'Link cable over WebRTC: local multiplayer + trading (multi-pak)',
+      'GBA LCD color correction (higan/byuu) + LCD/CRT screen filter',
+      'Fast-forward, frame-step, and rewind',
+      'Save states + GameShark/Action Replay cheats',
     ],
     limitations: [
-      'Pure interpreter — slower than a JIT, but deterministic',
-      'UART and JOY-bus SIO modes are accepted but non-functional',
-      'RTC uses an injectable clock (host supplies real time)',
-      'Open-bus behavior simplified for the BIOS region',
+      'Hardware sensors & rumble not modeled — solar (Boktai), tilt/gyro (WarioWare: Twisted!), and cartridge rumble (Drill Dozer)',
+      'Link is local multiplay only — no GameCube/JOY-bus, Single-Pak, Wireless Adapter, or Mobile Adapter GB',
+      'HLE BIOS only (no dumped-BIOS option); no GB/GBC enhanced backward-compat mode',
+      'No e-Reader or exotic cart peripherals (Battle Chip Gate, Campho Advance, Play-Yan, …)',
+      'Instruction-approximate timing (not cycle-exact); BIOS-region open bus simplified',
+      'Affine/Mode-7 upscaling and high-quality "XQ" (Sappy) audio enhancements not implemented',
     ],
     tests:
       '235-vector cargo suite covering ARM/THUMB CPU, the PPU (text/bitmap/affine, sprites, compositor priority/blend/window + golden frames), DMA, timers, IRQ, sound, save back-ends, RTC, and save-state round-trips; validated bit-identical against a reference interpreter for 120 frames.',
@@ -99,6 +134,75 @@ export const CORES: Core[] = [
       { title: 'Pokémon Ruby', boots: true, plays: true, sound: true, notes: '"Battery has run dry" prompt fixed' },
       { title: 'Garfield: Search for Pooky', boots: true, plays: true, sound: true, notes: 'Language select renders' },
       { title: 'Crash Bandicoot', boots: true, plays: true, sound: true, notes: 'Title intro + Earth flyby' },
+    ],
+    // Benchmarked against the emulation-general wiki + Shonumi's peripheral catalog, cross-checked against the gba-core source.
+    matrix: [
+      {
+        group: 'CPU & timing',
+        rows: [
+          { feature: 'ARM + THUMB interpreter', support: 'yes', note: 'Validated bit-identical vs a reference interpreter for 120 frames' },
+          { feature: 'IRQ / exception banking', support: 'yes' },
+          { feature: 'Cycle accuracy', support: 'partial', note: 'Instruction-approximate, not cycle-/dot-exact' },
+          { feature: 'BIOS-region open-bus behavior', support: 'partial', note: 'Simplified' },
+        ],
+      },
+      {
+        group: 'Video (PPU)',
+        rows: [
+          { feature: 'All BG modes (text / affine / bitmap)', support: 'yes' },
+          { feature: 'Sprites: affine, mosaic, windows, blending', support: 'yes' },
+          { feature: 'Golden-frame accuracy tests', support: 'yes' },
+          { feature: 'GBA LCD color correction (higan/byuu)', support: 'yes', note: 'Optional toggle in the player' },
+          { feature: 'LCD pixel-grid / CRT filter', support: 'yes' },
+          { feature: 'High-resolution affine / Mode-7 upscaling', support: 'no', note: 'mGBA-style OpenGL enhancement' },
+        ],
+      },
+      {
+        group: 'Audio (APU)',
+        rows: [
+          { feature: 'PSG (square / wave / noise)', support: 'yes' },
+          { feature: 'DirectSound (2 FIFO PCM channels)', support: 'yes' },
+          { feature: 'High-quality "XQ" audio (Sappy HLE)', support: 'no', note: 'Cleaner music mixer; enhancement' },
+        ],
+      },
+      {
+        group: 'Saves & RTC',
+        rows: [
+          { feature: 'SRAM / Flash 64–128 KB / EEPROM autodetect', support: 'yes' },
+          { feature: 'Cartridge RTC (Pokémon R/S/E time events)', support: 'yes', note: 'Host supplies the clock' },
+          { feature: 'Save states + rewind', support: 'yes' },
+          { feature: 'Raw .sav exchange with other emulators', support: 'testing', note: 'Persists locally; cross-emulator interchange unverified' },
+        ],
+      },
+      {
+        group: 'Sensors & rumble',
+        rows: [
+          { feature: 'Solar sensor (Boktai series)', support: 'no', note: 'Needs a GPIO ADC; GPIO is currently RTC-only' },
+          { feature: 'Tilt / gyro (WarioWare: Twisted!, Yoshi UG, Koro Koro)', support: 'no' },
+          { feature: 'Cartridge rumble (Drill Dozer, Pokémon Pinball)', support: 'no' },
+          { feature: 'Game Boy Player rumble', support: 'no' },
+        ],
+      },
+      {
+        group: 'Connectivity',
+        rows: [
+          { feature: 'Link cable — multiplayer / trading', support: 'testing', note: 'SIO multiplay over WebRTC; needs broader real-game verification' },
+          { feature: 'GameCube ↔ GBA link (JOY-bus)', support: 'no', note: 'Registers accepted but non-functional' },
+          { feature: 'Single-Pak link (multiboot)', support: 'no' },
+          { feature: 'Wireless Adapter', support: 'no' },
+          { feature: 'Mobile Adapter GB', support: 'no' },
+        ],
+      },
+      {
+        group: 'Cartridge hardware & compatibility',
+        rows: [
+          { feature: 'Real (dumped) BIOS support', support: 'no', note: 'HLE BIOS only today' },
+          { feature: 'GB/GBC enhanced backward-compat mode', support: 'no' },
+          { feature: 'e-Reader (dot-code scanning)', support: 'no' },
+          { feature: 'Exotic peripherals (Battle Chip Gate, Campho, Play-Yan, Glucoboy, Turbo File, Soul Doll)', support: 'no' },
+          { feature: 'Commercial-game compatibility breadth', support: 'testing', note: 'Only ~5 titles verified so far' },
+        ],
+      },
     ],
   },
   {

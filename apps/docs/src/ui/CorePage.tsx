@@ -6,6 +6,7 @@ import { Section } from './Section';
 import { SpecRow } from './SpecRow';
 import { BulletPanel } from './BulletPanel';
 import { GamesTable } from './GamesTable';
+import { SupportMatrix } from './SupportMatrix';
 
 const REPO_TREE = 'https://github.com/ImLunaHey/emulators/tree/main';
 
@@ -58,6 +59,13 @@ export function CorePage() {
           </span>
         </div>
       </header>
+
+      {/* Capability matrix — what's supported, partial, needs testing, or to-add */}
+      {core.matrix && (
+        <Section title="Support matrix">
+          <SupportMatrix groups={core.matrix} />
+        </Section>
+      )}
 
       {/* Subsystem support table */}
       <Section title="Hardware support">
