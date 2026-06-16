@@ -47,19 +47,24 @@ pub struct BranchRec {
     pub regs: [u32; 8],
 }
 
-static BRANCH_TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static BRANCH_TRACE_INIT: std::sync::Once = std::sync::Once::new();
+// 0 = unknown (env not yet checked), 1 = off, 2 = on.
+static BRANCH_TRACE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static BRANCH_RING: std::sync::Mutex<Vec<BranchRec>> = std::sync::Mutex::new(Vec::new());
 const BRANCH_RING_CAP: usize = 128;
 
 #[inline]
 fn branch_trace_on() -> bool {
-    BRANCH_TRACE_INIT.call_once(|| {
-        if std::env::var_os("XBOX_TRACE_BRANCH").is_some() {
-            BRANCH_TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
-    BRANCH_TRACE_ON.load(std::sync::atomic::Ordering::Relaxed)
+    // Called on every conditional branch (hot). A `Once::call_once` per branch
+    // is needless synchronization when tracing is off, so resolve the env flag
+    // once into a 3-state atomic (0 = unknown, 1 = off, 2 = on) and then just
+    // read it — a single relaxed load in steady state.
+    use std::sync::atomic::Ordering;
+    let mut state = BRANCH_TRACE_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        state = if std::env::var_os("XBOX_TRACE_BRANCH").is_some() { 2 } else { 1 };
+        BRANCH_TRACE_STATE.store(state, Ordering::Relaxed);
+    }
+    state == 2
 }
 
 fn record_branch(rec: BranchRec) {
