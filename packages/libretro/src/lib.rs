@@ -98,6 +98,11 @@ struct State {
     video_buf: Vec<u32>,
     audio_f32: Vec<f32>,
     audio_i16: Vec<i16>,
+    // Battery save (SRAM/Flash/EEPROM). RetroArch reads/writes this buffer
+    // directly via `retro_get_memory_data`: it loads the `.srm` into it after
+    // load, and persists it back on save. We mirror it to/from the core.
+    sram: Vec<u8>,
+    sram_loaded: bool,
 }
 
 static mut STATE: State = State {
@@ -110,7 +115,12 @@ static mut STATE: State = State {
     video_buf: Vec::new(),
     audio_f32: Vec::new(),
     audio_i16: Vec::new(),
+    sram: Vec::new(),
+    sram_loaded: false,
 };
+
+// libretro memory type ids.
+const RETRO_MEMORY_SAVE_RAM: u32 = 0;
 
 #[allow(static_mut_refs)]
 fn state() -> &'static mut State {
@@ -298,7 +308,14 @@ pub unsafe extern "C" fn retro_load_game(game: *const retro_game_info) -> bool {
     if !emu.load_rom(data) {
         return false;
     }
-    state().emu = Some(emu);
+    // Size the SRAM mirror to the core's save chip. RetroArch grabs a pointer to
+    // this buffer (via retro_get_memory_data) and writes the .srm into it before
+    // the first frame; `retro_run` then pushes it into the core.
+    let save = emu.save_data();
+    let s = state();
+    s.sram = save;
+    s.sram_loaded = false;
+    s.emu = Some(emu);
     true
 }
 
@@ -309,7 +326,10 @@ pub extern "C" fn retro_load_game_special(_t: u32, _info: *const retro_game_info
 
 #[no_mangle]
 pub extern "C" fn retro_unload_game() {
-    state().emu = None;
+    let s = state();
+    s.emu = None;
+    s.sram = Vec::new();
+    s.sram_loaded = false;
 }
 
 #[no_mangle]
@@ -327,10 +347,29 @@ pub extern "C" fn retro_run() {
         return;
     };
 
+    // Push the .srm RetroArch loaded into our buffer into the core, once.
+    if !s.sram_loaded {
+        s.sram_loaded = true;
+        if !s.sram.is_empty() {
+            emu.load_save(&s.sram);
+        }
+    }
+
     if let Some(istate) = s.input_state {
         emu.set_buttons(read_input(istate));
     }
     emu.run_frame();
+
+    // Mirror the core's save back out (only when it changed) so RetroArch
+    // persists current progress to the .srm. The buffer length is fixed, so the
+    // pointer RetroArch holds stays valid.
+    if emu.save_dirty() {
+        let d = emu.save_data();
+        if d.len() == s.sram.len() {
+            s.sram.copy_from_slice(&d);
+        }
+        emu.clear_save_dirty();
+    }
 
     // Video: RGBA8888 -> XRGB8888 (0xFFRRGGBB).
     let w = emu.width();
@@ -399,10 +438,19 @@ pub extern "C" fn retro_cheat_reset() {}
 #[no_mangle]
 pub extern "C" fn retro_cheat_set(_index: u32, _enabled: bool, _code: *const c_char) {}
 #[no_mangle]
-pub extern "C" fn retro_get_memory_data(_id: u32) -> *mut c_void {
-    core::ptr::null_mut()
+pub extern "C" fn retro_get_memory_data(id: u32) -> *mut c_void {
+    let s = state();
+    if id == RETRO_MEMORY_SAVE_RAM && !s.sram.is_empty() {
+        s.sram.as_mut_ptr() as *mut c_void
+    } else {
+        core::ptr::null_mut()
+    }
 }
 #[no_mangle]
-pub extern "C" fn retro_get_memory_size(_id: u32) -> usize {
-    0
+pub extern "C" fn retro_get_memory_size(id: u32) -> usize {
+    if id == RETRO_MEMORY_SAVE_RAM {
+        state().sram.len()
+    } else {
+        0
+    }
 }

@@ -632,7 +632,7 @@ impl Emu {
     /// cores without battery-backed storage. The bytes are the core's native
     /// `.sav` image — directly interchangeable with other emulators. (`.to_vec`
     /// normalizes the cores that hand back a borrowed slice vs an owned Vec.)
-    fn save_data(&self) -> Vec<u8> {
+    pub fn save_data(&self) -> Vec<u8> {
         match &self.inner {
             Inner::Gba(c) => c.save_ram().to_vec(),
             Inner::Gbc(c) => c.save_ram().to_vec(),
@@ -646,7 +646,7 @@ impl Emu {
 
     /// Load a previously-saved `.sav` image into the core's battery store.
     /// No-op for cores without one.
-    fn load_save(&mut self, bytes: &[u8]) {
+    pub fn load_save(&mut self, bytes: &[u8]) {
         match &mut self.inner {
             Inner::Gba(c) => c.load_save_ram(bytes),
             Inner::Gbc(c) => c.load_save_ram(bytes),
@@ -660,7 +660,7 @@ impl Emu {
 
     /// Whether the save store changed since the last `clear_save_dirty` — the
     /// host polls this to decide when to flush a `.sav` to disk.
-    fn save_dirty(&self) -> bool {
+    pub fn save_dirty(&self) -> bool {
         match &self.inner {
             Inner::Gba(c) => c.save_dirty(),
             Inner::Gbc(c) => c.save_dirty(),
@@ -672,7 +672,7 @@ impl Emu {
         }
     }
 
-    fn clear_save_dirty(&mut self) {
+    pub fn clear_save_dirty(&mut self) {
         match &mut self.inner {
             Inner::Gba(c) => c.clear_save_dirty(),
             Inner::Gbc(c) => c.clear_save_dirty(),
@@ -1101,3 +1101,4 @@ mod tests {
         }
     }
 }
+
