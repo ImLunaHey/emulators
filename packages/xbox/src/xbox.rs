@@ -291,13 +291,19 @@ impl Xbox {
     /// conceptual budget; we cap the actual step count well below it so a tight
     /// loop in unfinished boot code can't hang the browser.
     const CYCLES_PER_FRAME: u32 = 733_000_000 / 60;
-    /// Instructions to step per frame. A real ~733 MHz frame is ~12M cycles; the
-    /// budget must be that large or per-frame CPU work that the game does every
-    /// frame — clearing the framebuffer / depth buffer (a ~1 MB byte loop),
-    /// transforming geometry — can't finish in a frame and the game never
-    /// progresses. (HLE traps + the preemption quantum keep a genuine spin loop
-    /// from hanging.)
-    const STEP_BUDGET: u32 = Self::CYCLES_PER_FRAME;
+    /// Instructions to step per presented frame. A real ~733 MHz frame is ~12M
+    /// cycles, but the interpreter runs at ~40M inst/s, so stepping a full frame's
+    /// worth takes ~0.3 s — i.e. the host can only present ~3 fps, and most of
+    /// those instructions are the guest *spin-waiting* for vblank/GPU-idle, not
+    /// doing useful work. Guest work (the framebuffer clear, geometry, …) carries
+    /// across presented frames because CPU state persists between `run_frame`
+    /// calls, so a smaller budget doesn't stall progress — it just presents more
+    /// often, trimming the wasted spin. At /8 the triangle demo presents ~30 fps
+    /// (matching xemu) and still advances. Trade-off: vblank/clock tick once per
+    /// presented frame, so a smaller budget skews the emulated-time:CPU ratio —
+    /// fine for these demos; revisit once the interpreter is fast enough to step
+    /// a full frame in real time (the decode-cache work).
+    const STEP_BUDGET: u32 = Self::CYCLES_PER_FRAME / 8;
     /// Round-robin preemption interval (instructions) — sized so a frame yields
     /// to other threads a few dozen times, not thousands (which churns context
     /// switches) nor never (which lets a spin-waiter starve a loader).
