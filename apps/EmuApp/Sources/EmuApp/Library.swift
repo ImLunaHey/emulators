@@ -31,7 +31,9 @@ final class Library: ObservableObject {
     /// launcher without a manual add.
     func seedDefaults() {
         let defaults = UserDefaults.standard
-        let flag = "seeded.xbox.v2"
+        // v3: paths moved from core-xbox/demos to packages/xbox/demos in the
+        // monorepo restructure, so re-seed with the new locations.
+        let flag = "seeded.xbox.v3"
         guard !defaults.bool(forKey: flag) else { return }
         // Repo root is two levels up from the SwiftPM executable's package dir.
         let repoRoot = "/Users/luna/code/imlunahey/emulator"
@@ -60,7 +62,10 @@ final class Library: ObservableObject {
         var result: [EmuSystem: [URL]] = [:]
         for (k, paths) in dict {
             if let raw = UInt32(k), let sys = EmuSystem(rawValue: raw) {
-                result[sys] = paths.map { URL(fileURLWithPath: $0) }
+                // Drop entries whose file no longer exists (e.g. a demo that
+                // moved) so a stale path can't surface as "No game running".
+                let live = paths.filter { FileManager.default.fileExists(atPath: $0) }
+                if !live.isEmpty { result[sys] = live.map { URL(fileURLWithPath: $0) } }
             }
         }
         recentsBySystem = result

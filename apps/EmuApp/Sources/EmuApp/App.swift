@@ -131,5 +131,6 @@ struct EmuAppMain: App {
                 .environmentObject(bios)
         }
         .defaultSize(width: 768, height: 576)
+        .defaultPosition(.center)
     }
 }
