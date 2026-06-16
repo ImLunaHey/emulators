@@ -34,6 +34,11 @@ Every core is a dependency-free Rust crate with no DOM/browser assumptions, so
 it can be reused under a different host — the React app and the SwiftUI app are
 both just shells over the same cores.
 
+For the full per-core breakdown — exactly what CPU/video/audio/saves each core
+implements, which file formats it loads, its test coverage, and the games
+verified on it — see the **docs site** (`apps/docs`, run with
+`pnpm --filter @emulators/docs dev`).
+
 ## Monorepo layout
 
 [pnpm workspaces](https://pnpm.io/workspaces) + [Turborepo](https://turborepo.com).
@@ -59,6 +64,8 @@ apps/
   web/                   React + Vite + Cloudflare Worker front-end (@emulators/web)
     src/ui/              players per system + library, save states, cheats, audio
     src/worker.ts        Cloudflare Worker entry (serves the built SPA)
+  docs/                  React + Vite static docs site (@emulators/docs)
+    src/cores.ts         per-core support catalog (CPU/GPU/APU, formats, tests)
   EmuApp/                native macOS SwiftUI app (links packages/native)
 
 scripts/                 native build helpers (build-macos/ios/android.sh), gen-cheats

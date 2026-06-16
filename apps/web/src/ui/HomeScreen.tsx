@@ -5,6 +5,7 @@ import { deleteRom, setSelectedRom, type RomMeta } from './romStore';
 import { ingestFiles, ingestHandles } from './romIngest';
 import { supportsFsa, pickRomHandles, handleFromDropItem } from './fsaccess';
 import { ACCEPT, ALL_SYSTEMS, type SystemId } from './systems';
+import { DOCS_URL } from './links';
 import { useToast } from './Toast';
 import { ConsoleGrid } from './ConsoleGrid';
 import { ConsoleShelf } from './ConsoleShelf';
@@ -120,7 +121,18 @@ export function HomeScreen({ onPlay }: { onPlay: (romId: string, system: string)
                     } console${ALL_SYSTEMS.filter((s) => (counts[s] ?? 0) > 0).length === 1 ? '' : 's'} · choose a console`}
               </p>
             </div>
-            <button type="button" onClick={openPicker} className="btn btn-primary shrink-0">+ Add ROM</button>
+            <div className="flex items-center gap-2 shrink-0">
+              <a
+                href={DOCS_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="btn btn-ghost"
+                title="What each core supports"
+              >
+                Docs ↗
+              </a>
+              <button type="button" onClick={openPicker} className="btn btn-primary">+ Add ROM</button>
+            </div>
           </header>
 
           <ConsoleGrid counts={counts} onSelect={setActive} />
