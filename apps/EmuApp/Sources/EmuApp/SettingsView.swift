@@ -28,12 +28,7 @@ private struct GeneralSettingsView: View {
     var body: some View {
         Form {
             Section("Video") {
-                Picker("Scaling filter", selection: $settings.videoFilter) {
-                    ForEach(AppSettings.VideoFilter.allCases) { f in
-                        Text(f.label).tag(f)
-                    }
-                }
-                Picker("Upscaler", selection: $settings.upscale) {
+                Picker("Upscaling", selection: $settings.upscale) {
                     ForEach(AppSettings.Upscale.allCases) { u in
                         Text(u.label).tag(u)
                     }
@@ -43,7 +38,6 @@ private struct GeneralSettingsView: View {
                         Text(e.label).tag(e)
                     }
                 }
-                Toggle("Snap to integer scale", isOn: $settings.integerScale)
             }
             Section("Audio") {
                 Toggle("Enable audio", isOn: $settings.audioEnabled)

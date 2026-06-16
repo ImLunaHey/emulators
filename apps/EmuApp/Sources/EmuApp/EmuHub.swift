@@ -21,7 +21,7 @@ final class EmuHub: ObservableObject {
     private var audio: AudioPlayer?
     private var timer: Timer?
     private var keyMonitor: Any?
-    private weak var screenLayer: CALayer?
+    private weak var screenView: ScreenNSView?
     private var audioBuf = [Float](repeating: 0, count: 16_384)
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private let upscaler = Upscaler()
@@ -46,9 +46,9 @@ final class EmuHub: ObservableObject {
     /// The view hosting our screen layer; used to tell whether this window is the
     /// key window (so only the focused game consumes input when several run).
     private weak var hostView: NSView?
-    func attach(layer: CALayer, view: NSView) {
-        screenLayer = layer
-        hostView = view
+    func attach(screen: ScreenNSView) {
+        screenView = screen
+        hostView = screen
     }
 
     /// True when this hub's window is frontmost (or, before the view attaches,
@@ -85,7 +85,6 @@ final class EmuHub: ObservableObject {
         self.systemLabel = system.label
         self.currentSystem = system
         isPlaying = true
-        applyVideoSettings()
         applyBindings()
 
         if settings?.audioEnabled ?? true {
@@ -132,12 +131,6 @@ final class EmuHub: ObservableObject {
     /// whenever the bindings change).
     func applyBindings() {
         if let s = settings { input.bindings = s.effectiveBindings }
-    }
-
-    /// Push the current video settings into the screen layer (filter, scaling).
-    func applyVideoSettings() {
-        guard let layer = screenLayer, let s = settings else { return }
-        layer.magnificationFilter = s.videoFilter == .smooth ? .linear : .nearest
     }
 
     /// Apply changed audio settings to a live session.
@@ -210,12 +203,7 @@ final class EmuHub: ObservableObject {
             }
             return makeImage(UnsafeRawPointer(ptr), byteCount: len, w: w, h: h)
         }
-        if let image {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true) // no implicit fade between frames
-            screenLayer?.contents = image
-            CATransaction.commit()
-        }
+        if let image { screenView?.present(image) }
     }
 
     /// Build an RGBA8888 CGImage from a pixel buffer (copies it, since the

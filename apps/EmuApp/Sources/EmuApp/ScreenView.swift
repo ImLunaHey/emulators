@@ -10,6 +10,10 @@ final class ScreenNSView: NSView {
     /// effect change (not per frame), so it's cheap.
     private let effect = CALayer()
     private var effectKind: AppSettings.VideoEffect = .none
+    /// Snap the picture to an integer multiple of its source size (pixel-perfect).
+    private var integer = false
+    /// Size of the most recently presented frame, for integer snapping.
+    private var sourceSize: CGSize = .zero
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -26,28 +30,62 @@ final class ScreenNSView: NSView {
         content.magnificationFilter = .nearest
         content.minificationFilter = .linear
         content.contentsGravity = .resizeAspect
+        // No implicit fade when the frame image is swapped.
+        content.actions = ["contents": NSNull(), "frame": NSNull(), "bounds": NSNull()]
         layer?.addSublayer(content)
 
         effect.contentsGravity = .resize
         effect.zPosition = 1
-        // No implicit fade when the overlay image is swapped.
         effect.actions = ["contents": NSNull(), "frame": NSNull(), "bounds": NSNull()]
         layer?.addSublayer(effect)
     }
 
     override func layout() {
         super.layout()
-        content.frame = bounds
         effect.frame = bounds
+        layoutContent()
         regenerateEffect()
     }
 
-    /// Apply the scaling filter (smooth vs nearest) and the retro overlay.
-    func setVideo(smooth: Bool, effect kind: AppSettings.VideoEffect) {
+    /// The render loop hands each frame here so we can integer-snap the layer to
+    /// the image's pixel grid when pixel-perfect mode is on.
+    func present(_ image: CGImage) {
+        sourceSize = CGSize(width: image.width, height: image.height)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        content.contents = image
+        layoutContent()
+        CATransaction.commit()
+    }
+
+    /// Apply the scaling filter (smooth vs nearest), integer snapping, and the
+    /// retro overlay.
+    func setVideo(smooth: Bool, integer: Bool, effect kind: AppSettings.VideoEffect) {
         content.magnificationFilter = smooth ? .linear : .nearest
+        self.integer = integer
         if kind != effectKind {
             effectKind = kind
             regenerateEffect()
+        }
+        layoutContent()
+    }
+
+    /// Position the game layer: integer-snapped + centered when pixel-perfect,
+    /// otherwise aspect-fit to the whole view.
+    private func layoutContent() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        if integer, sourceSize.width > 0, sourceSize.height > 0 {
+            let s = max(1, floor(min(bounds.width / sourceSize.width,
+                                     bounds.height / sourceSize.height)))
+            let w = sourceSize.width * s
+            let h = sourceSize.height * s
+            content.contentsGravity = .resize
+            content.frame = CGRect(x: ((bounds.width - w) / 2).rounded(),
+                                   y: ((bounds.height - h) / 2).rounded(),
+                                   width: w, height: h)
+        } else {
+            content.contentsGravity = .resizeAspect
+            content.frame = bounds
         }
     }
 
@@ -110,12 +148,16 @@ struct ScreenView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ScreenNSView {
         let v = ScreenNSView()
-        hub.attach(layer: v.content, view: v)
-        v.setVideo(smooth: settings.videoFilter == .smooth, effect: settings.videoEffect)
+        hub.attach(screen: v)
+        v.setVideo(smooth: settings.upscale.smoothFilter,
+                   integer: settings.upscale.integer,
+                   effect: settings.videoEffect)
         return v
     }
 
     func updateNSView(_ nsView: ScreenNSView, context: Context) {
-        nsView.setVideo(smooth: settings.videoFilter == .smooth, effect: settings.videoEffect)
+        nsView.setVideo(smooth: settings.upscale.smoothFilter,
+                        integer: settings.upscale.integer,
+                        effect: settings.videoEffect)
     }
 }

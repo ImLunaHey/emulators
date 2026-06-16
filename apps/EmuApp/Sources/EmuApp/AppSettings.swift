@@ -4,13 +4,43 @@ import Foundation
 /// every player window read one set of values. Backed by `UserDefaults`; each
 /// property publishes on change (so SwiftUI views update) and writes through.
 final class AppSettings: ObservableObject {
-    /// How the screen is scaled up. Pixel-art cores want the sharp (nearest)
-    /// filter; the smooth (linear) filter softens upscaling.
-    enum VideoFilter: String, CaseIterable, Identifiable {
+    /// How the picture is scaled to the window. One control covers the filter,
+    /// integer snapping, and optional pixel-art algorithms — pick the look you
+    /// want. (Fancier GPL scalers like xBRZ are intentionally not bundled.)
+    enum Upscale: String, CaseIterable, Identifiable {
+        /// Nearest, snapped to an integer multiple — crisp, uniform pixels.
+        case pixelPerfect
+        /// Nearest, stretched to fill (non-integer; the classic default).
         case sharp
+        /// Bilinear — soft, no blocky edges (good for 3D cores).
         case smooth
+        /// EPX/Scale2x — doubles resolution, cleaning up hard pixel edges.
+        case scale2x
+        /// EPX/Scale3x — triples resolution.
+        case scale3x
+
         var id: String { rawValue }
-        var label: String { self == .sharp ? "Sharp (nearest)" : "Smooth (linear)" }
+        var label: String {
+            switch self {
+            case .pixelPerfect: return "Pixel-Perfect (integer)"
+            case .sharp: return "Sharp (fill)"
+            case .smooth: return "Smooth (bilinear)"
+            case .scale2x: return "Scale2× (EPX)"
+            case .scale3x: return "Scale3× (EPX)"
+            }
+        }
+        /// EPX upscale factor (1 = no algorithm, just filtering).
+        var factor: Int {
+            switch self {
+            case .scale2x: return 2
+            case .scale3x: return 3
+            default: return 1
+            }
+        }
+        /// Linear (smooth) vs nearest magnification.
+        var smoothFilter: Bool { self == .smooth }
+        /// Snap to an integer multiple (uniform pixels, no shimmer).
+        var integer: Bool { self == .pixelPerfect }
     }
 
     /// A retro display overlay drawn on top of the game.
@@ -30,39 +60,11 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// A pixel-art upscaler run on the framebuffer before display.
-    enum Upscale: String, CaseIterable, Identifiable {
-        case none
-        case scale2x
-        case scale3x
-        var id: String { rawValue }
-        var label: String {
-            switch self {
-            case .none: return "None"
-            case .scale2x: return "Scale2× (EPX)"
-            case .scale3x: return "Scale3× (EPX)"
-            }
-        }
-        var factor: Int {
-            switch self {
-            case .none: return 1
-            case .scale2x: return 2
-            case .scale3x: return 3
-            }
-        }
-    }
-
-    @Published var videoFilter: VideoFilter {
-        didSet { d.set(videoFilter.rawValue, forKey: K.videoFilter) }
-    }
-    @Published var videoEffect: VideoEffect {
-        didSet { d.set(videoEffect.rawValue, forKey: K.videoEffect) }
-    }
     @Published var upscale: Upscale {
         didSet { d.set(upscale.rawValue, forKey: K.upscale) }
     }
-    @Published var integerScale: Bool {
-        didSet { d.set(integerScale, forKey: K.integerScale) }
+    @Published var videoEffect: VideoEffect {
+        didSet { d.set(videoEffect.rawValue, forKey: K.videoEffect) }
     }
     @Published var audioEnabled: Bool {
         didSet { d.set(audioEnabled, forKey: K.audioEnabled) }
@@ -90,10 +92,8 @@ final class AppSettings: ObservableObject {
 
     private let d: UserDefaults
     private enum K {
-        static let videoFilter = "settings.video.filter"
         static let videoEffect = "settings.video.effect"
         static let upscale = "settings.video.upscale"
-        static let integerScale = "settings.video.integerScale"
         static let audioEnabled = "settings.audio.enabled"
         static let volume = "settings.audio.volume"
         static let runInBackground = "settings.emu.runInBackground"
@@ -103,10 +103,8 @@ final class AppSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         d = defaults
-        videoFilter = VideoFilter(rawValue: d.string(forKey: K.videoFilter) ?? "") ?? .sharp
+        upscale = Upscale(rawValue: d.string(forKey: K.upscale) ?? "") ?? .sharp
         videoEffect = VideoEffect(rawValue: d.string(forKey: K.videoEffect) ?? "") ?? .none
-        upscale = Upscale(rawValue: d.string(forKey: K.upscale) ?? "") ?? .none
-        integerScale = d.object(forKey: K.integerScale) as? Bool ?? false
         audioEnabled = d.object(forKey: K.audioEnabled) as? Bool ?? true
         volume = d.object(forKey: K.volume) as? Double ?? 1.0
         runInBackground = d.object(forKey: K.runInBackground) as? Bool ?? true

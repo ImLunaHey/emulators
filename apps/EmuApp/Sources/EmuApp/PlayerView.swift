@@ -17,9 +17,8 @@ struct PlayerWindow: View {
             .environmentObject(hub)
             .onAppear { launchIfNeeded() }
             .onDisappear { hub.stop() }
-            // Live-apply settings changes (filter, volume, key bindings) to the
-            // running game.
-            .onChange(of: settings.videoFilter) { _ in hub.applyVideoSettings() }
+            // Live-apply settings changes (volume, key bindings) to the running
+            // game. Video (upscale/effect) is applied by ScreenView.updateNSView.
             .onChange(of: settings.audioEnabled) { _ in hub.applyAudioSettings() }
             .onChange(of: settings.volume) { _ in hub.applyAudioSettings() }
             .onChange(of: settings.effectiveBindings) { _ in hub.applyBindings() }
