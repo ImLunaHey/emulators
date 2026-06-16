@@ -37,6 +37,27 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('packages/*/Cargo.lock') }}
 
+      # Per-core Rust target dirs, so a core that DID change compiles
+      # incrementally instead of from scratch.
+      - name: Cache Rust target
+        uses: actions/cache@v4
+        with:
+          path: packages/*/target
+          key: ${{ runner.os }}-target-${{ hashFiles('packages/*/Cargo.lock', 'packages/*/src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
+
+      # Turbo's task-output cache (the wasm `pkg/`). On a hit, UNCHANGED cores
+      # skip wasm-pack entirely. restore-keys grabs the most recent cache; turbo
+      # then decides per-task hit/miss against it.
+      - name: Cache turbo
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
 
