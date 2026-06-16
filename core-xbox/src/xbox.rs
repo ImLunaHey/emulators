@@ -457,9 +457,17 @@ impl Xbox {
     /// the executor can use `self` as its `&mut dyn Bus` (the contract's
     /// `mem::take` pattern). `Cpu: Default`.
     fn step_cpu(&mut self) {
-        let mut cpu = std::mem::take(&mut self.cpu);
+        // Hot path (~12M calls/frame). Step the CPU in place instead of
+        // `mem::take`ing it out and back — that move + `Cpu::default()` ran on
+        // every instruction and dominated the interpreter.
+        //
+        // SAFETY: `step` mutates the CPU through the `&mut Cpu` we hand it and
+        // reaches memory/MMIO through the `&mut dyn Bus` (`self`). The `Bus`
+        // impl for `Xbox` only ever touches `self.mem` / `self.nv2a` — never
+        // `self.cpu` — so the two `&mut` borrows never actually alias the same
+        // field. The pointer is derived and used within this call only.
+        let cpu = unsafe { &mut *(&raw mut self.cpu) };
         cpu.step(self);
-        self.cpu = cpu;
     }
 
     // ---- shared read/write cores (translate → classify → route) ----
@@ -544,7 +552,17 @@ use std::collections::HashMap as EipMap;
 static EIP_HIST: std::sync::Mutex<Option<EipMap<u32, u64>>> = std::sync::Mutex::new(None);
 
 fn trace_eip(eip: u32) {
-    if std::env::var_os("XBOX_TRACE_EIP").is_none() {
+    // Hot path: called once per emulated instruction (~12M/frame). Cache the
+    // env-var check in an atomic so we don't do an environment lookup per
+    // instruction (that lookup alone dwarfed the actual interpreter).
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ENABLED: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    let mut state = ENABLED.load(Ordering::Relaxed);
+    if state == 0 {
+        state = if std::env::var_os("XBOX_TRACE_EIP").is_some() { 2 } else { 1 };
+        ENABLED.store(state, Ordering::Relaxed);
+    }
+    if state != 2 {
         return;
     }
     let mut g = EIP_HIST.lock().unwrap();
