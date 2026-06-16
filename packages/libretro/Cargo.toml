@@ -1,0 +1,20 @@
+[package]
+name = "emu-libretro"
+version = "0.0.0"
+edition = "2021"
+
+# libretro core wrapping the unified `emu-native` Emu, so the cores can run in
+# RetroArch (and any libretro frontend). One polyglot core: it detects the
+# system from the loaded content's extension. Build:  cargo build --release
+# then load packages/libretro/target/release/libemu_libretro.dylib in RetroArch.
+[lib]
+name = "emu_libretro"
+crate-type = ["cdylib"]
+
+[dependencies]
+emu-native = { path = "../native" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

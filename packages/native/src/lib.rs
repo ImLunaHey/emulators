@@ -61,8 +61,27 @@ pub enum System {
     N64 = 15,
 }
 
+// Logical (RetroPad-style) button bits for `Emu::set_buttons` /
+// `System::button_mask`. Face buttons follow the standard position→letter
+// abstraction: EAST = A (right), SOUTH = B (bottom), NORTH = X (top),
+// WEST = Y (left).
+pub const BTN_UP: u32 = 1 << 0;
+pub const BTN_DOWN: u32 = 1 << 1;
+pub const BTN_LEFT: u32 = 1 << 2;
+pub const BTN_RIGHT: u32 = 1 << 3;
+pub const BTN_SOUTH: u32 = 1 << 4;
+pub const BTN_EAST: u32 = 1 << 5;
+pub const BTN_WEST: u32 = 1 << 6;
+pub const BTN_NORTH: u32 = 1 << 7;
+pub const BTN_L1: u32 = 1 << 8;
+pub const BTN_R1: u32 = 1 << 9;
+pub const BTN_L2: u32 = 1 << 10;
+pub const BTN_R2: u32 = 1 << 11;
+pub const BTN_START: u32 = 1 << 12;
+pub const BTN_SELECT: u32 = 1 << 13;
+
 impl System {
-    fn from_u32(v: u32) -> Option<System> {
+    pub fn from_u32(v: u32) -> Option<System> {
         Some(match v {
             0 => System::Gba,
             1 => System::Ps1,
@@ -82,6 +101,184 @@ impl System {
             15 => System::N64,
             _ => return None,
         })
+    }
+
+    /// Translate a logical `BTN_*` bitmask to this system's native key layout
+    /// (mirrors the web players / the Swift `EmuSystem.keyMask`).
+    pub fn button_mask(self, logical: u32) -> u32 {
+        let b = |flag: u32, shift: u32| -> u32 {
+            if logical & flag != 0 {
+                1 << shift
+            } else {
+                0
+            }
+        };
+        match self {
+            System::Gba | System::Nds => {
+                let mut m = b(BTN_EAST, 0)
+                    | b(BTN_SOUTH, 1)
+                    | b(BTN_SELECT, 2)
+                    | b(BTN_START, 3)
+                    | b(BTN_RIGHT, 4)
+                    | b(BTN_LEFT, 5)
+                    | b(BTN_UP, 6)
+                    | b(BTN_DOWN, 7)
+                    | b(BTN_R1, 8)
+                    | b(BTN_L1, 9);
+                if self == System::Nds {
+                    m |= b(BTN_NORTH, 10) | b(BTN_WEST, 11);
+                }
+                m
+            }
+            System::Nes => {
+                b(BTN_EAST, 0)
+                    | b(BTN_SOUTH, 1)
+                    | b(BTN_SELECT, 2)
+                    | b(BTN_START, 3)
+                    | b(BTN_UP, 4)
+                    | b(BTN_DOWN, 5)
+                    | b(BTN_LEFT, 6)
+                    | b(BTN_RIGHT, 7)
+            }
+            System::Gbc => {
+                b(BTN_EAST, 0)
+                    | b(BTN_SOUTH, 1)
+                    | b(BTN_SELECT, 2)
+                    | b(BTN_START, 3)
+                    | b(BTN_RIGHT, 4)
+                    | b(BTN_LEFT, 5)
+                    | b(BTN_UP, 6)
+                    | b(BTN_DOWN, 7)
+            }
+            System::Sms | System::GameGear => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_SOUTH, 4)
+                    | b(BTN_EAST, 5)
+                    | b(BTN_START, 6)
+            }
+            System::Ps1 => {
+                b(BTN_SELECT, 0)
+                    | b(BTN_START, 3)
+                    | b(BTN_UP, 4)
+                    | b(BTN_RIGHT, 5)
+                    | b(BTN_DOWN, 6)
+                    | b(BTN_LEFT, 7)
+                    | b(BTN_L1, 10)
+                    | b(BTN_R1, 11)
+                    | b(BTN_NORTH, 12)
+                    | b(BTN_EAST, 13)
+                    | b(BTN_SOUTH, 14)
+                    | b(BTN_WEST, 15)
+            }
+            System::Xbox => {
+                b(BTN_START, 0)
+                    | b(BTN_SELECT, 1)
+                    | b(BTN_UP, 2)
+                    | b(BTN_DOWN, 3)
+                    | b(BTN_LEFT, 4)
+                    | b(BTN_RIGHT, 5)
+                    | b(BTN_SOUTH, 6)
+                    | b(BTN_EAST, 7)
+                    | b(BTN_WEST, 8)
+                    | b(BTN_NORTH, 9)
+                    | b(BTN_L1, 10)
+                    | b(BTN_R1, 11)
+                    | b(BTN_L2, 12)
+                    | b(BTN_R2, 13)
+            }
+            System::Snes => {
+                b(BTN_SOUTH, 0)
+                    | b(BTN_WEST, 1)
+                    | b(BTN_SELECT, 2)
+                    | b(BTN_START, 3)
+                    | b(BTN_UP, 4)
+                    | b(BTN_DOWN, 5)
+                    | b(BTN_LEFT, 6)
+                    | b(BTN_RIGHT, 7)
+                    | b(BTN_EAST, 8)
+                    | b(BTN_NORTH, 9)
+                    | b(BTN_L1, 10)
+                    | b(BTN_R1, 11)
+            }
+            System::Genesis => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_WEST, 4)
+                    | b(BTN_SOUTH, 5)
+                    | b(BTN_EAST, 6)
+                    | b(BTN_START, 7)
+                    | b(BTN_L1, 8)
+                    | b(BTN_NORTH, 9)
+                    | b(BTN_R1, 10)
+                    | b(BTN_SELECT, 11)
+            }
+            System::Pce => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_EAST, 4)
+                    | b(BTN_SOUTH, 5)
+                    | b(BTN_SELECT, 6)
+                    | b(BTN_START, 7)
+            }
+            System::Atari2600 => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_SOUTH, 4)
+                    | b(BTN_START, 5)
+                    | b(BTN_SELECT, 6)
+            }
+            System::Ngpc => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_SOUTH, 4)
+                    | b(BTN_EAST, 5)
+                    | b(BTN_START, 6)
+            }
+            System::WonderSwan => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_EAST, 4)
+                    | b(BTN_SOUTH, 5)
+                    | b(BTN_START, 6)
+            }
+            System::VirtualBoy => {
+                b(BTN_UP, 0)
+                    | b(BTN_DOWN, 1)
+                    | b(BTN_LEFT, 2)
+                    | b(BTN_RIGHT, 3)
+                    | b(BTN_EAST, 4)
+                    | b(BTN_SOUTH, 5)
+                    | b(BTN_L1, 6)
+                    | b(BTN_R1, 7)
+                    | b(BTN_START, 8)
+                    | b(BTN_SELECT, 9)
+            }
+            System::N64 => {
+                b(BTN_EAST, 0)
+                    | b(BTN_SOUTH, 1)
+                    | b(BTN_L2, 2)
+                    | b(BTN_START, 3)
+                    | b(BTN_UP, 4)
+                    | b(BTN_DOWN, 5)
+                    | b(BTN_LEFT, 6)
+                    | b(BTN_RIGHT, 7)
+                    | b(BTN_L1, 8)
+                    | b(BTN_R1, 9)
+            }
+        }
     }
 }
 
@@ -107,6 +304,8 @@ enum Inner {
 /// The opaque session handle.
 pub struct Emu {
     inner: Inner,
+    /// Which system this handle was created for (drives input layout).
+    system: System,
     /// Latest presented framebuffer (RGBA8888), refreshed each `run_frame`.
     fb: Vec<u8>,
     width: u32,
@@ -118,7 +317,7 @@ pub struct Emu {
 }
 
 impl Emu {
-    fn new(system: System) -> Emu {
+    pub fn new(system: System) -> Emu {
         // (sample rate, channels) mirror the web players' audio settings.
         let (inner, w, h, rate, ch): (Inner, u32, u32, u32, u32) = match system {
             System::Gba => (Inner::Gba(Box::new(Gba::new())), 240, 160, 32768, 2),
@@ -142,6 +341,7 @@ impl Emu {
         };
         let mut e = Emu {
             inner,
+            system,
             fb: Vec::new(),
             width: w,
             height: h,
@@ -154,7 +354,7 @@ impl Emu {
     }
 
     /// Load a ROM / disc image. Returns true on success.
-    fn load_rom(&mut self, bytes: &[u8]) -> bool {
+    pub fn load_rom(&mut self, bytes: &[u8]) -> bool {
         match &mut self.inner {
             Inner::Gba(c) => {
                 c.load_rom(bytes);
@@ -217,7 +417,7 @@ impl Emu {
     }
 
     /// Load a BIOS/flash image (PS1, Xbox). No-op for cores that don't need one.
-    fn load_bios(&mut self, bytes: &[u8]) -> bool {
+    pub fn load_bios(&mut self, bytes: &[u8]) -> bool {
         match &mut self.inner {
             Inner::Ps1(c) => {
                 c.load_bios(bytes);
@@ -231,7 +431,7 @@ impl Emu {
         }
     }
 
-    fn run_frame(&mut self) {
+    pub fn run_frame(&mut self) {
         match &mut self.inner {
             Inner::Gba(c) => c.run_frame(),
             Inner::Ps1(c) => c.run_frame(),
@@ -257,7 +457,7 @@ impl Emu {
     /// each core's web-player bit layout. Cores that want a different convention
     /// are adapted here (e.g. the NDS keypad registers are active-low), so every
     /// front-end — Swift, libretro — uses the same "1 = pressed" contract.
-    fn set_keys(&mut self, bits: u32) {
+    pub fn set_keys(&mut self, bits: u32) {
         match &mut self.inner {
             Inner::Gba(c) => c.set_keys(bits),
             Inner::Ps1(c) => c.set_keys(bits as u16),
@@ -284,7 +484,7 @@ impl Emu {
     }
 
     /// Drain audio into `out` (capacity `max` floats). Returns count written.
-    fn drain_audio(&mut self, out: &mut [f32]) -> usize {
+    pub fn drain_audio(&mut self, out: &mut [f32]) -> usize {
         let samples: Vec<f32> = match &mut self.inner {
             Inner::Gba(c) => c.drain_audio(),
             Inner::Ps1(c) => c.drain_audio(),
@@ -307,8 +507,38 @@ impl Emu {
         n
     }
 
-    fn frame_count(&self) -> u32 {
+    pub fn frame_count(&self) -> u32 {
         self.frames
+    }
+
+    // ---- accessors for Rust front-ends (e.g. the libretro core) ----
+
+    /// The latest RGBA8888 framebuffer (`width * height * 4` bytes).
+    pub fn framebuffer(&self) -> &[u8] {
+        &self.fb
+    }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    pub fn channels(&self) -> u32 {
+        self.channels
+    }
+    pub fn system(&self) -> System {
+        self.system
+    }
+
+    /// Set the controller state from a uniform **logical** bitmask (the `BTN_*`
+    /// bits below — a RetroPad-style abstraction), translating to this system's
+    /// native key layout. Front-ends that think in logical buttons (libretro,
+    /// the Swift app) use this instead of the raw per-system `set_keys`.
+    pub fn set_buttons(&mut self, logical: u32) {
+        self.set_keys(self.system.button_mask(logical));
     }
 
     /// Refresh the cached framebuffer + dimensions from the core.
