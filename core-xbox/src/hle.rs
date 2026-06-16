@@ -478,6 +478,45 @@ pub fn tick_clock(mem: &mut Mem) {
     }
 }
 
+/// Convert a Windows FILETIME (100 ns ticks since 1601-01-01) to NT TIME_FIELDS
+/// components: (Year, Month, Day, Hour, Minute, Second, Milliseconds, Weekday).
+/// Weekday is 0=Sunday. Uses Howard Hinnant's days→civil algorithm.
+fn filetime_to_fields(t: u64) -> (i16, i16, i16, i16, i16, i16, i16, i16) {
+    let ms_total = (t / 10_000) as i64; // ms since 1601-01-01
+    let ms = (ms_total % 1000) as i16;
+    let secs = ms_total / 1000;
+    let second = (secs % 60) as i16;
+    let mins = secs / 60;
+    let minute = (mins % 60) as i16;
+    let hours = mins / 60;
+    let hour = (hours % 24) as i16;
+    let days = hours / 24; // days since 1601-01-01 (a Monday)
+    let weekday = ((days + 1).rem_euclid(7)) as i16; // 0=Sunday
+    // Shift days-since-1601 to the algorithm's internal epoch (0000-03-01).
+    // 134774 = days from 1601-01-01 to 1970-01-01; 719468 = 1970 → 0000-03-01.
+    let z = days - 134774 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as i16; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as i16; // [1, 12]
+    let year = (if m <= 2 { y + 1 } else { y }) as i16;
+    (year, m, d, hour, minute, second, ms, weekday)
+}
+
+/// Current system tick in milliseconds (the KeTickCount export's value, or 0
+/// before it's been allocated).
+fn current_tick_ms(mem: &Mem) -> u32 {
+    let g = KDATA.lock().unwrap();
+    g.as_ref()
+        .and_then(|m| m.get(&ORD_KE_TICK_COUNT).copied())
+        .map(|addr| mem.ram_read32(addr))
+        .unwrap_or(0)
+}
+
 /// Reset all HLE global state (allocator, scheduler, ISR, filesystem, kernel
 /// data). Called when a new game boots so stale state from a prior run (these
 /// are process-globals) doesn't leak across loads.
@@ -1015,6 +1054,15 @@ const ORD_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 218;
 const ORD_NT_QUERY_INFORMATION_FILE: u32 = 211;
 const ORD_NT_SET_INFORMATION_FILE: u32 = 226;
 const ORD_NT_QUERY_FULL_ATTRIBUTES_FILE: u32 = 210;
+const ORD_NT_DEVICE_IO_CONTROL_FILE: u32 = 196;
+const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x0007_0000;
+const IOCTL_DISK_GET_PARTITION_INFO: u32 = 0x0007_4004;
+const ORD_NT_FS_CONTROL_FILE: u32 = 200;
+const ORD_RTL_TIME_TO_TIME_FIELDS: u32 = 305;
+const ORD_KE_QUERY_SYSTEM_TIME: u32 = 128;
+/// Windows FILETIME (100 ns ticks since 1601) for ~2023-01-01, used as the base
+/// for KeQuerySystemTime; the system tick (ms) is added so time advances.
+const SYSTEMTIME_BASE: u64 = 133_170_048_000_000_000;
 const ORD_EX_QUERY_NON_VOLATILE_SETTING: u32 = 24;
 const ORD_RTL_EQUAL_STRING: u32 = 279;
 const ORD_HAL_GET_INTERRUPT_VECTOR: u32 = 44;
@@ -1352,6 +1400,119 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             close_file(h);
             stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
             Dispatch::Handled("NtClose")
+        }
+        ORD_RTL_TIME_TO_TIME_FIELDS => {
+            // VOID RtlTimeToTimeFields(PLARGE_INTEGER Time, PTIME_FIELDS Fields).
+            // Fields = 8 SHORTs: Year, Month, Day, Hour, Minute, Second,
+            // Milliseconds, Weekday.
+            let time_ptr = arg(cpu, mem, 0);
+            let fields = arg(cpu, mem, 1);
+            if time_ptr != 0 && fields != 0 {
+                let lo = mem.ram_read32(time_ptr) as u64;
+                let hi = mem.ram_read32(time_ptr.wrapping_add(4)) as u64;
+                let (y, mo, d, h, mi, s, ms, wd) = filetime_to_fields((hi << 32) | lo);
+                for (off, v) in [(0, y), (2, mo), (4, d), (6, h), (8, mi), (10, s), (12, ms), (14, wd)] {
+                    mem.ram_write16(fields.wrapping_add(off), (v as u16) as u32);
+                }
+            }
+            stdcall_return(cpu, mem, 0, 8);
+            Dispatch::Handled("RtlTimeToTimeFields")
+        }
+        ORD_KE_QUERY_SYSTEM_TIME => {
+            // VOID KeQuerySystemTime(PLARGE_INTEGER CurrentTime) — 100 ns ticks
+            // since 1601. Base time + the system tick (ms) so it advances.
+            let out = arg(cpu, mem, 0);
+            if out != 0 {
+                let t = SYSTEMTIME_BASE + (current_tick_ms(mem) as u64) * 10_000;
+                mem.ram_write32(out, t as u32);
+                mem.ram_write32(out.wrapping_add(4), (t >> 32) as u32);
+            }
+            stdcall_return(cpu, mem, 0, 4);
+            Dispatch::Handled("KeQuerySystemTime")
+        }
+        ORD_NT_DEVICE_IO_CONTROL_FILE => {
+            // NtDeviceIoControlFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE,
+            //   PVOID ApcCtx, PIO_STATUS_BLOCK, ULONG IoControlCode, PVOID InBuf,
+            //   ULONG InLen, PVOID OutBuf, ULONG OutLen) — 40 bytes.
+            let iosb = arg(cpu, mem, 4);
+            let code = arg(cpu, mem, 5);
+            let out_buf = arg(cpu, mem, 8);
+            let out_len = arg(cpu, mem, 9);
+            if std::env::var_os("XBOX_TRACE_IOCTL").is_some() {
+                let in_buf = arg(cpu, mem, 6);
+                let in_len = arg(cpu, mem, 7);
+                eprintln!(
+                    "[ioctl] code={code:#010x} in={in_buf:#x}/{in_len} out={out_buf:#x}/{out_len}"
+                );
+            }
+            // Start zeroed, then fill the structures the game's HDD/cache setup
+            // queries. Returning zeros makes it see a 0-byte disk and retry
+            // forever, so present a plausible ~8 GB fixed disk with FATX-recognized
+            // partitions.
+            if out_buf != 0 {
+                for i in (0..out_len.min(4096)).step_by(4) {
+                    mem.ram_write32(out_buf.wrapping_add(i), 0);
+                }
+            }
+            let info = match code {
+                IOCTL_DISK_GET_DRIVE_GEOMETRY if out_buf != 0 && out_len >= 24 => {
+                    // DISK_GEOMETRY { Cylinders(i64), MediaType(u32),
+                    //   TracksPerCylinder(u32), SectorsPerTrack(u32), BytesPerSector(u32) }
+                    mem.ram_write32(out_buf, 16644); // Cylinders low (≈8 GB @ CHS)
+                    mem.ram_write32(out_buf.wrapping_add(4), 0); // Cylinders high
+                    mem.ram_write32(out_buf.wrapping_add(8), 12); // MediaType = FixedMedia
+                    mem.ram_write32(out_buf.wrapping_add(12), 16); // TracksPerCylinder
+                    mem.ram_write32(out_buf.wrapping_add(16), 63); // SectorsPerTrack
+                    mem.ram_write32(out_buf.wrapping_add(20), 512); // BytesPerSector
+                    24
+                }
+                IOCTL_DISK_GET_PARTITION_INFO if out_buf != 0 && out_len >= 28 => {
+                    // PARTITION_INFORMATION { StartingOffset(i64), PartitionLength(i64),
+                    //   HiddenSectors(u32), PartitionNumber(u32), PartitionType(u8),
+                    //   BootIndicator(u8), RecognizedPartition(u8), RewritePartition(u8) }
+                    mem.ram_write32(out_buf, 0); // StartingOffset low
+                    mem.ram_write32(out_buf.wrapping_add(4), 0); // StartingOffset high
+                    mem.ram_write32(out_buf.wrapping_add(8), 0x2EE0_0000); // PartitionLength low (~750 MB)
+                    mem.ram_write32(out_buf.wrapping_add(12), 0); // PartitionLength high
+                    mem.ram_write32(out_buf.wrapping_add(16), 0); // HiddenSectors
+                    mem.ram_write32(out_buf.wrapping_add(20), 0); // PartitionNumber
+                    mem.ram_write8(out_buf.wrapping_add(24), 0x42); // PartitionType (non-zero)
+                    mem.ram_write8(out_buf.wrapping_add(25), 0); // BootIndicator
+                    mem.ram_write8(out_buf.wrapping_add(26), 1); // RecognizedPartition = TRUE
+                    mem.ram_write8(out_buf.wrapping_add(27), 0); // RewritePartition
+                    28
+                }
+                _ => 0,
+            };
+            if iosb != 0 {
+                mem.ram_write32(iosb, STATUS_SUCCESS);
+                mem.ram_write32(iosb.wrapping_add(4), info); // Information = bytes returned
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 40);
+            Dispatch::Handled("NtDeviceIoControlFile")
+        }
+        ORD_NT_FS_CONTROL_FILE => {
+            // NtFsControlFile(HANDLE, HANDLE Event, PIO_APC_ROUTINE, PVOID ApcCtx,
+            //   PIO_STATUS_BLOCK, ULONG FsControlCode, PVOID InBuf, ULONG InLen,
+            //   PVOID OutBuf, ULONG OutLen) — 40 bytes. No real FS backing; accept
+            //   the control op with a zeroed output buffer.
+            let iosb = arg(cpu, mem, 4);
+            let out_buf = arg(cpu, mem, 8);
+            let out_len = arg(cpu, mem, 9);
+            if std::env::var_os("XBOX_TRACE_IOCTL").is_some() {
+                eprintln!("[fsctl] code={:#010x} out={out_buf:#x}/{out_len}", arg(cpu, mem, 5));
+            }
+            if out_buf != 0 {
+                for i in (0..out_len.min(4096)).step_by(4) {
+                    mem.ram_write32(out_buf.wrapping_add(i), 0);
+                }
+            }
+            if iosb != 0 {
+                mem.ram_write32(iosb, STATUS_SUCCESS);
+                mem.ram_write32(iosb.wrapping_add(4), 0);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 40);
+            Dispatch::Handled("NtFsControlFile")
         }
 
         // NTSTATUS ExQueryNonVolatileSetting(DWORD ValueIndex, DWORD *Type,
@@ -1810,6 +1971,22 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
 mod tests {
     use super::*;
     use crate::cpu::state::ESP;
+
+    #[test]
+    fn filetime_to_fields_known_dates() {
+        // SYSTEMTIME_BASE is 2023-01-01 00:00:00 UTC (a Sunday).
+        let (y, mo, d, h, mi, s, ms, wd) = filetime_to_fields(SYSTEMTIME_BASE);
+        assert_eq!((y, mo, d), (2023, 1, 1));
+        assert_eq!((h, mi, s, ms), (0, 0, 0, 0));
+        assert_eq!(wd, 0); // Sunday
+        // Add one day + 2 hours + 3 minutes + 4 seconds + 5 ms.
+        let t = SYSTEMTIME_BASE
+            + ((((24 + 2) * 60 + 3) * 60 + 4) as u64) * 10_000_000
+            + 5 * 10_000;
+        let (y, mo, d, h, mi, s, ms, wd) = filetime_to_fields(t);
+        assert_eq!((y, mo, d, h, mi, s, ms), (2023, 1, 2, 2, 3, 4, 5));
+        assert_eq!(wd, 1); // Monday
+    }
 
     /// Serializes tests that touch the shared module-level bump heap so the
     /// parallel test runner can't interleave a `heap_reset` with another test's
