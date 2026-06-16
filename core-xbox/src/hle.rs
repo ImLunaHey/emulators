@@ -1187,6 +1187,9 @@ const ORD_NT_QUERY_SYMBOLIC_LINK_OBJECT: u32 = 215;
 const ORD_NT_CREATE_MUTANT: u32 = 192;
 const ORD_NT_RELEASE_MUTANT: u32 = 221;
 const ORD_NT_CREATE_EVENT: u32 = 189;
+const ORD_NT_PULSE_EVENT: u32 = 205;
+const ORD_NT_SET_EVENT: u32 = 225;
+const ORD_NT_CLEAR_EVENT: u32 = 186;
 const ORD_KE_GET_CURRENT_THREAD: u32 = 104;
 const ORD_KE_GET_CURRENT_IRQL: u32 = 103;
 const ORD_KE_RAISE_IRQL_TO_DPC: u32 = 129;
@@ -1764,6 +1767,22 @@ pub fn dispatch(cpu: &mut Cpu, mem: &mut Mem, ordinal: u32) -> Dispatch {
             }
             stdcall_return(cpu, mem, STATUS_SUCCESS, 16);
             Dispatch::Handled("NtCreateEvent")
+        }
+        ORD_NT_PULSE_EVENT | ORD_NT_SET_EVENT => {
+            // NtPulseEvent/NtSetEvent(HANDLE, PLONG PreviousState) — 8 bytes.
+            // Handle-based waits don't block in this model, so signalling is a
+            // no-op beyond reporting the previous state (0 = was non-signalled).
+            let prev = arg(cpu, mem, 1);
+            if prev != 0 {
+                mem.ram_write32(prev, 0);
+            }
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 8);
+            Dispatch::Handled("NtPulseEvent/NtSetEvent")
+        }
+        ORD_NT_CLEAR_EVENT => {
+            // NtClearEvent(HANDLE) — 4 bytes.
+            stdcall_return(cpu, mem, STATUS_SUCCESS, 4);
+            Dispatch::Handled("NtClearEvent")
         }
         ORD_NT_RELEASE_MUTANT => {
             // NtReleaseMutant(HANDLE, PLONG PreviousCount) — 8 bytes.
