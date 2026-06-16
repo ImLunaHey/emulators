@@ -457,17 +457,9 @@ impl Xbox {
     /// the executor can use `self` as its `&mut dyn Bus` (the contract's
     /// `mem::take` pattern). `Cpu: Default`.
     fn step_cpu(&mut self) {
-        // Hot path (~12M calls/frame). Step the CPU in place instead of
-        // `mem::take`ing it out and back — that move + `Cpu::default()` ran on
-        // every instruction and dominated the interpreter.
-        //
-        // SAFETY: `step` mutates the CPU through the `&mut Cpu` we hand it and
-        // reaches memory/MMIO through the `&mut dyn Bus` (`self`). The `Bus`
-        // impl for `Xbox` only ever touches `self.mem` / `self.nv2a` — never
-        // `self.cpu` — so the two `&mut` borrows never actually alias the same
-        // field. The pointer is derived and used within this call only.
-        let cpu = unsafe { &mut *(&raw mut self.cpu) };
+        let mut cpu = std::mem::take(&mut self.cpu);
         cpu.step(self);
+        self.cpu = cpu;
     }
 
     // ---- shared read/write cores (translate → classify → route) ----
