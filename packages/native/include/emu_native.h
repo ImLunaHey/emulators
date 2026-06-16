@@ -65,8 +65,29 @@ bool emu_load_bios(Emu *emu, const uint8_t *data, size_t len);
 /* Run one frame and refresh the framebuffer. */
 void emu_run_frame(Emu *emu);
 
-/* Set the controller button bitmask. */
+/* Set the controller button bitmask (per-system native layout). */
 void emu_set_keys(Emu *emu, uint32_t bits);
+
+/* Logical (RetroPad-style) button bits for emu_set_buttons. Face buttons use
+ * the position->letter abstraction: EAST=A (right), SOUTH=B (bottom),
+ * NORTH=X (top), WEST=Y (left). */
+#define EMU_BTN_UP     (1u << 0)
+#define EMU_BTN_DOWN   (1u << 1)
+#define EMU_BTN_LEFT   (1u << 2)
+#define EMU_BTN_RIGHT  (1u << 3)
+#define EMU_BTN_SOUTH  (1u << 4)
+#define EMU_BTN_EAST   (1u << 5)
+#define EMU_BTN_WEST   (1u << 6)
+#define EMU_BTN_NORTH  (1u << 7)
+#define EMU_BTN_L1     (1u << 8)
+#define EMU_BTN_R1     (1u << 9)
+#define EMU_BTN_L2     (1u << 10)
+#define EMU_BTN_R2     (1u << 11)
+#define EMU_BTN_START  (1u << 12)
+#define EMU_BTN_SELECT (1u << 13)
+
+/* Set controller state from a logical EMU_BTN_* mask, mapped per system. */
+void emu_set_buttons(Emu *emu, uint32_t logical);
 
 /* Current RGBA8888 framebuffer (valid until the next emu_run_frame/emu_free). */
 const uint8_t *emu_framebuffer_ptr(const Emu *emu);

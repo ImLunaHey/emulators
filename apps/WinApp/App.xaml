@@ -1,0 +1,9 @@
+<Application x:Class="EmuWin.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ThemeMode="System"
+             StartupUri="MainWindow.xaml">
+    <!-- ThemeMode="System" opts into the .NET 9 Fluent theme that follows the
+         OS light/dark setting. If your toolchain predates it, remove that
+         attribute (the app still works with the classic native theme). -->
+</Application>

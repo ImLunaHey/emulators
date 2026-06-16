@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Native Windows front-end (WPF) for every core — the Windows counterpart to
+    the macOS SwiftUI app (apps/EmuApp). It P/Invokes the Rust core's C ABI in
+    emu_native.dll (built from packages/native with crate-type cdylib).
+
+    Build:
+      1) Build the DLL on Windows:
+           cd packages/native && cargo build --release
+         then copy target/release/emu_native.dll next to this .csproj
+         (or to the build output dir).
+      2) dotnet build -c Release   (or open in Visual Studio)
+  -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>imlunahey-emulator</AssemblyName>
+    <RootNamespace>EmuWin</RootNamespace>
+    <!-- .NET 9 Fluent theme that follows the OS light/dark setting. -->
+    <ApplicationDefaultFont>Segoe UI</ApplicationDefaultFont>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The Rust core DLL, copied next to the exe if present (see build notes). -->
+    <None Include="emu_native.dll" Condition="Exists('emu_native.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

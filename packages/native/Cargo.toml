@@ -12,7 +12,10 @@ edition = "2021"
 # iOS-only `core-ffi` (GBA only); this one is multi-core and macOS-first.
 [lib]
 name = "emu_native"
-crate-type = ["staticlib", "rlib"]
+# staticlib: linked into the macOS SwiftPM app. rlib: used by Rust front-ends
+# (the desktop/libretro crates). cdylib: a shared library (emu_native.dll /
+# .so / .dylib) for non-Rust front-ends — the WPF Windows app P/Invokes it.
+crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]
 gba-core = { path = "../gba" }

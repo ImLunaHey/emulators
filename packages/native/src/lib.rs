@@ -840,6 +840,19 @@ pub unsafe extern "C" fn emu_set_keys(emu: *mut Emu, bits: u32) {
     }
 }
 
+/// Set the controller state from a uniform **logical** bitmask (`EMU_BTN_*`),
+/// translated to the system's native key layout. Front-ends that think in
+/// logical buttons (the WPF app, libretro) use this instead of `emu_set_keys`.
+///
+/// # Safety
+/// `emu` valid.
+#[no_mangle]
+pub unsafe extern "C" fn emu_set_buttons(emu: *mut Emu, logical: u32) {
+    if !emu.is_null() {
+        (*emu).set_buttons(logical);
+    }
+}
+
 /// Pointer to the current RGBA8888 framebuffer (refreshed each `emu_run_frame`).
 ///
 /// # Safety
