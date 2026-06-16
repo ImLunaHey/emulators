@@ -105,6 +105,12 @@ final class AppSettings: ObservableObject {
         didSet { persistKeyBinds() }
     }
 
+    /// Custom controller bindings (logical button → gamepad input), overlaid on
+    /// the defaults.
+    @Published private var padBinds: [Btn: PadInput] {
+        didSet { persistPadBinds() }
+    }
+
     private let d: UserDefaults
     private enum K {
         static let videoEffect = "settings.video.effect"
@@ -114,6 +120,7 @@ final class AppSettings: ObservableObject {
         static let runInBackground = "settings.emu.runInBackground"
         static let attachments = "settings.attachments"
         static let keyBinds = "settings.keyBinds"
+        static let padBinds = "settings.padBinds"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -140,6 +147,15 @@ final class AppSettings: ObservableObject {
             })
         } else {
             keyBinds = [:]
+        }
+        if let raw = d.string(forKey: K.padBinds),
+           let data = raw.data(using: .utf8),
+           let map = try? JSONDecoder().decode([String: PadInput].self, from: data) {
+            padBinds = Dictionary(uniqueKeysWithValues: map.compactMap { key, value in
+                Btn(rawValue: key).map { ($0, value) }
+            })
+        } else {
+            padBinds = [:]
         }
     }
 
@@ -170,6 +186,33 @@ final class AppSettings: ObservableObject {
         let map = Dictionary(uniqueKeysWithValues: keyBinds.map { ($0.key.rawValue, $0.value) })
         if let data = try? JSONEncoder().encode(map), let raw = String(data: data, encoding: .utf8) {
             d.set(raw, forKey: K.keyBinds)
+        }
+    }
+
+    // ---- controller bindings ----
+
+    func padBinding(for btn: Btn) -> PadInput? {
+        padBinds[btn] ?? DefaultPadBindings.map[btn]
+    }
+
+    var effectivePadBindings: [Btn: PadInput] {
+        var map = DefaultPadBindings.map
+        for (btn, bind) in padBinds { map[btn] = bind }
+        return map
+    }
+
+    func setPadBinding(_ input: PadInput, for btn: Btn) {
+        padBinds[btn] = input
+    }
+
+    func resetPadBindings() {
+        padBinds = [:]
+    }
+
+    private func persistPadBinds() {
+        let map = Dictionary(uniqueKeysWithValues: padBinds.map { ($0.key.rawValue, $0.value) })
+        if let data = try? JSONEncoder().encode(map), let raw = String(data: data, encoding: .utf8) {
+            d.set(raw, forKey: K.padBinds)
         }
     }
 

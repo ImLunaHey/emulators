@@ -126,10 +126,12 @@ final class EmuHub: ObservableObject {
         e.clearSaveDirty()
     }
 
-    /// Push the user's key bindings into the input manager (call on launch and
-    /// whenever the bindings change).
+    /// Push the user's key + controller bindings into the input manager (call on
+    /// launch and whenever the bindings change).
     func applyBindings() {
-        if let s = settings { input.bindings = s.effectiveBindings }
+        guard let s = settings else { return }
+        input.bindings = s.effectiveBindings
+        input.padBindings = s.effectivePadBindings
     }
 
     /// Apply changed audio settings to a live session.

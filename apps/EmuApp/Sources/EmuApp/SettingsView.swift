@@ -220,8 +220,12 @@ private struct StorageDetail: View {
 
 private struct ControlsSettingsView: View {
     @EnvironmentObject var settings: AppSettings
+    // Keyboard capture.
     @State private var capturing: Btn?
     @State private var monitor: Any?
+    // Controller capture (polled, since there's no event stream).
+    @State private var capturingPad: Btn?
+    @State private var padTimer: Timer?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -235,7 +239,7 @@ private struct ControlsSettingsView: View {
                                 Text(capturing == btn
                                      ? "Press a key…"
                                      : (settings.binding(for: btn)?.label ?? "—"))
-                                    .frame(minWidth: 92)
+                                    .frame(minWidth: 96)
                             }
                             .tint(capturing == btn ? .accentColor : nil)
                         }
@@ -243,10 +247,33 @@ private struct ControlsSettingsView: View {
                 } header: {
                     Text("Keyboard")
                 } footer: {
-                    Text("Click a button, then press the key to bind it (Esc cancels). "
-                        + "Controllers use a fixed DualSense-style layout.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text("Click a button, then press the key to bind it (Esc cancels).")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    ForEach(Btn.bindOrder) { btn in
+                        HStack {
+                            Text(btn.label)
+                            Spacer()
+                            Button { beginPadCapture(btn) } label: {
+                                Text(capturingPad == btn
+                                     ? "Press a button…"
+                                     : (settings.padBinding(for: btn)?.label ?? "—"))
+                                    .frame(minWidth: 110)
+                            }
+                            .tint(capturingPad == btn ? .accentColor : nil)
+                            .disabled(firstGamepad == nil)
+                        }
+                    }
+                } header: {
+                    Text("Controller")
+                } footer: {
+                    Text(firstGamepad == nil
+                         ? "Connect a controller to remap it."
+                         : "Click a button, then press the controller button to bind it. "
+                            + "The left stick always works as the D-pad.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
@@ -255,19 +282,26 @@ private struct ControlsSettingsView: View {
                 Spacer()
                 Button("Reset to Defaults") {
                     cancelCapture()
+                    cancelPadCapture()
                     settings.resetBindings()
+                    settings.resetPadBindings()
                 }
             }
             .padding(.horizontal)
             .padding(.bottom, 12)
         }
-        .onDisappear(perform: cancelCapture)
+        .onDisappear {
+            cancelCapture()
+            cancelPadCapture()
+        }
     }
+
+    // ---- keyboard capture ----
 
     private func beginCapture(_ btn: Btn) {
         cancelCapture()
+        cancelPadCapture()
         capturing = btn
-        // Swallow key/modifier events while binding so they don't leak to the UI.
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { ev in
             handleCapture(ev)
             return nil
@@ -282,7 +316,6 @@ private struct ControlsSettingsView: View {
             settings.setBinding(.key(ev.keyCode), for: btn)
             cancelCapture()
         case .flagsChanged:
-            // Bind to the modifier that's now held (ignore pure releases).
             for m in KeyBind.Modifier.allCases where ev.modifierFlags.contains(m.flag) {
                 settings.setBinding(.modifier(m), for: btn)
                 cancelCapture()
@@ -296,6 +329,31 @@ private struct ControlsSettingsView: View {
     private func cancelCapture() {
         capturing = nil
         if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+    }
+
+    // ---- controller capture (poll for a fresh press) ----
+
+    private func beginPadCapture(_ btn: Btn) {
+        cancelCapture()
+        cancelPadCapture()
+        guard let pad = firstGamepad else { return }
+        capturingPad = btn
+        // Buttons already held when capture starts don't count, so the user makes
+        // a deliberate fresh press.
+        let initial = Set(PadInput.allCases.filter { $0.isPressed(pad) })
+        padTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            guard let pad = firstGamepad else { return }
+            if let hit = PadInput.allCases.first(where: { $0.isPressed(pad) && !initial.contains($0) }) {
+                settings.setPadBinding(hit, for: btn)
+                cancelPadCapture()
+            }
+        }
+    }
+
+    private func cancelPadCapture() {
+        capturingPad = nil
+        padTimer?.invalidate()
+        padTimer = nil
     }
 }
 

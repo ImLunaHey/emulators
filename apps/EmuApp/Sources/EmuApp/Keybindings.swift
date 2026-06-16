@@ -1,4 +1,5 @@
 import AppKit
+import GameController
 
 /// A bound keyboard input: either a hardware key (captured from a keyDown, by
 /// `keyCode`) or a modifier key (captured from flagsChanged). Modifiers are
@@ -75,4 +76,71 @@ enum KeyNames {
         16: "Y", 17: "T", 31: "O", 32: "U", 34: "I", 35: "P", 37: "L",
         38: "J", 40: "K", 45: "N", 46: "M",
     ]
+}
+
+// ---- game controller bindings ----
+
+/// A bindable controller input (button, d-pad direction, or trigger). Raw values
+/// persist the binding; `isPressed` reads it from a live gamepad.
+enum PadInput: String, Codable, CaseIterable, Identifiable {
+    case a, b, x, y
+    case dpadUp, dpadDown, dpadLeft, dpadRight
+    case l1, r1, l2, r2
+    case menu, options
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .a: return "Cross (A)"
+        case .b: return "Circle (B)"
+        case .x: return "Square (X)"
+        case .y: return "Triangle (Y)"
+        case .dpadUp: return "D-Pad Up"
+        case .dpadDown: return "D-Pad Down"
+        case .dpadLeft: return "D-Pad Left"
+        case .dpadRight: return "D-Pad Right"
+        case .l1: return "L1"
+        case .r1: return "R1"
+        case .l2: return "L2 / ZL"
+        case .r2: return "R2 / ZR"
+        case .menu: return "Menu (Options)"
+        case .options: return "Create (Share)"
+        }
+    }
+
+    func isPressed(_ p: GCExtendedGamepad, threshold: Float = 0.3) -> Bool {
+        switch self {
+        case .a: return p.buttonA.isPressed
+        case .b: return p.buttonB.isPressed
+        case .x: return p.buttonX.isPressed
+        case .y: return p.buttonY.isPressed
+        case .dpadUp: return p.dpad.up.isPressed
+        case .dpadDown: return p.dpad.down.isPressed
+        case .dpadLeft: return p.dpad.left.isPressed
+        case .dpadRight: return p.dpad.right.isPressed
+        case .l1: return p.leftShoulder.isPressed
+        case .r1: return p.rightShoulder.isPressed
+        case .l2: return p.leftTrigger.value > threshold
+        case .r2: return p.rightTrigger.value > threshold
+        case .menu: return p.buttonMenu.isPressed
+        case .options: return p.buttonOptions?.isPressed == true
+        }
+    }
+}
+
+/// Default controller layout (DualSense-style), matching the original hard-coded
+/// mapping.
+enum DefaultPadBindings {
+    static let map: [Btn: PadInput] = [
+        .south: .a, .east: .b, .west: .x, .north: .y,
+        .up: .dpadUp, .down: .dpadDown, .left: .dpadLeft, .right: .dpadRight,
+        .l1: .l1, .r1: .r1, .l2: .l2, .r2: .r2,
+        .start: .menu, .select: .options,
+    ]
+}
+
+/// The first connected extended gamepad, if any.
+var firstGamepad: GCExtendedGamepad? {
+    GCController.controllers().compactMap { $0.extendedGamepad }.first
 }

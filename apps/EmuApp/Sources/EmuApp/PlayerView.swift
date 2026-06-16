@@ -22,6 +22,7 @@ struct PlayerWindow: View {
             .onChange(of: settings.audioEnabled) { _ in hub.applyAudioSettings() }
             .onChange(of: settings.volume) { _ in hub.applyAudioSettings() }
             .onChange(of: settings.effectiveBindings) { _ in hub.applyBindings() }
+            .onChange(of: settings.effectivePadBindings) { _ in hub.applyBindings() }
     }
 
     private func launchIfNeeded() {
@@ -52,10 +53,13 @@ struct PlayerView: View {
     @EnvironmentObject var hub: EmuHub
     @EnvironmentObject var settings: AppSettings
     @Environment(\.openWindow) private var openWindow
+    @State private var window: NSWindow?
+    @State private var fullscreen = false
 
     var body: some View {
         VStack(spacing: 0) {
-            if hub.isPlaying {
+            // The top bar is hidden in fullscreen so the game fills the screen.
+            if hub.isPlaying && !fullscreen {
                 // A real top bar (not an overlay) so it never covers the screen.
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -115,6 +119,14 @@ struct PlayerView: View {
         }
         .frame(minWidth: 480, minHeight: 360)
         .background(Color.black)
+        // Track this window so we can hide the bar when it goes fullscreen.
+        .background(WindowAccessor { window = $0 })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { n in
+            if n.object as? NSWindow === window { fullscreen = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { n in
+            if n.object as? NSWindow === window { fullscreen = false }
+        }
     }
 }
 
@@ -269,5 +281,19 @@ private struct FpsGraph: View {
                 }
             }
         }
+    }
+}
+
+/// Resolves the hosting `NSWindow` for a SwiftUI view (used to observe this
+/// window's fullscreen transitions). Reports nil until the view is in a window.
+struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { onResolve(v.window) }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { onResolve(nsView.window) }
     }
 }

@@ -45,26 +45,21 @@ final class InputManager {
 
     // ---- controller ----
 
+    /// Active controller bindings (logical button → gamepad input). Replaced by
+    /// `EmuHub` from settings; defaults until then.
+    var padBindings: [Btn: PadInput] = DefaultPadBindings.map
+
     private func pollController() -> Set<Btn> {
-        guard let pad = GCController.controllers().compactMap({ $0.extendedGamepad }).first else {
-            return []
-        }
+        guard let pad = firstGamepad else { return [] }
         var s: Set<Btn> = []
+        for (btn, input) in padBindings where input.isPressed(pad) { s.insert(btn) }
+        // The left analog stick always drives the d-pad directions, regardless of
+        // the button bindings.
         let t: Float = 0.3
-        if pad.dpad.up.isPressed || pad.leftThumbstick.up.value > t { s.insert(.up) }
-        if pad.dpad.down.isPressed || pad.leftThumbstick.down.value > t { s.insert(.down) }
-        if pad.dpad.left.isPressed || pad.leftThumbstick.left.value > t { s.insert(.left) }
-        if pad.dpad.right.isPressed || pad.leftThumbstick.right.value > t { s.insert(.right) }
-        if pad.buttonA.isPressed { s.insert(.south) }  // Cross
-        if pad.buttonB.isPressed { s.insert(.east) }   // Circle
-        if pad.buttonX.isPressed { s.insert(.west) }   // Square
-        if pad.buttonY.isPressed { s.insert(.north) }  // Triangle
-        if pad.leftShoulder.isPressed { s.insert(.l1) }
-        if pad.rightShoulder.isPressed { s.insert(.r1) }
-        if pad.leftTrigger.value > t { s.insert(.l2) }
-        if pad.rightTrigger.value > t { s.insert(.r2) }
-        if pad.buttonMenu.isPressed { s.insert(.start) }      // Options
-        if pad.buttonOptions?.isPressed == true { s.insert(.select) } // Create/Share
+        if pad.leftThumbstick.up.value > t { s.insert(.up) }
+        if pad.leftThumbstick.down.value > t { s.insert(.down) }
+        if pad.leftThumbstick.left.value > t { s.insert(.left) }
+        if pad.leftThumbstick.right.value > t { s.insert(.right) }
         return s
     }
 
