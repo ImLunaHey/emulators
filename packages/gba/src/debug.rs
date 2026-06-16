@@ -196,6 +196,91 @@ impl Gba {
             .apply_remote_multiplay(m0, m1, m2, m3, error, &mut self.irq);
     }
 
+    /// Attach (or detach) the GBA Wireless Adapter as the SIO Normal-32
+    /// peripheral. `true` swaps the loopback transport for a `WirelessAdapter`
+    /// HLE so wireless-capable games detect the adapter and walk its command
+    /// protocol (single-player: no radio peers). `false` restores loopback.
+    /// See `wireless.rs`.
+    pub fn sio_set_wireless_adapter(&mut self, enabled: bool) {
+        self.sio.transport = if enabled {
+            Box::new(crate::wireless::WirelessAdapter::new())
+        } else {
+            Box::new(crate::sio::LocalLoopback)
+        };
+    }
+
+    // ---- Wireless Adapter peer seam (driven by the JS/host transport) ----
+    //
+    // These reach the concrete `WirelessAdapter` behind the boxed transport via
+    // the `as_any_mut` downcast. Each is a no-op when the wireless adapter isn't
+    // the active transport, so the host can call them unconditionally.
+
+    fn wireless_mut(&mut self) -> Option<&mut crate::wireless::WirelessAdapter> {
+        self.sio
+            .transport
+            .as_any_mut()
+            .downcast_mut::<crate::wireless::WirelessAdapter>()
+    }
+
+    /// Advance the adapter's wait timeout by `frames` (call once per frame).
+    pub fn wl_update(&mut self, frames: u32) {
+        if let Some(w) = self.wireless_mut() {
+            w.update(frames);
+        }
+    }
+
+    /// Register a connected client on the host side; returns its device ID (0 if
+    /// the wireless adapter isn't active).
+    pub fn wl_host_add_client(&mut self) -> u16 {
+        self.wireless_mut().map(|w| w.host_add_client()).unwrap_or(0)
+    }
+
+    /// Finalize this adapter as a client the host accepted (device ID + slot).
+    pub fn wl_client_set_connected(&mut self, devid: u16, clnum: u16) {
+        if let Some(w) = self.wireless_mut() {
+            w.client_set_connected(devid, clnum);
+        }
+    }
+
+    /// Drop the peer link (queues a disconnect event for a parked wait).
+    pub fn wl_disconnect_peer(&mut self) {
+        if let Some(w) = self.wireless_mut() {
+            w.disconnect_peer();
+        }
+    }
+
+    /// Inject a packet received from the peer.
+    pub fn wl_deliver_packet(&mut self, bytes: &[u8]) {
+        if let Some(w) = self.wireless_mut() {
+            w.deliver_packet(bytes);
+        }
+    }
+
+    /// Take the packet the game queued via SEND_DATA(W), if any, to relay.
+    pub fn wl_take_outgoing(&mut self) -> Option<Vec<u8>> {
+        self.wireless_mut().and_then(|w| w.take_outgoing())
+    }
+
+    /// Surface a host the transport discovered (device ID + 6 broadcast words).
+    pub fn wl_add_scanned_host(&mut self, devid: u16, data: [u32; 6]) {
+        if let Some(w) = self.wireless_mut() {
+            w.add_scanned_host(devid, data);
+        }
+    }
+
+    /// Clear the discovered-hosts list (e.g. when a scan session restarts).
+    pub fn wl_clear_scanned_hosts(&mut self) {
+        if let Some(w) = self.wireless_mut() {
+            w.clear_scanned_hosts();
+        }
+    }
+
+    /// This host's broadcast payload + device ID, for the transport to announce.
+    /// Returns `None` when the wireless adapter isn't active or isn't hosting.
+    pub fn wl_broadcast(&mut self) -> Option<(u16, [u32; 6])> {
+        self.wireless_mut().map(|w| (w.host_device_id(), w.broadcast_payload()))
+    }
+
     // ---- IWRAM write-watch (LinkPanel IwramWatch) ----
 
     /// Arm the write-watch over the inclusive byte range `[lo, hi]`. Every bus

@@ -81,6 +81,11 @@ pub trait LinkTransport {
     fn request_multiplay(&mut self, _local_data: u32) -> Option<MultiplayResult> {
         None
     }
+
+    // Downcast hook so the host can reach a concrete transport's own surface
+    // (e.g. the Wireless Adapter's packet seam) without the trait carrying every
+    // peripheral's methods. Implementations are one-liners (`self`).
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +138,9 @@ impl LinkTransport for LocalLoopback {
     }
     fn normal8_exchange(&mut self, _local_data: u32) -> u32 {
         0xFF
+    }
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }
 
@@ -791,6 +799,9 @@ mod tests {
             }
             fn normal8_exchange(&mut self, _d: u32) -> u32 {
                 0
+            }
+            fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+                self
             }
         }
         let mut sio = Sio::new();
