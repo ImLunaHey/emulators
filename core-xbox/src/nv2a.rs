@@ -52,6 +52,11 @@ mod off {
     // PTIMER.
     pub const PTIMER_INTR_0: u32 = 0x00_9100;
     pub const PTIMER_INTR_EN_0: u32 = 0x00_9140;
+    // PFB (framebuffer/memory config) + PRAMDAC (GPU clock PLL). The driver
+    // validates these during init (computes the GPU frequency from the PLL
+    // coefficient and checks the memory-partition count).
+    pub const PFB_CFG0: u32 = 0x10_0200;
+    pub const PRAMDAC_NVPLL_COEFF: u32 = 0x68_0500;
     // PGRAPH (3D engine).
     pub const PGRAPH_INTR: u32 = 0x40_0100;
     pub const PGRAPH_INTR_EN: u32 = 0x40_0140;
@@ -346,6 +351,12 @@ impl Nv2a {
             off::PFIFO_INTR_0 => self.pfifo_intr,
             off::PFIFO_INTR_EN_0 => self.pfifo_intr_en,
             off::PCRTC_START => self.crtc_start,
+            // GPU clock PLL coefficient: mdiv=1, ndiv=14, pdiv=0 →
+            // (16.666 MHz * 14) / 1 / 1 = 233.333 MHz, the frequency the driver
+            // requires (it rejects any other value).
+            off::PRAMDAC_NVPLL_COEFF => 0x0000_0E01,
+            // Framebuffer config: low 2 bits (memory-partition count) must read 3.
+            off::PFB_CFG0 => 0x0307_0003,
             off::DMA_GET => self.get,
             off::DMA_PUT => self.put,
             // ---- PFIFO state machine ----
