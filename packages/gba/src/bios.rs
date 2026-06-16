@@ -153,8 +153,12 @@ impl BiosHle {
                 return true;
             }
             0x19 => return true, // SoundBias
-            0x1A | 0x1B | 0x1C | 0x1D | 0x1E | 0x1F | 0x25 | 0x26 => {
+            0x1A | 0x1B | 0x1C | 0x1D | 0x1E | 0x1F | 0x26 => {
                 return true; // sound drivers — silent stub
+            }
+            0x25 => {
+                self.multi_boot(cpu, bus);
+                return true;
             }
             _ => {}
         }
@@ -171,6 +175,37 @@ impl BiosHle {
     }
 
     // -------- Reset / RAM clear --------
+    // SWI 0x25 — MultiBoot. r0 = pointer to a MultiBootParam struct, r1 =
+    // transfer mode (0/2 = Normal-32, 1 = Multi-play-16). On hardware this ships
+    // the cartridge's multiboot image to every connected child and returns r0=0
+    // on success, r0=1 on failure.
+    //
+    // We are a single unit with no child attached over the link transport, so a
+    // real transfer can't complete: we parse and validate the parameter block
+    // (exercising the multiboot crypto/length checks) and report failure (r0=1),
+    // which is the faithful "no slaves responded" result. Games take their
+    // transfer-failed path instead of hanging on an undefined return. The
+    // encryption/CRC primitives in `crate::multiboot` are ready for the day a
+    // child peer is wired over the link transport.
+    fn multi_boot(&mut self, cpu: &mut Cpu, bus: &mut dyn Bus) {
+        let param_ptr = cpu.state.r[0];
+        let mode = crate::multiboot::Mode::from_swi_arg(cpu.state.r[1]);
+        // Pull the 0x28-byte parameter block out of GBA memory.
+        let mut raw = [0u8; 0x28];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = bus.read8(param_ptr.wrapping_add(i as u32)) as u8;
+        }
+        // Validate; an out-of-range payload length is itself a failure. (`mode`
+        // and the parsed params would seed `multiboot::Session` for the actual
+        // encrypted transfer once a child peer exists.)
+        let ok = crate::multiboot::MultiBootParam::parse(&raw)
+            .and_then(|p| p.payload_len())
+            .is_some();
+        let _ = (mode, ok);
+        // No child responded → failure.
+        cpu.state.r[0] = 1;
+    }
+
     fn soft_reset(&mut self, cpu: &mut Cpu, bus: &mut dyn Bus) {
         let s = &mut cpu.state;
         // BIOS soft reset reads flag from 0x03007FFA: 0 = ROM, !=0 = EWRAM entry.

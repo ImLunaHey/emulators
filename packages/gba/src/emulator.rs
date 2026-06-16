@@ -152,6 +152,40 @@ impl Gba {
         self.bios = bios;
     }
 
+    /// Boot a multiboot (`.mb`) image as a child unit: lay the image into EWRAM,
+    /// stamp the BIOS-written boot-mode / client-id header bytes, and start the
+    /// CPU at the EWRAM entry point (`0x020000C0`) instead of the cartridge.
+    /// Returns `false` (leaving the machine untouched) if the image is too small
+    /// or too large for EWRAM.
+    ///
+    /// This is the receive half of Single-Pak link: a real parent would ship the
+    /// (encrypted) image over the cable; here the host supplies the decrypted
+    /// `.mb` directly so multiboot ROMs are runnable on their own.
+    pub fn load_multiboot(&mut self, bytes: &[u8]) -> bool {
+        let entry = match crate::multiboot::prepare_child_image(
+            bytes,
+            &mut self.mem.ewram[..],
+            crate::multiboot::Mode::Normal32,
+            1, // single child → client id 1
+        ) {
+            Some(e) => e,
+            None => return false,
+        };
+        // A multiboot image carries no cartridge, but games may still probe for
+        // a save; keep the autodetected default.
+        self.save_type = detect_save_type(bytes);
+        self.eeprom_mode = matches!(self.save_type, SaveType::Eeprom512 | SaveType::Eeprom8k);
+        // Boot like the cartridge-bypass path, then redirect the PC into EWRAM.
+        self.cpu.reset(&mut self.mem);
+        self.cpu.state.r[15] = entry;
+        self.cpu.flush_pipeline();
+        self.ppu.dispstat = 0x38;
+        let mut bios = std::mem::replace(&mut self.bios, BiosHle::new());
+        bios.reset_affine_defaults(self);
+        self.bios = bios;
+        true
+    }
+
     // ---- input / output accessors for the host ----
     pub fn framebuffer(&self) -> &[u8] {
         self.ppu.framebuffer()
@@ -793,5 +827,35 @@ mod tests {
         let exc = g.cpu.exceptions;
         g.run_frame();
         assert_eq!(g.cpu.exceptions, exc, "CPU frozen after fault");
+    }
+
+    #[test]
+    fn multiboot_child_boots_from_ewram() {
+        let mut g = Gba::new();
+        // A minimal .mb image: 0xC0 header + a small payload whose entry word at
+        // 0xC0 is `B .` (0xEAFFFFFE), an infinite self-loop.
+        let mut image = vec![0u8; 0xC0 + 0x40];
+        image[0xC0..0xC4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        assert!(g.load_multiboot(&image));
+
+        // Booted into EWRAM at the child entry point, ARM state.
+        assert_eq!(g.cpu.state.r[15], 0x0200_00C0);
+        assert_eq!(g.cpu.state.cpsr & 0x20, 0, "ARM (T clear)");
+        // The image is resident and the BIOS-written header bytes are stamped.
+        assert_eq!(g.mem.ewram[0xC0], 0xFE);
+        assert_eq!(g.mem.ewram[0xC4], 1, "boot mode = Normal-32");
+        assert_eq!(g.mem.ewram[0xC5], 1, "client id 1");
+
+        // It runs from EWRAM without faulting: the self-loop keeps PC parked.
+        g.run_frame();
+        assert!(g.fault.is_none(), "multiboot image runs cleanly");
+        assert_eq!(g.cpu.state.r[15], 0x0200_00C0, "spinning at the entry");
+    }
+
+    #[test]
+    fn multiboot_rejects_undersized_image() {
+        let mut g = Gba::new();
+        // Header-only (no payload) → rejected, machine untouched.
+        assert!(!g.load_multiboot(&[0u8; 0xC0]));
     }
 }
