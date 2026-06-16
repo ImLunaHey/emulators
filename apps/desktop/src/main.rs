@@ -79,6 +79,10 @@ struct App {
     recents: Vec<Recent>,
     /// Transient on-screen message (text, shown-until).
     status: Option<(String, Instant)>,
+    /// Path of the running ROM, for Reset.
+    rom_path: Option<PathBuf>,
+    fullscreen: bool,
+    paused: bool,
     save_clock: u32,
     last: Instant,
     acc: f32,
@@ -105,6 +109,9 @@ impl App {
             settings_open: false,
             recents,
             status: None,
+            rom_path: None,
+            fullscreen: false,
+            paused: false,
             save_clock: 0,
             last: Instant::now(),
             acc: 0.0,
@@ -165,8 +172,19 @@ impl App {
         self.emu = Some(emu);
         self.acc = 0.0;
         self.save_clock = 0;
+        self.paused = false;
+        self.rom_path = Some(path.to_path_buf());
         self.last = Instant::now();
         self.record_recent(path, &name);
+    }
+
+    /// Reload the current ROM from scratch (a hard reset; flushes save first).
+    fn reset(&mut self) {
+        self.flush_save();
+        if let Some(p) = self.rom_path.clone() {
+            self.load_path(&p);
+            self.set_status("Reset");
+        }
     }
 
     /// Add (or move to front) a game in the recents list, capped at 12.
@@ -265,7 +283,11 @@ impl eframe::App for App {
         }
         let gamepad_mask = self.gilrs.as_ref().map(read_gamepad).unwrap_or(0);
 
-        // Save-state hotkeys (RetroArch-style): F2 = save, F4 = load.
+        // Global hotkeys: F11 fullscreen always; the rest only while playing.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         if self.emu.is_some() {
             if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
                 self.save_state();
@@ -273,9 +295,12 @@ impl eframe::App for App {
             if ctx.input(|i| i.key_pressed(egui::Key::F4)) {
                 self.load_state();
             }
+            if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+                self.paused = !self.paused;
+            }
         }
 
-        if self.emu.is_some() {
+        if self.emu.is_some() && !self.paused {
             let now = Instant::now();
             let dt = (now - self.last).as_secs_f32().min(0.1);
             self.last = now;
@@ -324,21 +349,30 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        egui::TopBottomPanel::top("bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.emu.is_some() {
-                    ui.strong(&self.title);
-                } else if ui.button("Open ROM…").clicked() {
-                    self.open_rom();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.emu.is_some() && ui.button("Stop").clicked() {
-                        self.stop();
+        // The top bar is hidden in fullscreen so the game fills the screen.
+        if !self.fullscreen {
+            egui::TopBottomPanel::top("bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if self.emu.is_some() {
+                        ui.strong(&self.title);
+                        if ui.button(if self.paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
+                            self.paused = !self.paused;
+                        }
+                        if ui.button("↺ Reset").clicked() {
+                            self.reset();
+                        }
+                    } else if ui.button("Open ROM…").clicked() {
+                        self.open_rom();
                     }
-                    ui.toggle_value(&mut self.settings_open, "⚙ Settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.emu.is_some() && ui.button("Stop").clicked() {
+                            self.stop();
+                        }
+                        ui.toggle_value(&mut self.settings_open, "⚙ Settings");
+                    });
                 });
             });
-        });
+        }
 
         if self.settings_open {
             egui::SidePanel::right("settings")
