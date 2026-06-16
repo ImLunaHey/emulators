@@ -26,13 +26,18 @@ final class Library: ObservableObject {
         save()
     }
 
-    /// One-time: pre-populate the Xbox shelf with the Halo discs if they're on
-    /// disk, so they show up in the launcher without a manual add.
+    /// One-time: pre-populate the Xbox shelf with the Halo discs and the bundled
+    /// nxdk homebrew demo XBEs if they're on disk, so they show up in the
+    /// launcher without a manual add.
     func seedDefaults() {
         let defaults = UserDefaults.standard
-        let flag = "seeded.halo.v1"
+        let flag = "seeded.xbox.v2"
         guard !defaults.bool(forKey: flag) else { return }
+        // Repo root is two levels up from the SwiftPM executable's package dir.
+        let repoRoot = "/Users/luna/code/imlunahey/emulator"
         let candidates = [
+            "\(repoRoot)/core-xbox/demos/triangle.xbe",
+            "\(repoRoot)/core-xbox/demos/hello.xbe",
             "/Users/luna/Downloads/Halo - Combat Evolved (USA).xiso.iso",
             "/Users/luna/Downloads/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko)/Halo 2 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko).xiso.iso",
         ]
