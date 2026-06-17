@@ -181,6 +181,26 @@ Player shortcuts: **Tab** fast-forward (hold), **`.`** frame-step.
 - Web Audio for sound, Gamepad API for controllers, Pointer events for touch
 - WebRTC for the link cable; PWA (manifest + service worker)
 
+## References
+
+The cores are written from scratch, but the hardware behaviour they reproduce is
+documented by the community. The link/serial work in particular leans on:
+
+- **[GBATEK](https://problemkaputt.de/gbatek.htm)** (Martin Korth) — the canonical
+  GBA hardware reference (SIO, RCNT/SIOCNT modes, IRQs, memory map).
+- **[gba-link-connection](https://github.com/afska/gba-link-connection)** (Rodrigo
+  Alfonso, MIT) — link cable, multiboot, and especially the **Wireless Adapter**
+  protocol. Its [`docs/wireless_adapter.md`](https://github.com/afska/gba-link-connection/blob/master/docs/wireless_adapter.md)
+  and `LinkRawWireless` / `LinkWirelessOpenSDK` headers are the reference for the
+  adapter command set (`0x10`–`0x3d`), the `0x99660028` data-available
+  notification, the clock-reversal ("the adapter seizes the SPI clock to push data
+  into the GBA"), and the send/receive packet header layouts. The Wireless Adapter
+  HLE in `packages/gba/src/wireless.rs` is an independent implementation written
+  from that protocol documentation.
+- **[davidgf.net](https://www.davidgf.net/2024/01/13/gba-wireless-adapter/)** and
+  **[blog.kuiper.dev](https://blog.kuiper.dev/gba-wireless-adapter)** — additional
+  reverse-engineering write-ups of the wireless adapter.
+
 ## Bugs / requests
 
 [github.com/ImLunaHey/emulators/issues](https://github.com/ImLunaHey/emulators/issues)

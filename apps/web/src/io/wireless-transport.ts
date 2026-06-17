@@ -113,9 +113,12 @@ export class WirelessTransport {
       this.lastEvent = `connect→${reqid.toString(16)}`;
     }
 
-    // Both: drain any queued outgoing data packets and relay them.
+    // Both: drain any queued outgoing data packets and relay them — INCLUDING
+    // the per-frame heartbeat (an empty send). The heartbeat keeps the peer's
+    // WAIT alive each frame so the session advances instead of timing out and
+    // giving up. `undefined` = nothing queued.
     let pkt = this.bridge.wlTakeOutgoing();
-    while (pkt && pkt.length) {
+    while (pkt !== undefined) {
       this.send({ type: 'wl-data', to: this.peerId, payload: { bytes: Array.from(pkt) } });
       this.packetsOut++;
       pkt = this.bridge.wlTakeOutgoing();

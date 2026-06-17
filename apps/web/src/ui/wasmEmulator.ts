@@ -355,6 +355,7 @@ export class WasmEmulator implements WasmCore {
     sio_wl_disconnect_peer(): void;
     sio_wl_deliver_packet(bytes: Uint8Array): void;
     sio_wl_take_outgoing(): Uint8Array | undefined;
+    sio_wl_diag(): string;
     sio_wl_pending_connect(): number;
     sio_wl_add_scanned_host(devid: number, data: Uint32Array): void;
     sio_wl_clear_scanned_hosts(): void;
@@ -395,6 +396,8 @@ export class WasmEmulator implements WasmCore {
   wlDeliverPacket(bytes: Uint8Array): void { this.linkApi?.sio_wl_deliver_packet(bytes); }
   /** Take the packet the game queued to send, if any. */
   wlTakeOutgoing(): Uint8Array | undefined { return this.linkApi?.sio_wl_take_outgoing(); }
+  /** One-line wait/reverse-clock diagnostic for the debug strip. */
+  wlDiag(): string { return this.linkApi?.sio_wl_diag() ?? ''; }
   /** Take the host devid the game is connecting to (once), or -1 if none. */
   wlPendingConnect(): number { return this.linkApi?.sio_wl_pending_connect() ?? -1; }
   /** Drain the wireless adapter SPI word trace as `[sent, reply]` pairs. */

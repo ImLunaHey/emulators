@@ -98,6 +98,36 @@ pub trait LinkTransport {
     fn gpio_si(&self, _so_high: bool) -> Option<bool> {
         None
     }
+
+    // Reverse-clock direction (the "clock reversal" the Wireless Adapter uses
+    // after a wait-class command). On real hardware the adapter becomes the SPI
+    // master and clocks event/data words INTO the GBA — the GBA is the slave for
+    // this phase. We can't drive the bus, so the host Sio polls these two hooks:
+    //
+    //   `wants_reverse()` — true while the adapter has a word queued to push.
+    //     When set, the Sio parks the game's next Normal-32 transfer instead of
+    //     completing it the normal (GBA-master) way.
+    //   `reverse_clock(gba_out)` — supplies the next word the adapter clocks in,
+    //     consuming `gba_out` (what the GBA shifted back this transfer, e.g. the
+    //     0x996600A8 ack). `None` = nothing to push yet (transfer stays parked).
+    //
+    // Defaults: a non-participating transport never reverses, so every other
+    // transport (loopback, cables) is unaffected.
+    fn wants_reverse(&self) -> bool {
+        false
+    }
+    fn reverse_clock(&mut self, _gba_out: u32) -> Option<u32> {
+        None
+    }
+
+    // True only while the adapter is parked in a wait (clock reversed to it). The
+    // Sio parks slave-mode Normal-32 transfers ONLY when this holds — outside the
+    // wait, slave transfers must complete normally (the game uses slave mode
+    // during detection too, and parking those would hang it forever, since
+    // `reverse_clock` only ever clocks a word during a wait).
+    fn is_waiting(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -263,6 +293,11 @@ pub struct Sio {
     // host hasn't delivered by then, `complete()` finishes with 0xFFFF slots
     // + the error flag so a dropped peer can't hang the game.
     awaiting_peer: bool,
+    // Set when a Normal-32 transfer is parked waiting for the Wireless Adapter to
+    // reverse-clock a word in (see the `reverse_clock` trait hooks). Driven to
+    // completion in `step()` once the adapter supplies the word; a safety timeout
+    // (the same long cycle budget as the JS link) unsticks it if it never does.
+    awaiting_reverse: bool,
     // The 16-bit SIOMLT_SEND payload the master wants the host to broadcast.
     // `take_outgoing()` hands it to JS once (take semantics) so the host
     // knows to send it to peers this frame.
@@ -310,6 +345,7 @@ impl Sio {
             link_connected: false,
             link_master: false,
             awaiting_peer: false,
+            awaiting_reverse: false,
             outgoing: None,
             transport: Box::new(LocalLoopback),
             trace: Vec::new(),
@@ -355,6 +391,32 @@ impl Sio {
     // Emulator.runFrame after each batch, same as PPU/Timers.
     pub fn step(&mut self, cyc: i32, irq: &mut Irq) {
         if !self.active {
+            return;
+        }
+        // Reverse-clock (Wireless Adapter) path: the adapter is driving a word
+        // INTO the GBA. Ask it for the next word; the GBA shifts back whatever it
+        // staged in SIODATA32 (e.g. the 0x996600A8 ack). When the adapter has a
+        // word, latch it, clear START, and raise the SIO IRQ — exactly as a
+        // completed slave-mode transfer would. If it has nothing yet, keep the
+        // safety timeout counting so a wedged session can't hang forever.
+        if self.awaiting_reverse {
+            let gba_out = ((self.multi[1] as u32) << 16) | (self.multi[0] as u32);
+            if let Some(word) = self.transport.reverse_clock(gba_out) {
+                self.multi[0] = (word & 0xFFFF) as u16;
+                self.multi[1] = ((word >> 16) & 0xFFFF) as u16;
+                self.awaiting_reverse = false;
+                self.active = false;
+                self.cycles_until_done = 0;
+                self.siocnt &= !0x80;
+                if self.siocnt & 0x4000 != 0 {
+                    irq.raise(IRQ_SIO);
+                }
+            }
+            // A parked slave transfer never auto-completes on the cycle budget:
+            // the GBA waits for the external clock. With no word from the adapter
+            // yet we stay parked (no spurious completion, no garbage read). The
+            // wait's own timeout surfaces as an EVT_TIMEOUT *through*
+            // reverse_clock, so the game still un-sticks if no data ever comes.
             return;
         }
         self.cycles_until_done -= cyc;
@@ -641,6 +703,7 @@ impl Sio {
             self.active = false;
             self.cycles_until_done = 0;
             self.awaiting_peer = false;
+            self.awaiting_reverse = false;
             self.outgoing = None;
         }
         // NOTE: `irq` is threaded through write_siocnt because begin_transfer
@@ -656,6 +719,24 @@ impl Sio {
         self.active_mode = mode;
         self.active_len32 = mode == MODE_NORMAL_32;
         if mode == MODE_NORMAL_8 || mode == MODE_NORMAL_32 {
+            // Wireless Adapter clock reversal. In Normal-32 SLAVE mode (external
+            // clock, SIOCNT bit 0 = 0) the ADAPTER drives the clock — a transfer
+            // completes ONLY when the adapter actually clocks a word in. librfu
+            // switches to slave after a wait command and idle-polls for the
+            // adapter's `0x99660028`; if we auto-complete those polls with the
+            // idle pattern, librfu reads `0x80000000` as a command, its `0x9966`
+            // header check fails, and it aborts the whole receive. So park the
+            // slave transfer and let `step()` complete it only when
+            // `reverse_clock` supplies a real word. Gated on the transport
+            // participating (wireless), so cables/loopback and the master
+            // command phase (bit 0 = 1) are untouched.
+            let external_clock = (self.siocnt & 1) == 0;
+            if mode == MODE_NORMAL_32 && external_clock && self.transport.is_waiting() {
+                self.awaiting_reverse = true;
+                self.active = true;
+                self.cycles_until_done = LINK_MULTI_TIMEOUT_CYCLES;
+                return;
+            }
             // Normal mode shift-clock: SIOCNT bit 1 picks 256 kHz (= slow)
             // vs 2 MHz (= fast). Bit 0 is SC direction (external vs
             // internal), which doesn't affect duration of the transfer in
@@ -736,6 +817,19 @@ impl Sio {
 
     fn complete(&mut self, irq: &mut Irq) {
         self.active = false;
+        // Reverse-clock safety timeout: the adapter never supplied a word within
+        // the long budget (wedged session). Finish with "no data" so the game's
+        // wait loop unsticks instead of hanging.
+        if self.awaiting_reverse {
+            self.awaiting_reverse = false;
+            self.multi[0] = 0xFFFF;
+            self.multi[1] = 0xFFFF;
+            self.siocnt &= !0x80;
+            if self.siocnt & 0x4000 != 0 {
+                irq.raise(IRQ_SIO);
+            }
+            return;
+        }
         if self.active_mode == MODE_MULTI {
             // Timeout fallback for the JS async path: the host never
             // delivered (peer dropped / signaling stall). Complete with

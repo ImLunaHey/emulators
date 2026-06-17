@@ -257,6 +257,12 @@ impl Gba {
         }
     }
 
+    /// One-line wait/reverse-clock diagnostic for the debug strip (empty when
+    /// the wireless adapter isn't active).
+    pub fn wl_diag(&mut self) -> String {
+        self.wireless_mut().map(|w| w.diag()).unwrap_or_default()
+    }
+
     /// Inject a packet received from the peer.
     pub fn wl_deliver_packet(&mut self, bytes: &[u8]) {
         if let Some(w) = self.wireless_mut() {

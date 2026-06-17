@@ -73,8 +73,8 @@ function RomPicker({ onPick, onExit }: { onPick: (bytes: Uint8Array) => void; on
   );
 }
 
-interface NetSnap { connected: boolean; packetsIn: number; packetsOut: number; lastEvent: string; rcnt: number; siocnt: number; }
-const EMPTY: NetSnap = { connected: false, packetsIn: 0, packetsOut: 0, lastEvent: '', rcnt: 0, siocnt: 0 };
+interface NetSnap { connected: boolean; packetsIn: number; packetsOut: number; lastEvent: string; rcnt: number; siocnt: number; diag: string; }
+const EMPTY: NetSnap = { connected: false, packetsIn: 0, packetsOut: 0, lastEvent: '', rcnt: 0, siocnt: 0, diag: '' };
 
 function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: () => void }) {
   const [roomInput, setRoomInput] = useState('');
@@ -170,6 +170,7 @@ function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: ()
           lastEvent: transport.lastEvent,
           rcnt: emu.io.read16(0x4000134) & 0xffff,
           siocnt: emu.io.read16(0x4000128) & 0xffff,
+          diag: emu.wlDiag(),
         });
       }
     };
@@ -212,6 +213,7 @@ function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: ()
             <span>SIOCNT=0x{snap.siocnt.toString(16).padStart(4, '0')}</span>
           </div>
           <div className="opacity-70">last: {snap.lastEvent || '—'}</div>
+          <div className="opacity-70 break-all">{snap.diag || '—'}</div>
           <SioTrace emuRef={emuRef} />
         </div>
       </div>

@@ -280,6 +280,11 @@ impl WasmGba {
         self.inner.wl_take_outgoing()
     }
 
+    /// One-line wait/reverse-clock diagnostic string for the debug strip.
+    pub fn sio_wl_diag(&mut self) -> String {
+        self.inner.wl_diag()
+    }
+
     /// Take the host device ID the game asked to CONNECT to (once), or -1 when
     /// no connect is pending. The transport relays a connect request to it.
     pub fn sio_wl_pending_connect(&mut self) -> i32 {
