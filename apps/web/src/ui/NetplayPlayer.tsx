@@ -101,7 +101,7 @@ function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: ()
 
   useEffect(() => () => { transportRef.current?.disconnect(); }, []);
 
-  const start = async (code: string) => {
+  const start = async (code: string, isHost: boolean) => {
     setPhase('connecting');
     const c = code.trim().toUpperCase();
     setRoomInput(c);
@@ -122,7 +122,7 @@ function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: ()
       // Drive the transport each frame via the existing pump hook.
       emu.io.sio.transport = transport as unknown as typeof emu.io.sio.transport;
 
-      await transport.connect({ roomId: c });
+      await transport.connect({ roomId: c, isHost });
       setStatus('waiting for peer…');
       setPhase('live');
     } catch (e) {
@@ -238,11 +238,11 @@ function WirelessRunner({ romBytes, onExit }: { romBytes: Uint8Array; onExit: ()
             }} />
           </label>
         </div>
-        <button onClick={() => start(makeRoomCode())} disabled={phase === 'connecting'} className="btn btn-primary w-full py-2.5">Create room</button>
+        <button onClick={() => start(makeRoomCode(), true)} disabled={phase === 'connecting'} className="btn btn-primary w-full py-2.5">Create room</button>
         <div className="text-[10px] opacity-40 text-center">or</div>
         <div className="flex gap-2">
           <input value={roomInput} onChange={(e) => setRoomInput(e.target.value.toUpperCase())} placeholder="Room code" maxLength={6} className="input flex-1 font-mono uppercase tracking-widest" />
-          <button onClick={() => start(roomInput)} disabled={phase === 'connecting' || !roomInput.trim()} className="btn px-4">Join</button>
+          <button onClick={() => start(roomInput, false)} disabled={phase === 'connecting' || !roomInput.trim()} className="btn px-4">Join</button>
         </div>
         {status && <div className="text-[11px] opacity-70">{status}</div>}
       </div>
