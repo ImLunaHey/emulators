@@ -46,3 +46,6 @@ apps/**/.build/
 !.dev.vars.example
 .env*
 !.env.example
+
+# SOFA agent credentials
+.sofa/
