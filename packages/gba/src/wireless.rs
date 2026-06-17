@@ -165,6 +165,15 @@ pub struct WirelessAdapter {
     event: Option<Vec<u32>>,
     // Frames elapsed since entering `WaitEvent`, for the no-event timeout.
     wait_ticks: u32,
+    // Set (to the requested host devid) when the game issues CMD_CONNECT against
+    // a discovered host. The transport takes it once to relay a connect request
+    // to that host; the host answers via `host_add_client` + the transport calls
+    // our `client_set_connected`. None when there's no pending connect.
+    connect_requested: Option<u16>,
+    // Diagnostic ring of (sent, reply) SPI word exchanges. Lets the host dump
+    // exactly what the game shifts to the adapter and what the HLE replies, to
+    // find where detection diverges. Capped; oldest drop first.
+    trace: Vec<(u32, u32)>,
 }
 
 impl WirelessAdapter {
@@ -193,7 +202,21 @@ impl WirelessAdapter {
             tx: None,
             event: None,
             wait_ticks: 0,
+            connect_requested: None,
+            trace: Vec::new(),
         }
+    }
+
+    // Soft reset triggered when the game re-runs the NINTENDO handshake mid-
+    // session (it pulsed the unmodeled reset GPIO). Clears protocol + session
+    // state but keeps the RNG (so device IDs stay deterministic) and the
+    // diagnostic trace (so a capture spans the re-handshake).
+    fn soft_reset(&mut self) {
+        let rng = self.rng;
+        let trace = std::mem::take(&mut self.trace);
+        *self = Self::new();
+        self.rng = rng;
+        self.trace = trace;
     }
 
     // Return the adapter to its just-powered state. The real device resets when
@@ -231,9 +254,24 @@ impl WirelessAdapter {
         cmd == CMD_WAIT || cmd == CMD_SEND_DATAW || cmd == CMD_RTX_WAIT
     }
 
+    // One SPI word exchange (with diagnostic logging). See `transfer_inner`.
+    pub fn transfer(&mut self, sent: u32) -> u32 {
+        let reply = self.transfer_inner(sent);
+        if self.trace.len() >= 4096 {
+            self.trace.remove(0);
+        }
+        self.trace.push((sent, reply));
+        reply
+    }
+
+    /// Drain the captured (sent, reply) SPI word exchanges for diagnosis.
+    pub fn take_trace(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.trace)
+    }
+
     // One SPI word exchange: take the word the GBA shifted out, advance the FSM,
     // return the word the adapter shifts back this transfer.
-    pub fn transfer(&mut self, sent: u32) -> u32 {
+    fn transfer_inner(&mut self, sent: u32) -> u32 {
         let retval = match self.com {
             Com::Reset => {
                 // The GBA opens with `0x7FFF494E` ("..NI"); the low half being
@@ -263,9 +301,23 @@ impl WirelessAdapter {
                     } else {
                         self.com = Com::WaitData;
                     }
+                    // The adapter is busy receiving; it shifts the idle pattern.
+                    SPI_IDLE
+                } else if sent == 0x7FFF_494E || sent == 0xFFFF_494E {
+                    // Re-initialization: games put the adapter to sleep with Bye
+                    // (0x3d) and re-use it by pulsing the reset line (a GPIO we
+                    // don't model) and re-running the NINTENDO handshake. We only
+                    // see the SPI words, so treat the canonical handshake opener
+                    // arriving here as a reset + restart — replying 0 like the
+                    // Reset state does, so the game's recovery proceeds. Without
+                    // this FR/LG's detection sends 0x7FFF494E hundreds of times to
+                    // no effect and reports "adapter not connected properly".
+                    self.soft_reset();
+                    self.com = Com::Handshake;
+                    0
+                } else {
+                    SPI_IDLE
                 }
-                // The adapter is busy receiving; it shifts the idle pattern.
-                SPI_IDLE
             }
             Com::WaitData => {
                 self.buf.push(sent);
@@ -481,6 +533,8 @@ impl WirelessAdapter {
                 let reqid = (input.first().copied().unwrap_or(0) & 0xFFFF) as u16;
                 if self.scanned.iter().any(|&(id, _)| id == reqid) {
                     self.wifi = Wifi::Connecting;
+                    // Signal the transport to relay a connect request to this host.
+                    self.connect_requested = Some(reqid);
                 }
                 Ok(vec![])
             }
@@ -611,6 +665,12 @@ impl WirelessAdapter {
         id
     }
 
+    /// Take the host devid the game asked to CONNECT to (once), so the transport
+    /// can relay a connect request. `None` when no connect is pending.
+    pub fn take_pending_connect(&mut self) -> Option<u16> {
+        self.connect_requested.take()
+    }
+
     /// Finalize this adapter as a client: the host accepted us with the given
     /// device ID and client slot number. Flips a pending Connecting to Client.
     pub fn client_set_connected(&mut self, devid: u16, clnum: u16) {
@@ -733,6 +793,15 @@ impl LinkTransport for WirelessAdapter {
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
     }
+
+    // The adapter is always ready for the next 32-bit transfer, so it mirrors
+    // the inverse of the GBA's SO line on SI: GBA drives SO low → SI reads high;
+    // GBA drives SO high → SI reads low. librfu polls this between transfers to
+    // pace the SPI; without it the wireless session init times out and the game
+    // loops re-initializing.
+    fn gpio_si(&self, so_high: bool) -> Option<bool> {
+        Some(!so_high)
+    }
 }
 
 #[cfg(test)]
@@ -819,6 +888,33 @@ mod tests {
         let (ack, resp) = send_cmd(&mut a, CMD_SYSVER, &[]);
         assert_eq!(ack, 0x9966_0192); // 0x12 + 0x80, len 1
         assert_eq!(resp, vec![SYSVER_WORD]);
+    }
+
+    #[test]
+    fn rehandshake_after_bye_recovers() {
+        // FR/LG's adapter detection does: handshake → Bye (0x3d) → reset +
+        // re-handshake. The adapter must restart the handshake when the opener
+        // arrives while waiting for a command, replying 0 like a cold reset —
+        // otherwise the game spins on 0x7FFF494E forever ("not connected
+        // properly"). Regression guard for that recovery.
+        let mut a = WirelessAdapter::new();
+        run_handshake(&mut a);
+        // Bye: bare ACK, back to waiting for a command.
+        let (ack, _) = send_cmd(&mut a, CMD_BYE, &[]);
+        assert_eq!(ack, ACK_BASE | CMD_BYE as u32); // 0x3d | 0x80
+        assert_eq!(a.com, Com::WaitCmd);
+        // The game re-opens the handshake: the opener is consumed like a cold
+        // reset (reply 0, → Handshake), then the rest of the documented table
+        // flows, ending back at WaitCmd.
+        assert_eq!(a.transfer(0x7FFF_494E), 0);
+        assert_eq!(a.com, Com::Handshake);
+        for &(sent, expect) in &HANDSHAKE[1..] {
+            assert_eq!(a.transfer(sent), expect, "re-handshake word {sent:#010x}");
+        }
+        assert_eq!(a.com, Com::WaitCmd);
+        // And a normal command works after recovery.
+        let (ack, _) = send_cmd(&mut a, CMD_HELLO, &[]);
+        assert_eq!(ack, 0x9966_0090);
     }
 
     #[test]

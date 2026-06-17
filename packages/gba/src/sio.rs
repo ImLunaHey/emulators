@@ -86,6 +86,18 @@ pub trait LinkTransport {
     // (e.g. the Wireless Adapter's packet seam) without the trait carrying every
     // peripheral's methods. Implementations are one-liners (`self`).
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+
+    // GPIO inter-transfer "ready" handshake. Between 32-bit Normal-mode
+    // transfers, the Wireless Adapter and the GBA flow-control via the SO/SI
+    // lines: the GBA drives SO (SIOCNT bit 3) and polls SI (SIOCNT bit 2) for
+    // the adapter's readiness ("GBA low → adapter high; GBA high → adapter low
+    // when ready"). A transport that participates returns the SI line state for
+    // the given SO level; `None` means it doesn't (cables/loopback), so SIOCNT
+    // keeps its normal multiplay SI/SD semantics. The Wireless Adapter is always
+    // ready, so it mirrors SI = !SO, which is what librfu's wait loop expects.
+    fn gpio_si(&self, _so_high: bool) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -550,6 +562,24 @@ impl Sio {
     //   only; IDs 2-3 would be additional slaves).
     fn read_siocnt(&self) -> u32 {
         let mut v = self.siocnt & !0x003C; // clear SI, SD, ID
+        // Wireless Adapter GPIO inter-transfer handshake: when the active
+        // transport participates (Normal-mode SO/SI flow control), bit 2 (SI)
+        // reflects the adapter's readiness for the GBA's current SO (bit 3), and
+        // bit 3 (SO) reads back what the game drove. This bypasses the multiplay
+        // SI/SD overlay below — librfu polls SI here between every 32-bit
+        // transfer and stalls the whole wireless session if it never moves.
+        if !self.link_active {
+            let so_high = (self.siocnt >> 3) & 1 == 1;
+            if let Some(si_high) = self.transport.gpio_si(so_high) {
+                if si_high {
+                    v |= 0x0004; // SI (bit 2)
+                }
+                if so_high {
+                    v |= 0x0008; // SO readback (bit 3)
+                }
+                return v;
+            }
+        }
         // When a JS link is active, SD comes from `link_connected` and
         // SI/ID from `link_master` (host-driven). Otherwise fall back to the
         // Rust transport (LocalLoopback → master, disconnected). Note SD and

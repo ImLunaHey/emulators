@@ -280,6 +280,21 @@ impl WasmGba {
         self.inner.wl_take_outgoing()
     }
 
+    /// Take the host device ID the game asked to CONNECT to (once), or -1 when
+    /// no connect is pending. The transport relays a connect request to it.
+    pub fn sio_wl_pending_connect(&mut self) -> i32 {
+        match self.inner.wl_take_pending_connect() {
+            Some(devid) => devid as i32,
+            None => -1,
+        }
+    }
+
+    /// Drain the wireless adapter's SPI word trace as JSON (`[[sent,reply],…]`),
+    /// for diagnosing adapter detection.
+    pub fn sio_wl_trace(&mut self) -> String {
+        self.inner.wl_trace_json()
+    }
+
     /// Surface a discovered host: `devid` + 6 broadcast words (`data.len() == 6`).
     pub fn sio_wl_add_scanned_host(&mut self, devid: u16, data: &[u32]) {
         let mut d = [0u32; 6];

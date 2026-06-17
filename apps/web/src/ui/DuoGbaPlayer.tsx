@@ -3,6 +3,7 @@ import { WasmEmulator } from './wasmEmulator';
 import { AudioSink } from './audio';
 import { listRoms, getRomBytes, type RomMeta } from './romStore';
 import { loadKeyboardMap } from './keyboardMap';
+import { stepDualFrame } from '../io/duoLink';
 
 // Single-page local two-player GBA link ("duo"). Two independent WasmEmulator
 // cores run the same ROM in the same tab, driven by ONE rAF clock, and are
@@ -369,57 +370,18 @@ interface LinkSnap {
 }
 const LINK_LOG_CAP = 500;
 
-// Cycles per interleave slice. Small enough that the slave gets a slice to
-// service each transfer's SIO IRQ between the master's sends (so it's fed its
-// per-frame burst, not starved), large enough to keep the call count modest
-// (~a frame is 280896 cycles → ~140 slices/core when nothing pends).
-const SLICE_CYCLES = 2048;
-// Hard stop so a pathological pend-storm can't wedge the rAF callback.
-const MAX_STEPS_PER_FRAME = 40000;
-
-// Advance both cores through one visual frame in fine-grained lockstep. We run
-// A and B in alternating cycle slices; whenever A (master) pauses on a pending
-// Multiplay transfer (run_slice → 2) we resolve it immediately — pairing A's
-// staged SIOMLT_SEND with B's *current* SIOMLT_SEND and delivering the same
-// four slots to both (A via deliver: SIO IRQ + seq bump; B via applyRemote: SIO
-// IRQ). Because B is running alongside in small slices, it services each
-// transfer's IRQ and updates its send word before the next one — so the slave
-// receives the burst of transfers per frame its link watchdog expects, instead
-// of one-per-frame (which made it report "link error").
-//
-// Logs only *transitions* (a new master/slave word pair) so the buffer shows
-// the handshake state machine progressing rather than hundreds of identical
-// rows/second.
+// Advance both cores through one visual frame via the shared dual-core lockstep
+// kernel (io/duoLink). We log only *transitions* (a new master/slave word pair)
+// so the buffer shows the handshake state machine progressing rather than
+// hundreds of identical rows/second.
 function stepLinked(a: WasmEmulator, b: WasmEmulator, log: LinkLogEntry[], last: { m: number; s: number }): void {
-  let aDone = false;
-  let bDone = false;
-  let steps = 0;
-  while (!(aDone && bDone) && steps++ < MAX_STEPS_PER_FRAME) {
-    if (!aDone) {
-      const st = a.runSlice(SLICE_CYCLES);
-      if (st === 1) aDone = true;
-      else if (st === 2) resolveTransfer(a, b, log, last);
+  stepDualFrame(a, b, (master, slave) => {
+    if (master !== last.m || slave !== last.s) {
+      last.m = master; last.s = slave;
+      log.push({ t: log.length, m: master, s: slave, seq: a.io.sio.transferSeq });
+      if (log.length > LINK_LOG_CAP) log.splice(0, log.length - LINK_LOG_CAP);
     }
-    if (!bDone) {
-      // B is the slave: it never starts its own transfer, so run_slice never
-      // returns 2 — it just yields 0 (more to do) or 1 (frame done).
-      if (b.runSlice(SLICE_CYCLES) === 1) bDone = true;
-    }
-  }
-}
-
-function resolveTransfer(a: WasmEmulator, b: WasmEmulator, log: LinkLogEntry[], last: { m: number; s: number }): void {
-  const masterRaw = a.linkTakeOutgoing();
-  if (masterRaw < 0) return; // paused without a staged word — shouldn't happen
-  const master = masterRaw & 0xffff;
-  const slave = b.linkPeekOutgoing() & 0xffff;
-  a.linkDeliver(master, slave, 0xffff, 0xffff, false);
-  b.linkApplyRemote(master, slave, 0xffff, 0xffff, false);
-  if (master !== last.m || slave !== last.s) {
-    last.m = master; last.s = slave;
-    log.push({ t: log.length, m: master, s: slave, seq: a.io.sio.transferSeq });
-    if (log.length > LINK_LOG_CAP) log.splice(0, log.length - LINK_LOG_CAP);
-  }
+  });
 }
 
 function linkLogText(log: LinkLogEntry[], snap: LinkSnap): string {

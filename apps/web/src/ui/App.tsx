@@ -22,6 +22,7 @@ import { WonderSwanPlayer } from './WonderSwanPlayer';
 import { VirtualBoyPlayer } from './VirtualBoyPlayer';
 import { N64Player } from './N64Player';
 import { DuoGbaPlayer } from './DuoGbaPlayer';
+import { NetplayPlayer } from './NetplayPlayer';
 import { ToastProvider } from './Toast';
 import { queryClient, persister } from './queryClient';
 
@@ -48,6 +49,15 @@ export function App() {
     return (
       <ToastProvider>
         <DuoGbaPlayer onExit={() => { window.location.href = window.location.pathname; }} />
+      </ToastProvider>
+    );
+  }
+  // `?netplay` opens the online deterministic input-delay link (two machines,
+  // exchange inputs only — works LAN to WAN). Each side runs both GBAs.
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('netplay')) {
+    return (
+      <ToastProvider>
+        <NetplayPlayer onExit={() => { window.location.href = window.location.pathname; }} />
       </ToastProvider>
     );
   }

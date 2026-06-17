@@ -355,6 +355,7 @@ export class WasmEmulator implements WasmCore {
     sio_wl_disconnect_peer(): void;
     sio_wl_deliver_packet(bytes: Uint8Array): void;
     sio_wl_take_outgoing(): Uint8Array | undefined;
+    sio_wl_pending_connect(): number;
     sio_wl_add_scanned_host(devid: number, data: Uint32Array): void;
     sio_wl_clear_scanned_hosts(): void;
     sio_wl_broadcast(): Uint32Array | undefined;
@@ -394,6 +395,13 @@ export class WasmEmulator implements WasmCore {
   wlDeliverPacket(bytes: Uint8Array): void { this.linkApi?.sio_wl_deliver_packet(bytes); }
   /** Take the packet the game queued to send, if any. */
   wlTakeOutgoing(): Uint8Array | undefined { return this.linkApi?.sio_wl_take_outgoing(); }
+  /** Take the host devid the game is connecting to (once), or -1 if none. */
+  wlPendingConnect(): number { return this.linkApi?.sio_wl_pending_connect() ?? -1; }
+  /** Drain the wireless adapter SPI word trace as `[sent, reply]` pairs. */
+  wlTrace(): Array<[number, number]> {
+    try { return JSON.parse((this.linkApi as unknown as { sio_wl_trace(): string } | undefined)?.sio_wl_trace() ?? '[]'); }
+    catch { return []; }
+  }
   /** Surface a discovered host: device ID + 6 broadcast words. */
   wlAddScannedHost(devid: number, data: Uint32Array): void { this.linkApi?.sio_wl_add_scanned_host(devid, data); }
   /** Clear the discovered-hosts list. */
@@ -466,6 +474,12 @@ export class WasmEmulator implements WasmCore {
 
   /** Detected save type (display-only); 'flash128' until a ROM is loaded. */
   get saveType(): string { return this.gba ? this.gba.save_type() : 'flash128'; }
+
+  /** FNV hash of the full machine state — used by lockstep netplay to detect
+   *  desync between peers running the same deterministic dual-core sim. */
+  stateHash(): number {
+    return (this.gba as unknown as { state_hash(): number } | undefined)?.state_hash() ?? 0;
+  }
 
   // ---- IwramWatch bridge (native wasm watch) -----------------------------
   setWatch(lo: number, hi: number): void { this.gba?.set_watch(lo, hi); }

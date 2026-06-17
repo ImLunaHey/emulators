@@ -269,6 +269,28 @@ impl Gba {
         self.wireless_mut().and_then(|w| w.take_outgoing())
     }
 
+    /// Take the host devid the game asked to CONNECT to (once), for the
+    /// transport to relay a connect request. None when no connect is pending.
+    pub fn wl_take_pending_connect(&mut self) -> Option<u16> {
+        self.wireless_mut().and_then(|w| w.take_pending_connect())
+    }
+
+    /// Drain the wireless adapter's (sent, reply) SPI trace as a JSON array of
+    /// `[sent, reply]` pairs (hex-agnostic decimal). Empty `[]` when the adapter
+    /// isn't active or nothing has been exchanged.
+    pub fn wl_trace_json(&mut self) -> String {
+        let trace = self.wireless_mut().map(|w| w.take_trace()).unwrap_or_default();
+        let mut s = String::from("[");
+        for (i, (sent, reply)) in trace.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[{sent},{reply}]"));
+        }
+        s.push(']');
+        s
+    }
+
     /// Surface a host the transport discovered (device ID + 6 broadcast words).
     pub fn wl_add_scanned_host(&mut self, devid: u16, data: [u32; 6]) {
         if let Some(w) = self.wireless_mut() {
