@@ -187,6 +187,17 @@ pub struct WirelessAdapter {
     reverse: Vec<u32>,
     // Frames elapsed since entering `WaitEvent`, for the no-event timeout.
     wait_ticks: u32,
+    // True while the GBA is the clock SLAVE for a wait/reverse exchange — from
+    // the wait-class ACK (MS_CHANGE 0x27, DATA_TX_AND_CHANGE 0x25, 0x35, 0x37)
+    // until it resumes master mode and issues the next command. librfu's slave
+    // SIO handler does handshake_wait(0) → drive SO high → handshake_wait(1),
+    // the REVERSE of the master handler's wait(1)→SO→wait(0). So `gpio_si` must
+    // mirror SO (return `so_high`) during this window, but invert it (`!so_high`)
+    // during the master command phase — otherwise the slave receive's second
+    // handshake_wait never satisfies and the receive loops in timeout recovery
+    // ("Communicating…" forever). Stays set through the final reverse word's
+    // handler (which runs after `com` has already flipped back to WaitCmd).
+    reversing: bool,
     // Set (to the requested host devid) when the game issues CMD_CONNECT against
     // a discovered host. The transport takes it once to relay a connect request
     // to that host; the host answers via `host_add_client` + the transport calls
@@ -234,6 +245,7 @@ impl WirelessAdapter {
             event: None,
             reverse: Vec::new(),
             wait_ticks: 0,
+            reversing: false,
             connect_requested: None,
             diag_deliver: 0,
             diag_rc_called: 0,
@@ -350,6 +362,10 @@ impl WirelessAdapter {
                     // the game ACKs in master mode rather than via the reverse.)
                     SPI_IDLE
                 } else if sent >> 16 == 0x9966 {
+                    // The GBA is driving a command word again → it has returned
+                    // to clock master, so the slave/reverse handshake window is
+                    // over. Restore `gpio_si` to its master-phase polarity.
+                    self.reversing = false;
                     self.plen = (sent >> 8) as u8;
                     self.cmd = sent as u8;
                     self.cnt = 0;
@@ -391,7 +407,12 @@ impl WirelessAdapter {
                 self.cnt = 0;
                 self.com = if Self::is_wait_class(self.cmd) {
                     // Park and wait for an event (or a timeout); see the
-                    // clock-reversal note in the module header.
+                    // clock-reversal note in the module header. NOTE: `reversing`
+                    // (the gpio_si polarity flip) is NOT set here — the *master*
+                    // handler still has to finish this command's closing
+                    // handshake_wait and perform the master→slave switch with
+                    // master polarity. It flips only once the adapter actually
+                    // reverse-clocks the first word (see `reverse_clock`).
                     self.wait_ticks = 0;
                     Com::WaitEvent
                 } else if self.plen > 0 {
@@ -936,7 +957,17 @@ impl LinkTransport for WirelessAdapter {
     // pace the SPI; without it the wireless session init times out and the game
     // loops re-initializing.
     fn gpio_si(&self, so_high: bool) -> Option<bool> {
-        Some(!so_high)
+        // Master command phase: SI = !SO (the adapter answers each of the GBA's
+        // SO toggles with the opposite SI, satisfying the master handler's
+        // wait(1)→SO-high→wait(0) sequence). Slave/reverse phase: the GBA's
+        // handler runs wait(0)→SO-high→wait(1), so SI must MIRROR SO instead —
+        // otherwise the second handshake_wait spins and the receive never
+        // completes. See `reversing`.
+        if self.reversing {
+            Some(so_high)
+        } else {
+            Some(!so_high)
+        }
     }
 
     // The adapter wants to seize the clock while parked after a wait-class
@@ -981,6 +1012,11 @@ impl LinkTransport for WirelessAdapter {
             }
         }
         let word = self.reverse.remove(0);
+        // The adapter is now driving the bus as clock master → the GBA is the
+        // clock slave. Flip `gpio_si` to slave polarity (mirror SO) so librfu's
+        // slave handler's handshake_wait(0)/handshake_wait(1) both satisfy. Stays
+        // set until the GBA resumes master mode and issues its next command.
+        self.reversing = true;
         self.diag_rc_fired = self.diag_rc_fired.wrapping_add(1);
         // Log the reverse-clock direction too (gba_out = what the GBA shifted
         // back, e.g. the 0x996600A8 ack), so the trace shows the wake sequence
