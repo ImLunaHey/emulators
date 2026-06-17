@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.2](https://github.com/ImLunaHey/emulators/compare/v0.1.1...v0.1.2) (2026-06-17)
+
+
+### Features
+
+* **gba:** asymmetric wireless relay (host/client roles) — reaches data loop ([3ce1e21](https://github.com/ImLunaHey/emulators/commit/3ce1e2142c1455189f7c8b69e6210346cb86261f))
+* **gba:** local 2-player link cable with working Pokémon trading ([1a302d6](https://github.com/ImLunaHey/emulators/commit/1a302d6ac54077ed0f5df12fbe5d9295aeb15e98))
+* **gba:** state_hash + determinism test for lockstep netplay ([0bd3cca](https://github.com/ImLunaHey/emulators/commit/0bd3cca232adb77b3da0f04901bf29e85b4807d7))
+* **gba:** wireless adapter — spec-complete command set + clock reversal ([4c1893d](https://github.com/ImLunaHey/emulators/commit/4c1893d619ae0f69777ed7ab045a6d4a82921589))
+* **gba:** wireless-adapter online (Union Room) over WS relay + duo refactor ([12eda1f](https://github.com/ImLunaHey/emulators/commit/12eda1fab143fd83529392a58a4294446f5144b7))
+
+
+### Bug Fixes
+
+* **ci:** attach release assets by calling release-build from release-please ([64638b8](https://github.com/ImLunaHey/emulators/commit/64638b893dc67ab72d985b6b5cba1991e8421e4f))
+* **gba:** complete wireless trade — SI handshake polarity + timeout ([b27623a](https://github.com/ImLunaHey/emulators/commit/b27623a3ff57554045bb2dce47d816cd05f31852))
+* **winapp:** remove illegal '--' from XML comment in csproj ([7e7ffd9](https://github.com/ImLunaHey/emulators/commit/7e7ffd93d9fe2352018b743d69c23f8135524c08))
+
 ## [0.1.1](https://github.com/ImLunaHey/emulators/compare/v0.1.0...v0.1.1) (2026-06-16)
 
 
