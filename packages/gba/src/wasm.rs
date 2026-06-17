@@ -124,6 +124,21 @@ impl WasmGba {
         self.inner.load_state(blob).is_ok()
     }
 
+    /// FNV-1a hash of the full machine snapshot — a cheap fingerprint of the
+    /// entire deterministic state. Used by lockstep netplay to detect desync
+    /// (both peers run the same dual-core sim; hashes must match every frame)
+    /// and by the determinism self-check. Computed in Rust so the multi-hundred-
+    /// KB snapshot never crosses into JS.
+    pub fn state_hash(&self) -> u32 {
+        let bytes = self.inner.save_state();
+        let mut h: u32 = 0x811c_9dc5;
+        for b in bytes {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
+    }
+
     // ---- cheats ----
     /// Set the active cheat codes (newline-separated raw codes). Pass the
     /// enabled cheats only; they're applied once per frame.

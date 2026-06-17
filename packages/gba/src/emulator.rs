@@ -848,6 +848,31 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_across_instances() {
+        // Lockstep netplay runs the *same* dual-core sim on both machines and
+        // relies on it being bit-reproducible: identical ROM + identical input
+        // must yield identical state. This guards that invariant at the
+        // framework level (no process-seeded nondeterminism — HashMap seeds,
+        // wall-clock, RNG — leaking into the sim). Two fresh cores fed the same
+        // ROM and the same (empty) input for many frames must match exactly.
+        let rom = [0u8; 0x8000];
+        let mut a = Gba::new();
+        let mut b = Gba::new();
+        a.load_rom(&rom);
+        b.load_rom(&rom);
+        for f in 0..180 {
+            a.run_frame();
+            b.run_frame();
+            // Compare each frame so a divergence is caught at its first frame.
+            assert_eq!(
+                a.save_state(),
+                b.save_state(),
+                "two identical cores diverged at frame {f}"
+            );
+        }
+    }
+
+    #[test]
     fn undefined_instruction_storm_raises_crash_screen() {
         let mut g = Gba::new();
         g.load_rom(&[0u8; 0x100]);
